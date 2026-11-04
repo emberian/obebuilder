@@ -1,165 +1,136 @@
 # obebuilder: design
 
 Started 2026-11-04 after reading every prompt ember sent to Gemini, Codex and Claude about obend
-(Oct 29 to Nov 4) against the tree those prompts produced. The finding that motivates this tool:
-three frontier model families each produced large volumes of work that satisfied the words of the
-brief ("soundness theorem", "0 sorry", "golden fixture passes") while specifying nothing about the
-world, because nothing in the process required a referent outside the author's own definitions.
-obebuilder is the process, made executable.
+(Oct 29 to Nov 4) against the tree those prompts produced, then the 2025–2026 literature on
+harnesses, multi-model collaboration and slop (`~/paperbin`, `reads/` in the session scratchpad;
+sources listed at the end). Revised the same day after ember's objection to the first draft: the
+first draft was a task tracker with gates and too many rules; agents do not need to be separate
+processes, and the unit of work is a transcript segment, not an agent.
 
-## 1. The artifact model: W, R, S, P, M
+## 1. What went wrong, in one sentence
 
-Every unit of work produces one of five artifacts (Gunter, Gunter, Jackson, Zave 2000,
-`~/paperbin/gunter-gunter-jackson-zave2000-*`):
+Three frontier families produced large volumes of work that satisfied the words of the brief
+("soundness theorem", "0 sorry", "golden fixture passes") while specifying nothing about the world,
+because nothing in the process required a referent outside the author's own definitions and nothing
+measured vacuity. obebuilder is the process that would have refused that, made executable and kept
+light.
 
-- **W** domain knowledge: presumed facts about the environment (a device's physics, a datasheet, a
-  benchmark problem's reference answer, a tool's observed behaviour). W is never authored by the
-  agent that will be checked against it; it is retrieved, measured, or derived from a reference
-  implementation, and cites its source.
-- **R** requirement: what we need to be true, stated in environment terms (a field computed from a
-  current agrees with FEMM on TEAM problem 24 to within x; a RISC core passes the compliance suite;
-  a claim refuses a specific wrong program).
-- **S** specification: the interface and behaviour the program must have so that W ∧ S ⊢ R. This is
-  where `.obend` claims, Lean theorem statements and `Judge.Format`s live.
-- **P** program or proof: the implementation of S.
-- **M** platform: Lean, the machines, the toolchain, the build gates.
+## 2. Principles (each with the source that earned it)
 
-The proof obligation of the model is W ∧ S ⊢ R. A claim of the form S ⊢ S (a theorem whose
-statement and proof are the same definition read twice; a checker tested on a fixture authored to
-pass it; a "soundness" theorem that projects a field out of a record) discharges nothing. The tool's
-first job is to make such claims impossible to schedule and easy to detect after the fact.
+1. **The transcript segment is the unit.** Fork at a message, continue with another model, run two
+   or three continuations, keep the best, merge back. `cv splice`, `cv rewind`, `cv distill` already
+   do the operations; obebuilder schedules them. Handoffs are directional (Ganz et al. 2026, "the
+   handoff tax"): a strong model's prefix guides a weaker continuer, so downshift with the full
+   transcript; a weak model's prefix burdens a stronger one, so escalate with the prefix compacted
+   or removed and the working tree kept.
+2. **Forget on a cadence, keep the artifacts.** Long single trajectories fixate (context inertia:
+   Anthropic's Memento, Microsoft's Fork-and-Flush, Tan et al.'s "Scaling Discovery Requires
+   Forgetting"). A segment has a length; at its end the next segment starts from the repository and
+   a short note, not from the conversation.
+3. **Populations, not pipelines.** A spec section, a theorem statement, a module or a brief has
+   variants; critiques attach to variants (TextGrad); an evaluator picks (AlphaEvolve, ShinkaEvolve:
+   program database, parent sampling, novelty rejection; the AI co-scientist's pairwise tournaments).
+   Convergence means no variant beats the incumbent, not "a review round changed nothing".
+4. **Mixture before adversary.** Every family drafts; each then sees the others' drafts
+   (Mixture-of-Agents: models improve when shown other answers, even weaker ones); then one
+   adversarial pass in a fresh context. Family diversity is a weight on who critiques, never a
+   prohibition.
+5. **An oracle is required to claim, not to start.** Exploration runs without one. What a segment
+   may assert at its end is labelled by regime, in obend's own vocabulary: *decided* (an oracle
+   outside the author agreed: measurement, reference tool, published benchmark, independent
+   derivation, the operational semantics for calculus work), *certified* (a checkable artifact
+   exists and was re-checked), *attested* (someone said so). Lints decide which label a theorem or
+   claim may carry. The five artifact kinds of Gunter–Jackson–Zave (W domain knowledge, R
+   requirement, S specification, P program, M platform) are tags the lints and ledger use.
+6. **Enforcement is lints with remediation text, not gates or prose rules** (OpenAI "Harness
+   engineering": invariants mechanically enforced, a doc-gardening agent, golden principles as
+   garbage collection; Anthropic July 2026: fewer rules, interfaces instead of examples, progressive
+   disclosure). The vacuity lints: closed-decide theorems, projection proofs, `golden/verified/poles`
+   names, checkers with no tooth on themselves, `.obend` claims restating their method, reverse
+   tests (a tooth must bite the checker; an agent's test must fail on the pre-patch code, after
+   FrontierCode), scope of a diff, build time per module, the `atp-checkers` suite from the 2026 Lean
+   dataset-defects paper.
+7. **Coordination through the repository and a supervisor, not locks and nudges.** Kyars's
+   six-agent SQLite run spent 54% of its commits on claim locks; Gas Town coordinates by prose over
+   tmux. The alternative is the OTP shape: segments are processes under a supervisor, restart from
+   artifacts on failure, budgets per segment, worktrees, PID files, stacked small diffs into a merge
+   agent, and the repository as system of record (anything not in it does not exist to the agent).
+8. **Human attention goes where the leverage is**: research, plan, theorem statements, briefs; code
+   only where the person cares (Horthy, "Why Software Factories Fail": a bad line of research costs
+   thousands of lines of code). Vertical slices over horizontal layers.
+9. **Size the ceremony to the work** (Böckeler on spec-driven tools; Huang's Paxos). Most work is
+   one segment and one review; medium work gets one plan; only large things get the population
+   treatment. Effort defaults to medium (SlopCodeBench: xhigh bought no strict passes at 2 to 4 times
+   the cost).
+10. **Briefs are induced from transcripts** (Agent Workflow Memory). Successful segments in `cv` are
+    mined into reusable workflows; new briefs start from those, written as a colleague's note.
+11. **Claim labels in every note.** VERIFIED / SOURCED / INFERRED / PROPOSED / CHAT-REPORTED /
+    REJECTED, as in `~/dev/degg-research` and `~/dev/zkml-research`, whose `docs/VERDICTS.md` is the
+    single-truth-file discipline obend's record lacked.
 
-## 2. The unit of work: a node with a referent and an oracle
+## 3. Objects
 
-A node is a TOML record in `plan/`. Required fields:
+- **Segment**: (parent segment or none, model, effort, brief, worktree, machine, budget, start,
+  end, outcome, regime of its claims, agent id in `cv`). Operations: `fork`, `continue-with`,
+  `compare`, `merge`, `forget-and-continue`.
+- **Artifact**: a spec section, statement, module, brief, or note, with a content hash, a kind tag
+  (W/R/S/P/M), a regime label, and a population of variants each carrying its critiques and
+  evaluator results.
+- **Evaluator**: an oracle (measurement, reference tool, benchmark, independent derivation,
+  semantics), a lint, a rubric with calibration cases, or a tournament.
+- **Ledger**: append-only rows (segment or artifact, event, by whom, when, reason, evaluator
+  result). An open decision for ember is a row that blocks what cites it. When obend's vault tooling
+  is fast enough to be depended on, the ledger becomes an obend vault with laws judged on write.
 
-```toml
-[node.magnetics-team24]
-title    = "2D magnetostatic solve agrees with FEMM on TEAM problem 24"
-artifact = "P"                     # W | R | S | P | M
-refines  = ["spec.magnetics.solve"] # the S (or R, or W) this node serves
-size     = "L"                      # S | M | L | XL  (wall-clock budget derives from size)
-oracle   = { kind = "reference-tool", tool = "femm", problem = "team24",
-             tolerance = "2% peak B", source = "~/paperbin/compumag-team-problem24-*.pdf" }
-owner    = "claude"                 # family that implements
-verifier = "codex"                  # a different family verifies; never the implementer
-budget   = { wall = "4h", build_s_per_module = 60 }
-after    = ["magnetics-mesh-reader", "w.team24-reference-field"]
-```
+## 4. Executors
 
-Oracle kinds, in order of preference:
+- Claude: `claude -p`, Agent SDK, Workflow.
+- Codex: `codex exec` and its native multi-agent (see memory note on codex 0.162).
+- Gemini: `agy --print --output-format stream-json`, `--input-format stream-json` for a turn per
+  NDJSON line, `--conversation <id>` to resume, `--model`, `--effort`, `--json-schema`,
+  `--dangerously-skip-permissions`; transcripts also ingested from `~/.gemini/antigravity-cli/`.
+- Machines from `~/swarm/MACHINES.md`; `swarm-build` on hbox; one build per tree; disk pressure
+  pauses the scheduler.
+- Transcripts indexed by `cv`; a segment's page links its agent id.
 
-1. `measurement`: data from the world (a datasheet file, a bench measurement, a tape-out report).
-2. `reference-tool`: an independent implementation run on the same input (FEMM, ngspice, devsim,
-   yosys/nextpnr timing, Verilator against a published core, RISC-V compliance tests).
-3. `benchmark`: a published problem with a published answer (TEAM problems, SPICE benchmark
-   circuits, IEEE 754 vectors, MMS manufactured solutions per Salari and Knupp 2000).
-4. `independent-model`: a second derivation by a different family from the same W and R, compared.
-5. `adversarial`: a generator of inputs the implementation must refuse, written by the verifier.
-6. `metatheory`: for S-nodes about the calculus itself, the independent object is the operational
-   semantics; the theorem must relate two separately defined things (checker vs. Step, machine vs.
-   reference reducer). This is why `Obend/Core` is honest and `Obend/Hardware` was not.
+## 5. The visualizer
 
-A node with no oracle cannot leave `waiting`. A node whose oracle is "the checker accepts the
-fixture" is rejected at lint.
+`obb serve` on localhost: segments as a tree with states, runtime, retries, budget use, machine
+load; artifacts with their populations and evaluator verdicts; a "ready" column and a "waiting on
+ember" column; server-sent events. This is how a person follows forty segments without reading
+forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 3. The spec pipeline before any P-node runs
+## 6. Shape and milestones
 
-The spec is a set of markdown sections under `spec/`, each with a stable id and a content hash.
+Rust workspace, one binary `obb`: `seg fork|continue|compare|merge|forget`, `art variants|critique|
+evaluate`, `lint` (plug-ins per language; the Lean one extends `Obend.Census`), `serve`, `run`
+(tokio supervisor; executors as trait objects), state in SQLite, artifacts and ledger in git.
 
-1. **Compile.** From ember's notes, transcripts (`cv`), and the existing design documents, one agent
-   compiles a draft per section. Every sentence that asserts a fact about the world is tagged W and
-   cites a source or is marked `UNSOURCED`.
-2. **Cross-review to convergence.** Each family critiques every section; each family then
-   meta-critiques the other two critiques; a merge agent folds the surviving points in. Repeat until
-   a round produces no accepted change. Each round is a DAG of nodes, so it is visible and budgeted.
-3. **All-pairs consistency.** For every pair of sections (i, j), a node checks for contradiction,
-   duplicated authority, or an undefined name used across the boundary. Pairs are cached by the two
-   content hashes, so a rerun after an edit costs only the pairs that touched the edited section.
-4. **Decomposition.** An agent proposes the P-node DAG: tiny steps, topologically ordered, each with
-   its referent and oracle filled in. `obb plan lint` refuses nodes without an oracle, cycles, nodes
-   over the size ceiling, and nodes whose `refines` names no spec section.
-5. **Freeze.** A spec revision is tagged; nodes record which revision they implement. A spec edit
-   reopens exactly the nodes whose sections changed (the hash tells us), the way an obend slot's
-   supports do.
+1. `lint` over obend's tree producing the per-directory classification and the `.obend` claim check,
+   plus `serve` over a hand-written segment tree for obend's current situation.
+2. `seg` operations over `cv`, with the three executors, budgets, and the forgetting cadence.
+3. Populations and evaluators; the spec of obend run as the first population.
+4. Brief induction from `cv`; the ledger into an obend vault.
 
-## 4. Gates a node passes through
+## 7. What this is not
 
-```
-waiting ─▶ ready ─▶ briefed ─▶ in-progress ─▶ verify ─▶ measure ─▶ merge ─▶ done
-                                   │              │          │
-                                   └─ rejected ◀──┴──────────┘   (with the reason, retry counter)
-```
+Not a way to run more agents; a way to run fewer with a referent each and to splice their work. Not
+a workflow for every size of task. Not obend-specific in its core; obend-specific only in its lint
+plug-ins and its ledger.
 
-- **briefed.** The brief is generated from the node, its spec sections, the real signatures of what
-  it depends on (pasted, not described), the oracle, and the standing rules (PID files, swarm-build,
-  named-file commits). A second family reads the brief and returns "missing ground truth" or
-  "ready". Briefs that shout or prohibit are rewritten (Brief style: a colleague's note).
-- **in-progress.** Runs in its own worktree on the machine the plan assigns, under `swarm-build`,
-  with a PID file, under the node's budget. Over budget is a red node, not a wait.
-- **verify.** A different family reads the theorem statements and the diff, never the implementer's
-  summary. It runs the vacuity probes: mutate the implementation and require the theorem to break;
-  mutate the fixture and require the checker to refuse; for every `_sound` theorem, state in one
-  sentence what the conclusion says beyond the hypothesis. It runs the oracle. It reports CONFIRMED,
-  PLAUSIBLE or REJECTED with the inputs that would change the verdict.
-- **measure.** Build time per touched module against the ceiling; the one-edit cascade; token and
-  wall-clock cost. Numbers go to the node's log, not to prose.
-- **merge.** Rebase onto main in the worktree, build the umbrella once, commit named files, append
-  the ledger row (what was decided, by which authority, the oracle result).
+## Sources read for this design
 
-## 5. Vacuity lint (project plug-ins)
-
-Lint runs on every verify and on demand over a whole tree. Plug-ins are per language; the first two
-are for obend:
-
-- **Lean.** Classify every theorem: quantified, closed-decide, closed-other; flag theorems whose
-  proof is a projection of a hypothesis (`exact h.1`, `simp at h; exact h.2.1`) and whose
-  conclusion names no object absent from the hypothesis; flag `golden_*`, `*_verified`, `*_poles`
-  names; flag a checker with no tooth on the checker itself (a tooth on the fixture does not count);
-  flag `Meaning := check = .ok`. This extends `Obend.Census` rather than replacing it.
-- **`.obend`.** Flag a `claim` whose right-hand side is the body of the method it names; flag a
-  `spec` whose every method is a constant or an affine function of its argument with a physical
-  name (the "product name on arithmetic" shape).
-- Output is the per-directory classification table, never a headline count.
-
-## 6. Executors and the record
-
-- Families: Claude (`claude -p`, Agent SDK), Codex (`codex exec`, its native multi-agent), Gemini
-  (Antigravity CLI, when a non-interactive entry point exists; otherwise its sessions are ingested
-  from `~/.gemini/antigravity-cli/` and treated as a family whose output arrives by handoff).
-- Machines: from `~/swarm/MACHINES.md`; the plan assigns a machine per node; one build per tree;
-  disk pressure pauses the scheduler.
-- Transcripts: everything an executor does is indexed by `cv`; a node's page links its agent id.
-- Ledger: append-only rows `(node, event, by, at, reason, oracle-result)`; a decision ember must make
-  is a row of kind `open` and blocks the nodes that cite it. Once obend's own vault tooling is fast
-  enough to be a dependency, the ledger becomes an obend vault with its laws judged on write; until
-  then it is a markdown table the tool owns.
-
-## 7. The visualizer
-
-`obb serve` on localhost: the DAG with states as colours, per-node runtime, retries, rejections,
-budget use, machine load; a node page with its brief, its log, its verifier's report, its oracle
-result; a "ready" column; a "waiting on ember" column. Server-sent events for live updates. This is
-what lets a person see what forty agents are doing without reading forty transcripts.
-
-## 8. Implementation shape
-
-Rust workspace, one binary `obb`:
-
-- `obb plan lint | graph | ready` over `plan/*.toml` and `spec/*.md`.
-- `obb serve` (axum, SSE, a single static page).
-- `obb run` (tokio scheduler; executors as trait objects; worktrees; PID files; budgets).
-- `obb review`, `obb pairs` (the spec pipeline as generated nodes).
-- `obb lint` (vacuity plug-ins; the Lean one shells out to the project's census).
-- State in SQLite (`.obb/state.db`); the plan and spec in git; the ledger in git.
-
-First milestone: `plan lint` and `serve` over a hand-written plan for obend's current situation
-(the fake list from the 2026-11-04 review as nodes, each with the oracle it lacks). Second:
-`run` with the Claude and Codex executors on bb2. Third: the spec pipeline. Fourth: the lint
-plug-ins. The ledger moves into an obend vault last, when obend can carry it.
-
-## 9. What this is not
-
-Not a replacement for judgement about what to build; the research questions are still ember's.
-Not a way to run more agents; a way to run fewer with a referent each. Not obend-specific in its
-core (W/R/S/P/M, nodes, gates, oracles) and obend-specific only in its lint plug-ins and ledger.
+Gunter, Gunter, Jackson, Zave 2000; Zave and Jackson 1997; Parnas and Clements 1986; Oberkampf,
+Trucano, Hirsch 2004; Salari and Knupp 2000; Ringer et al. 2019; Klein et al. 2014; Kupferman and
+Vardi 2003 (not fetched, 403); the 2026 Lean dataset-defects audit (arXiv 2606.29493); Ganz et al.
+2026 (arXiv 2608.24358); Fan et al. 2026 (arXiv 2609.20804); Ning et al. 2026 "Code as Agent
+Harness" (arXiv 2605.18747); ATC (arXiv 2611.04321); AgentDiet (arXiv 2509.23586); Mixture-of-Agents
+(arXiv 2406.04692); Co-LLM (arXiv 2403.03870); TextGrad (arXiv 2406.07496); ShinkaEvolve (arXiv
+2509.19349); AlphaEvolve (arXiv 2506.13131); AI co-scientist (arXiv 2502.18864); Agent Workflow
+Memory (arXiv 2409.07429); Du et al. 2023 debate; MetaGPT; Horthy "Why Software Factories Fail" and
+"Advanced Context Engineering" (humanlayer); OpenAI "Harness engineering" (Feb 2026); Anthropic
+"Effective harnesses for long-running agents" (Nov 2025) and "The new rules of context engineering
+for Claude 5" (Jul 2026); Breunig "The State of Context Engineering" (Oct 2026); Appleton on Gas
+Town; Yegge's Beads; Kyars "building sqlite with a small swarm"; Guimarães on Elixir; Cognition
+FrontierCode; SlopCodeBench (Oct 2026); dollspace-gay's VSDD gist; Huang "100K lines of Rust with
+AI"; Böckeler on Kiro, spec-kit and Tessl; Willison on parallel agents.
