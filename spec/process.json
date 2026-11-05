@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "source": "PROCESS.md, 2026-11-04",
+  "ember_events": ["aim", "decision", "taste"],
+  "machines": {
+    "campaign": {
+      "initial": "Aim",
+      "states": ["Aim", "Alone", "Grounded", "Running", "Reground", "Done"],
+      "transitions": [
+        {"from": "Aim", "to": "Alone", "when": "no AMBITION.md or ledger older than last aim"},
+        {"from": "Alone", "to": "Aim", "when": "AMBITION.md written in ember's words"},
+        {"from": "Aim", "to": "Grounded", "guard": "G1"},
+        {"from": "Grounded", "to": "Running", "guard": "G2"},
+        {"from": "Running", "to": "Running", "on": ["quest.landed", "quest.sunk", "population.converged"]},
+        {"from": "Running", "to": "Reground", "guard": "G3", "on": ["budget.spent", "ember.aim", "doctrine.contradiction"]},
+        {"from": "Reground", "to": "Aim", "guard": "G4"},
+        {"from": "Running", "to": "Done", "when": "every quest Recorded and the aim's statements carry a regime"}
+      ]
+    },
+    "quest": {
+      "initial": "Grounded",
+      "states": ["Grounded", "Scoped", "Built", "Wired", "Toothed", "Landed", "Claimed", "Recorded"],
+      "sinks": ["Theater", "Label", "Ritual", "Stalled", "EmberGated", "Lost", "SummaryRebuilt", "Miscalibrated", "Shrunk", "SideBranched", "Mirror", "HarnessLoss", "Slow", "Navel", "Appended", "Scar", "Stomped", "Alone"],
+      "transitions": [
+        {"from": "Grounded", "to": "Scoped", "guard": "Q1"},
+        {"from": "Scoped", "to": "Built", "guard": "Q2"},
+        {"from": "Built", "to": "Wired", "guard": "Q3"},
+        {"from": "Wired", "to": "Toothed", "guard": "Q4"},
+        {"from": "Toothed", "to": "Landed", "guard": "Q5"},
+        {"from": "Landed", "to": "Claimed", "guard": "Q6"},
+        {"from": "Claimed", "to": "Recorded", "guard": "Q7"}
+      ],
+      "sink_edges": {
+        "Grounded": ["Lost", "SummaryRebuilt"],
+        "Scoped": ["Shrunk", "Miscalibrated"],
+        "Built": ["Theater", "Mirror"],
+        "Wired": ["Label"],
+        "Toothed": ["Ritual"],
+        "Landed": ["SideBranched", "Stomped", "Scar"],
+        "Recorded": ["Navel", "Appended"],
+        "*": ["Stalled", "EmberGated", "Slow", "HarnessLoss"]
+      },
+      "sink_exit_rule": "a quest leaves a sink only by the transition that fixes it, performed by the agent already holding the context"
+    },
+    "segment": {
+      "initial": "Fresh",
+      "states": ["Fresh", "Working", "Forgetting", "Pressured", "Distilled", "Forked", "Handoff", "Stranded", "Retired"],
+      "transitions": [
+        {"from": "Fresh", "to": "Working"},
+        {"from": "Working", "to": "Forgetting", "guard": "S1"},
+        {"from": "Forgetting", "to": "Working"},
+        {"from": "Working", "to": "Pressured", "guard": "S2"},
+        {"from": "Pressured", "to": "Distilled", "guard": "S3"},
+        {"from": "Distilled", "to": "Working"},
+        {"from": "Working", "to": "Forked", "guard": "S4"},
+        {"from": "Forked", "to": "Working", "when": "best continuation kept by evaluator"},
+        {"from": "Working", "to": "Handoff", "guard": "S5"},
+        {"from": "Handoff", "to": "Working"},
+        {"from": "Working", "to": "Stranded", "when": "root died or wait never wakes"},
+        {"from": "Stranded", "to": "Working", "guard": "S6"},
+        {"from": "Working", "to": "Retired", "when": "quest Recorded or segment superseded"}
+      ]
+    }
+  },
+  "guards": {
+    "G1": {"source": "cv events", "passes": "named foundation files appear as whole reads in the coordinator's own transcript"},
+    "G2": {"source": "ledger", "passes": "every quest has brief, budget in swarm-hours, machine, worktree-or-main, evaluator"},
+    "G3": {"source": "ledger, cv deferrals", "passes": "budget exhausted or doctrine contradiction or ember.aim"},
+    "G4": {"source": "git diff", "passes": "doctrine rewritten not appended; replaced modules deleted in the same commit"},
+    "Q1": {"source": "brief vs aim", "passes": "deliverable equals the aim's; estimate in swarm-hours with a cv stats comparable"},
+    "Q2": {"source": "tree", "passes": "runs on real inputs in the real tree; no sim/mock/stub/fallback/browser twin on the load-bearing path"},
+    "Q3": {"source": "tree", "passes": "imported by, exported to, or emitted for the live system; no Rust twin without a call or an emitted artifact"},
+    "Q4": {"source": "tree", "passes": "planted bad input refused; no structural-only tests"},
+    "Q5": {"source": "git", "passes": "on main, named paths, no stash, no add -A, no surviving branch, superseded path deleted"},
+    "Q6": {"source": "lints", "passes": "each statement labelled decided/certified/attested with inhabited hypothesis families"},
+    "Q7": {"source": "ledger, docs census", "passes": "one ledger row; docs cite real names and address a reader; no confession prose; no counts as achievements"},
+    "S1": {"source": "segment config", "passes": "length reached; forget note written from artifacts"},
+    "S2": {"source": "cv doctor", "passes": "context pressure above threshold or two compactions"},
+    "S3": {"source": "cv retire", "passes": "source retired and routes updated to the successor"},
+    "S4": {"source": "cv", "passes": "fork only below the large-context threshold"},
+    "S5": {"source": "cv", "passes": "handoff direction per the handoff tax"},
+    "S6": {"source": "cv lanes --stranded", "passes": "strand class recorded before adoption"}
+  },
+  "sinks": {
+    "Theater": {"detector": "Q2 word list and reachability", "exit": "replace with the real artifact"},
+    "Label": {"detector": "residual name with no inhabitation (Q3, Q6)", "exit": "close the gap; delete the name"},
+    "Ritual": {"detector": "cv events: last N rounds re-run pins/vectors/audits with no new artifact or claim", "exit": "give the segment a deliverable or retire it"},
+    "Stalled": {"detector": "cv deferrals; cv lanes --stranded", "exit": "do the deferred thing; match every deferral to a quest"},
+    "EmberGated": {"detector": "message contains the decision and asks permission; destructive actions excepted", "exit": "proceed; record decision-made"},
+    "Lost": {"detector": "cv doctor compactions with no whole reads since; claims citing .md and no code", "exit": "reground with whole reads"},
+    "SummaryRebuilt": {"detector": "fresh agent briefed from a summary while the scout's transcript exists", "exit": "cv distill or cv adopt; the scout becomes the doer"},
+    "Miscalibrated": {"detector": "estimate over one swarm-week without a comparable", "exit": "re-estimate from measured campaigns"},
+    "Shrunk": {"detector": "brief deliverable is a subset of the aim; pillar closed without a decision row", "exit": "restore the aim; split into quests"},
+    "SideBranched": {"detector": "stash, branch older than its segment, add -A, revert of another lane's commit", "exit": "land on main with named files"},
+    "Mirror": {"detector": "Rust semantic object with no Lean source, emitted artifact or FFI call", "exit": "Lean definition, then emit or call"},
+    "HarnessLoss": {"detector": "cv lanes after a root dies", "exit": "cv adopt; PID files; never respawn from a summary"},
+    "Slow": {"detector": "identical expensive command twice; a build on the Mac; a wait with no tee'd log", "exit": "tee once; build on the box; measure once"},
+    "Navel": {"detector": "lint class 9; process narration added to a reader's document", "exit": "rewrite for the reader or delete"},
+    "Appended": {"detector": "G4 on doctrine diffs", "exit": "wholesale rewrite in Reground"},
+    "Scar": {"detector": "replacement landed and superseded module still reachable or on disk", "exit": "delete in the same commit"},
+    "Stomped": {"detector": "paths outside the lane's named set; kill not by PID file; delete outside scratchpad", "exit": "revert only the lane's own change"},
+    "Alone": {"detector": "no AMBITION.md or ledger older than last aim", "exit": "write the aim; the ledger is the plan"}
+  }
+}

@@ -68,6 +68,11 @@ light.
     REJECTED, as in `~/dev/degg-research` and `~/dev/zkml-research`, whose `docs/VERDICTS.md` is the
     single-truth-file discipline obend's record lacked.
 
+The control flow these principles imply is `PROCESS.md`: three nested statecharts (campaign,
+quest, segment), guards computed from the Lean environment, cv and git, and one sink per
+frustration that persisted across the prompt corpus (`~/dev/collected-writings/prompts/COHERENCE.md`).
+`spec/process.json` is the machine form.
+
 ## 3. Objects
 
 - **Segment**: (parent segment or none, model, effort, brief, worktree, machine, budget, start,
