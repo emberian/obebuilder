@@ -3,8 +3,8 @@
 On 2026-11-06 the swarm that builds obend got a workspace that is an obend vault: `~/dev/obend-swarm`
 (its own git repository; `obend open`). This page says how `PROCESS.md`'s machines run there, what the
 vault decided by itself, and what is still missing. What the vault refused while it was being built
-is `~/dev/obend-swarm/FINDINGS.md` (37 entries); the walkthrough that reproduces it on a fresh copy,
-and is a gate on obend, is `~/dev/obend/lean/tests/vault/SWARM.md` (20 steps).
+is `~/dev/obend-swarm/FINDINGS.md` (43 entries); the walkthrough that reproduces it on a fresh copy,
+and is a gate on obend, is `~/dev/obend/lean/tests/vault/SWARM.md` (28 steps).
 
 ## What is in it
 
@@ -67,28 +67,43 @@ command's time in `data/costs.tsv`.
   steps: a label law that admitted its absence; commit hashes and gate lines silently dropped; two
   suggestions that offered fake values; a merge that lost a refused write.
 
+## Closed on 2026-11-06 (lane-seams)
+
+- **A brief is a form; a report is its fill.** `obend brief PAGE FORM --for LANE --grant PAGE --set
+  state=reported --hole commit:label --hole gate:text --hole leftout:text`; the lane fills it where it
+  works (`obend fill`), and `obend judge` lands the fill as one turn judged by the lane page's laws. A
+  report without a gate is refused by the lanes kind's `gate` law, by name. In the swarm vault, the
+  reports of lane-holetyping and lane-cost landed this way.
+- **DEV reads its backlinks.** `law listed: linked_by.state == "merged" implies linked_by.listed == 1`
+  on DEV: every lane marked merged is listed there, refused at the lane otherwise; DEV cannot drop a
+  merged lane.
+- **Writes that need each other land together.** The writes an open refused are judged again as one
+  turn: pages born linking each other, or a lane marked merged with DEV listing it.
+- **A refused write is an exit status.** Every command whose write is refused says so on stderr and
+  exits 1; the walkthrough runner holds every refused step to it.
+- **The four merges of 2026-11-05 are gated after the fact,** each page saying `gated: after` and the
+  dev commit its gate passed on; DEV lists all of dev's merges of the swarm.
+
 ## What is still missing
 
-1. **The report as a form.** Forms move numbers between pages and conserve them; a report sets labels
-   and text. Until a form has label and text holes and a `set` move, the brief is not a form and the fill
-   is a write in a fork (FINDINGS 10).
+1. **A merge replays a fork's turn one page at a time.** Writes a fork landed together are refused at
+   the tip one by one, each waiting on another (FINDINGS 41). `Branch.merge` should replay a side's turn
+   as a turn.
 2. **Authority in a fork.** A fork writes as the owner; the merge does not know which lane wrote, so a
    lane's fork can write any page. A fork declared for a member, its writes judged against that
    member's grants at the tip (FINDINGS 12).
-3. **Laws over backlinks and link roles.** A box's laws cannot reach the lanes that name it; "every merged
-   lane is on DEV" cannot be said; a lane's law cannot tell its build box from its brief (FINDINGS 6 to 8).
-4. **Records of facts that break a law.** A merge without a gate, a box that went down, a tally over a
-   floor: each is refused instead of recorded as an inconsistency to resolve (FINDINGS 14, 20). The
-   reasons substrate is where such facts belong; the vault's laws do not yet read it.
+3. **Link roles.** A law over links or backlinks reads every linked page alike: a lane's law cannot tell
+   its build box from its brief, and DEV cannot see a merged lane that does not link it (FINDINGS 6, 8).
+4. **Records of facts that break a law.** A box that went down, a tally over a floor: each is refused
+   instead of recorded as an inconsistency to resolve (FINDINGS 14, 20). The reasons substrate is where
+   such facts belong; the vault's laws do not yet read it.
 5. **The judge in front of the command.** The doctrine is two texts (the lanes kind's laws and the
-   genealogy's floors) and the genealogy's habitat is a record of naturals, not the vault. The step is a
-   PreToolUse judge whose state is the floors' tallies and whose succession is an edit of a kind page
-   (FINDINGS 19, 20; JUDGE.md's "What does not exist yet").
-6. **Births of mutually linked pages.** A fresh copy of this vault does not open: the lanes and the box
-   they build on link each other under laws over links, and none can be born first (FINDINGS 36).
-7. **Cost at the swarm's size.** Every command reads the whole log; a merge record carries the fork's
-   world; retention cannot compact while lanes are out (FINDINGS 21 to 23).
-8. **Git as an environment.** `ancestor: true` is written by a script; no law reads dev's history
+   genealogy's floors), and the genealogy's habitat is a record of naturals, not the vault (FINDINGS 19,
+   20; JUDGE.md's "What does not exist yet").
+6. **Gates the root runs.** The root merged both of today's lanes with no gate of its own, and dev's
+   FORMS walkthrough now fails its cost check (FINDINGS 38, 43). A merge into dev should be a fill of
+   the lane's brief whose gate line the root's own run wrote.
+7. **Git as an environment.** `ancestor: true` is written by a script; no law reads dev's history
    (FINDINGS 9).
-9. **cv inside the vault.** The doctrine counts and gate lines are extracted by a script over `cv show
+8. **cv inside the vault.** The doctrine counts and gate lines are extracted by a script over `cv show
    --json`; the lints of PROCESS.md §2 are not yet a part of `cv` or `obb lint` that writes the pages.
