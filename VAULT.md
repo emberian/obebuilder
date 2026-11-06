@@ -3,7 +3,7 @@
 On 2026-11-06 the swarm that builds obend got a workspace that is an obend vault: `~/dev/obend-swarm`
 (its own git repository; `obend open`). This page says how `PROCESS.md`'s machines run there, what the
 vault decided by itself, and what is still missing. What the vault refused while it was being built
-is `~/dev/obend-swarm/FINDINGS.md` (36 entries); the walkthrough that reproduces it on a fresh copy,
+is `~/dev/obend-swarm/FINDINGS.md` (37 entries); the walkthrough that reproduces it on a fresh copy,
 and is a gate on obend, is `~/dev/obend/lean/tests/vault/SWARM.md` (20 steps).
 
 ## What is in it
