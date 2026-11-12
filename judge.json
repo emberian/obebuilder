@@ -1,0 +1,81 @@
+{
+  "name": "g0-obebuilder",
+  "formats": [
+    "revert@1",
+    "lean-module@1",
+    "judge-instance@1",
+    "tactic-elab@1",
+    "markdown-spec@1",
+    "judge-succession@1"
+  ],
+  "floors": [
+    "home 10",
+    "no_sorry_ax <= 0",
+    "no_declared_axiom <= 0",
+    "tier1_module_sec_cap <= 60",
+    "docs_symbols_exist <= 0",
+    "no_tautological_judge_meaning <= 0",
+    "no_discarded_tactic_result <= 0",
+    "planted_fault_red <= 0"
+  ],
+  "methods": [
+    { "format": "revert@1", "floor": "home 10", "method": "lemma" },
+    { "format": "revert@1", "floor": "no_sorry_ax <= 0", "method": "lemma" },
+    { "format": "revert@1", "floor": "no_declared_axiom <= 0", "method": "lemma" },
+    { "format": "revert@1", "floor": "tier1_module_sec_cap <= 60", "method": "lemma" },
+    { "format": "revert@1", "floor": "docs_symbols_exist <= 0", "method": "lemma" },
+    { "format": "revert@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
+    { "format": "revert@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
+    { "format": "revert@1", "floor": "planted_fault_red <= 0", "method": "lemma" },
+
+    { "format": "lean-module@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
+    { "format": "lean-module@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
+    { "format": "lean-module@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "lean-module@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
+    { "format": "lean-module@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
+    { "format": "lean-module@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
+    { "format": "lean-module@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "lean-module@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
+
+    { "format": "judge-instance@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
+    { "format": "judge-instance@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
+    { "format": "judge-instance@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "judge-instance@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
+    { "format": "judge-instance@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
+    { "format": "judge-instance@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
+    { "format": "judge-instance@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "judge-instance@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
+
+    { "format": "tactic-elab@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
+    { "format": "tactic-elab@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
+    { "format": "tactic-elab@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "tactic-elab@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
+    { "format": "tactic-elab@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
+    { "format": "tactic-elab@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
+    { "format": "tactic-elab@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "tactic-elab@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
+
+    { "format": "markdown-spec@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
+    { "format": "markdown-spec@1", "floor": "no_sorry_ax <= 0", "method": "lemma" },
+    { "format": "markdown-spec@1", "floor": "no_declared_axiom <= 0", "method": "lemma" },
+    { "format": "markdown-spec@1", "floor": "tier1_module_sec_cap <= 60", "method": "lemma" },
+    { "format": "markdown-spec@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
+    { "format": "markdown-spec@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
+    { "format": "markdown-spec@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
+    { "format": "markdown-spec@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
+
+    { "format": "judge-succession@1", "floor": "home 10", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "no_sorry_ax <= 0", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "no_declared_axiom <= 0", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "tier1_module_sec_cap <= 60", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "docs_symbols_exist <= 0", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
+    { "format": "judge-succession@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" }
+  ],
+  "basis": [
+    "kernel",
+    "compiled",
+    "external:git-merge-tree"
+  ]
+}
