@@ -20,6 +20,7 @@ clap.workspace = true
 obb-core.workspace = true
 obb-judge.workspace = true
 obb-lint.workspace = true
+obb-quarry.workspace = true
 obb-state.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,550 @@
+# Obend Cathedral + `refs/quarry/<donor>/*` Namespace Manifest
+# Managed and audited by `obb quarry {sync, status, inspect}`.
+#
+# Every donor repository's full git history is fetched into `refs/quarry/<donor>/<branch>`
+# (`--no-tags --no-write-fetch-head`), leaving `HEAD`, `.git/index`, and the working tree untouched.
+# No code crosses from `refs/quarry/*` into `obend` without passing all 6 Quarry Surgery Gates!
+
+version = 1
+target_name = "obend"
+default_target_repo = "/Users/ember/dev/obend"
+
+[donors.breadstuffs]
+path = "/Users/ember/dev/breadstuffs"
+branches = ["main"]
+default_branch = "main"
+language = "Lean 4 + Rust + seL4 Microkit + Verilog"
+summary = "Dregg2 metatheory, Realizability/Paco, CertifiedPresentation CCC, BFV/Polis, 13-family Automata/Datalog/Policy/Tree zoo, calltree, seL4 firmament, braid-hook, confined-swarm, and UMEM/Convex specs"
+
+[donors.minidregg]
+path = "/Users/ember/dev/minidregg"
+branches = ["main"]
+default_branch = "main"
+language = "Lean 4 + Rust + Python"
+summary = "Resource Book/Floors & ZoE Seat accounting, Pred can/why refusal algebra, TokenCensus, HypothesisLedger anti-vacuity tool, Tower256 binary field backend, GenericSimplex quorum, and IrreversibleEffectSettlement"
+
+[donors.svenvs]
+path = "/Users/ember/dev/svenvs"
+branches = ["main"]
+default_branch = "main"
+language = "HOL4 + OCaml/Candle"
+summary = "Self-verifying environments: Genealogy non-regression, sv_weakening/liberty, relEnvelope, corrigibility, specneg, Proof-Carrying Authorization (PCA), physical embodiment, and Candle self-upgrade"
+
+[donors.lean-transport]
+path = "/Users/ember/dev/lean-transport"
+branches = ["dev"]
+default_branch = "dev"
+language = "Lean 4"
+summary = "Shadow-olean DAG walk (`--no-repair` spec-sensitivity census & bounded proof-repair engine for `obb repair`)"
+
+# ==============================================================================
+# 1. `breadstuffs` Excavations
+# ==============================================================================
+
+[[entries]]
+id = "breadstuffs-sat-lrat"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Sat"
+state = "uptaken"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Lrat.lean"
+audit_notes = "LRAT unsatisfiability checker (`lrat-unsat@1`) uptaken into `Obend.Judge.Lrat` with independent `Unsatisfiable` declarative `Meaning`, universal `sound`, and zero `sorry`/`axiom`."
+required_cures = []
+
+[[entries]]
+id = "breadstuffs-automata-cfg-confinement"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Crypto/CfgCompact.lean"
+state = "uptaken"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/AutomataConfinement.lean"
+audit_notes = "Compact CFG × DFA regular confinement witness checker (`CfgCompact.lean`) uptaken into `Obend.Judge.AutomataConfinement` (`automata-confinement@1`). Broader VPA/pushdown & table-run hierarchy remains queued below."
+required_cures = []
+
+[[entries]]
+id = "breadstuffs-realizability"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Realizability"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Metatheory/Realizability.lean"
+audit_notes = "Partial combinatory algebra (`PCA`), assemblies, and realizability tripos foundations (`Realizability/`). High mathematical value once stripped of `Dregg2` monolith imports."
+required_cures = [
+  "G1: Verify 0 `sorry`/`axiom`/`native_decide` across all `PCA` and assembly lemmas",
+  "G6: Re-home onto `Obend.Core` without importing `Dregg2` circuit monoliths"
+]
+
+[[entries]]
+id = "breadstuffs-paco-gpaco"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Paco/GPaco.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Coinductive/GPaco.lean"
+audit_notes = "Parameterized coinduction (`paco`/`gpaco`, Hur et al. POPL 2013) over complete lattices for compositional infinite-trace bisimulation and session/consensus liveness proofs."
+required_cures = [
+  "G1: Keep 100% constructive/classical kernel-pure (`0 native_decide`)",
+  "G4: Pair coinduction up-to closure combinators with concrete reactive stream examples",
+  "G6: Expose clean `CompleteLattice` typeclass interface (<800 lines)"
+]
+
+[[entries]]
+id = "breadstuffs-certified-presentation-change"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Metatheory/CertifiedPresentationChange.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Metatheory/CertifiedPresentation.lean"
+audit_notes = "Certified representation/presentation change isomorphisms and quotient transport across executable vs specification carriers."
+required_cures = [
+  "G2: Ensure representation-change soundness quantifies universally over arbitrary carrier values",
+  "G6: Factor common Galois/retraction carrier structures shared with `CertifiedPresentationFibredCCC`"
+]
+
+[[entries]]
+id = "breadstuffs-certified-presentation-fibred-ccc"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Metatheory/CertifiedPresentationFibredCCC.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Metatheory/FibredCCC.lean"
+audit_notes = "Fibred cartesian closed category (`CCC`) structure for semantics-preserving compiler/lowering passes with indexed logical relations."
+required_cures = [
+  "G4: Provide inhabitedness witness instance on `Obend.Core.Term` lowering",
+  "G6: Split categorical laws from concrete instance files (<1,500 lines)"
+]
+
+[[entries]]
+id = "breadstuffs-bfv-fhe"
+donor = "breadstuffs"
+source_path = "metatheory/Bfv"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Crypto/Bfv/"
+audit_notes = "BFV ring-LWE noise growth (`Noise.lean`), `ZqSumcheck.lean`, and noise-flooding (`Smudging.lean`). Must enforce 2026 IND-CPA-D smudging bounds (`ePrint 2026/2546`, Alexandru-Castryck-Vercauteren)."
+required_cures = [
+  "G3: Enforce explicit smudging/noise-flooding variance floor or fresh mask per distributed decryption (`ePrint 2026/2546`)",
+  "G3: Bind Fiat-Shamir sumcheck challenges over `Z_q` to full public parameter digest (`ePrint 2026/1838`)",
+  "G4: Prove non-vacuous decryption correctness witness under concrete modulus/noise parameters"
+]
+
+[[entries]]
+id = "breadstuffs-polis"
+donor = "breadstuffs"
+source_path = "metatheory/Polis"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Governance/Polis.lean"
+audit_notes = "Deliberative voting / collective-choice viability (`Polis.lean`, `PolisAuthViability.lean`) with authenticated ballot/delegation invariants."
+required_cures = [
+  "G3: Replace any narrow stand-in ballot digests with `Obend.Core.Digest` 256-bit commitments",
+  "G4: Witness satisfiability of `AuthViable` over multi-voter profiles"
+]
+
+[[entries]]
+id = "breadstuffs-automata-table-run"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Automata"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/AutomataTable.lean"
+audit_notes = "13-family automata table-run & statement-audit suite (`TableRun.lean`, `TableRunSpec.lean`, `DfaBoundReference.lean`, `StatementAudit.lean`)."
+required_cures = [
+  "G1: Remove any `native_decide` inside library decidability theorems",
+  "G2: Register `Obend.Judge` instance with independent language-membership `Meaning`"
+]
+
+[[entries]]
+id = "breadstuffs-automata-vpa"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Crypto/VpaDecidable.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Vpa.lean"
+audit_notes = "Visibly pushdown automata (`VpaAsCert.lean`, `VpaDecidable.lean`, Alur-Madhusudan) for call/return balanced protocol confinement."
+required_cures = [
+  "G1: Remove any `native_decide` inside library decidability theorems",
+  "G2: Register `vpa-confinement@1` `Obend.Judge` instance with independent language-inclusion `Meaning`"
+]
+
+[[entries]]
+id = "breadstuffs-datalog"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Datalog"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Datalog.lean"
+audit_notes = "Stratified Datalog fixpoint engine (`StratifiedCert.lean`, `SafeCoincidence.lean`, `Aggregates.lean`) — pairs directly with `svenvs/pca` for capability & policy authorization."
+required_cures = [
+  "G2: Prove universal least-herbrand-model coincidence (`SafeCoincidence`) without tautological `Meaning`",
+  "G5: Wire structural wire parser for `stratified-datalog@1` certificates (no preset string shortcuts)"
+]
+
+[[entries]]
+id = "breadstuffs-policy"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Policy"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Policy.lean"
+audit_notes = "Policy compilation and verified parse/pretty round-trip (`Compile.lean`, `ParseRoundTrip.lean`) for capability guard lowering."
+required_cures = [
+  "G2: Ensure round-trip theorem quantifies over all well-formed ASTs (`∀ p, parse (pretty p) = .ok p`)",
+  "G4: Include inhabitedness & mutation `#tooth` witnesses"
+]
+
+[[entries]]
+id = "breadstuffs-tree-cbor-schema"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Tree"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/TreeSchema.lean"
+audit_notes = "Bottom-up tree automata (`Automaton.lean`), deterministic CBOR framing (`Cbor.lean`), and schema validation (`Schema.lean`) for wire-boundary decoding."
+required_cures = [
+  "G3: Enforce canonical deterministic CBOR map key ordering so commitment digests cannot collide on reordered encodings",
+  "G5: Wire directly into `Obend.Core.Data` wire boundary"
+]
+
+[[entries]]
+id = "breadstuffs-calltree"
+donor = "breadstuffs"
+source_path = "calltree"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "crates/obend-calltree/"
+audit_notes = "Authenticated call-tree deployment & execution trace framing (`calltree/` + `metatheory/Dregg2/Lightclient/CallTreeDeploy.lean`)."
+required_cures = [
+  "G3: Upgrade all call-tree node hashes to full 256-bit cSHAKE256/SHA-256 (zero 64-bit limb truncation)",
+  "G5: Eliminate duplicate Rust/Lean semantic mirrors; drive verification through single `Judge.Format` wire"
+]
+
+[[entries]]
+id = "breadstuffs-sel4-chokepoint"
+donor = "breadstuffs"
+source_path = "sel4"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "hardware/sel4/"
+audit_notes = "seL4 Microkit `chokepoint.system` & `dregg-firmament` capability-isolated protection domains (net-rx -> judge-gate -> actuator-tx with read-only shared DMA rings)."
+required_cures = [
+  "G2: Prove Lean capability-graph non-bypassability theorem matching `chokepoint.system` channel topology",
+  "G5: Replace placeholder protection-domain C stubs with generated `Obend` C-ABI judge entrypoints"
+]
+
+[[entries]]
+id = "breadstuffs-braid-hook"
+donor = "breadstuffs"
+source_path = "braid-hook"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "crates/obend-braid-hook/"
+audit_notes = "Cross-domain transcript braiding & webhook/attestation bridge (`braid-hook/`)."
+required_cures = [
+  "G3: Absorb `(protocol_id, circuit_descriptor, public_inputs)` into transcript sponge prior to challenge-0 (`ePrint 2026/1838`)",
+  "G5: Remove any mock HTTP/signature verifiers from `src/`"
+]
+
+[[entries]]
+id = "breadstuffs-confined-swarm"
+donor = "breadstuffs"
+source_path = "confined-swarm"
+state = "idea_only"
+target_repo = "obend"
+destination_path = "lean/Obend/Vault/Mandate.lean"
+audit_notes = "Confined multi-agent capability delegation & attenuation patterns (`confined-swarm/`). Core monotone attenuation (`Subsumes`) lives in `Obend.Vault.Mandate`; multi-worker runtime orchestration belongs in `obebuilder`."
+required_cures = [
+  "G5: Keep multi-agent process scheduling in `obb-state`/`obb-quarry` and pure capability math in `Obend.Vault.Mandate`"
+]
+
+[[entries]]
+id = "breadstuffs-umem-primitive"
+donor = "breadstuffs"
+source_path = "docs/deos/UMEM-PRIMITIVE.md"
+state = "idea_only"
+target_repo = "obend"
+destination_path = "lean/Obend/Vault/"
+audit_notes = "Design specification (`UMEM-PRIMITIVE.md`) for zero-copy capability-addressed unified memory regions (`AF_XDP`/shared-page arenas pinned by `Vault` read/write footprints)."
+required_cures = [
+  "G2: Formalize page-lease aliasing/disjointness invariants in Lean before writing unsafe Rust/C arena code"
+]
+
+[[entries]]
+id = "breadstuffs-private-convex-engine"
+donor = "breadstuffs"
+source_path = "docs/deos/PRIVATE-CONVEX-ENGINE.md"
+state = "idea_only"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Clearing.lean"
+audit_notes = "Architecture note (`PRIVATE-CONVEX-ENGINE.md`) for privacy-preserving convex batch clearing with public KKT dual certificates. Public KKT certificate checker is realized in `Obend.Judge.Clearing`; MPC/FHE witness generation remains future uptake."
+required_cures = [
+  "G3: Any FHE/MPC front-end must satisfy `ePrint 2026/2546` smudging bounds while emitting kernel-checked KKT dual certificates"
+]
+
+[[entries]]
+id = "breadstuffs-retired-orb-crypto"
+donor = "breadstuffs"
+source_path = "orb/Crypto.lean"
+state = "retired_slop"
+target_repo = "obend"
+audit_notes = "QUARANTINED SLOP: Declares 25 unchecked cryptographic `axiom`s (`orb/Crypto.lean`), violating `no_declared_axiom <= 0`. Superseded by `Obend.Core.Digest` + explicit `Bounded H`/`Collision H` hypotheses."
+required_cures = [
+  "PERMANENTLY RETIRED: Never import; parameterize theorems over explicit hash carriers (`Obend.Digest`)"
+]
+
+[[entries]]
+id = "breadstuffs-retired-descriptor-ir2-weld"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Circuit/DescriptorIR2.lean"
+state = "retired_slop"
+target_repo = "obend"
+audit_notes = "QUARANTINED SLOP: Contains the 1-felt `(m.newRoot 0).eval ... = (m.root 0).eval ...` narrow digest weld (`2^15.5`-bit birthday collision across 43 downstream files). Guarded against regression by `lean/narrow-digest-weld`."
+required_cures = [
+  "PERMANENTLY RETIRED: Full 256-bit / 8-limb commitment equality is mandatory in `obend`"
+]
+
+[[entries]]
+id = "breadstuffs-retired-circuit-emit-toys"
+donor = "breadstuffs"
+source_path = "metatheory/Dregg2/Circuit/Emit"
+state = "retired_slop"
+target_repo = "obend"
+audit_notes = "QUARANTINED SLOP: Monolithic emitted circuit literals (`DyckStackEmit` depth-3 toy `a^n b^n` circuit & 24.7 GB RSS elaboration spikes)."
+required_cures = [
+  "PERMANENTLY RETIRED: Use symbolic compositional lowering + external streaming artifact files, never giant inline Lean AST literals"
+]
+
+# ==============================================================================
+# 2. `minidregg` Excavations
+# ==============================================================================
+
+[[entries]]
+id = "minidregg-ledger-floors"
+donor = "minidregg"
+source_path = "Kernel/PayLedger.lean"
+state = "uptaken"
+target_repo = "obend"
+destination_path = "lean/Obend/Ledger/Book.lean"
+audit_notes = "Double-entry resource conservation (`sumBalances` invariance) and per-account credit floors (`floorsOk`, `applyPosting`) uptaken and proved kernel-clean in `Obend.Ledger.Book`."
+required_cures = []
+
+[[entries]]
+id = "minidregg-zoe-seat"
+donor = "minidregg"
+source_path = "Kernel/Seat.lean"
+state = "uptaken"
+target_repo = "obend"
+destination_path = "lean/Obend/Ledger/Seat.lean"
+audit_notes = "Agoric Offer-Safety / Zone-of-Expenditure (`Seat`, `wantSatisfied`, `refundOk`, `safeAt`) uptaken into `Obend.Ledger.Seat` with universal settlement safety theorems."
+required_cures = []
+
+[[entries]]
+id = "minidregg-pred-refusal-algebra"
+donor = "minidregg"
+source_path = "Pred"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Pred.lean"
+audit_notes = "Structured predicate & diagnostic refusal algebra (`Pred/`: `can` / `why` localized counterexample trees explaining exactly which conjunct refused)."
+required_cures = [
+  "G2: Prove bidirectional soundness/completeness (`evalWhy p x = .ok ↔ Holds p x` and `.refused path → ¬SubpredHolds path x`)",
+  "G4: Witness both acceptance and minimal refusal paths"
+]
+
+[[entries]]
+id = "minidregg-token-census"
+donor = "minidregg"
+source_path = "TokenCensus"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Census/"
+audit_notes = "Fine-grained declaration & proof-token epistemic census (`TokenCensus/`) measuring spec-to-proof ratios and axiom footprints."
+required_cures = [
+  "G1: Strip `minidregg` legacy `Host` path assumptions; integrate cleanly with `Obend/Census.lean` and `obb lint --modularity`"
+]
+
+[[entries]]
+id = "minidregg-hypothesis-ledger"
+donor = "minidregg"
+source_path = "scripts/HypothesisLedger.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Tactic/HypothesisLedger.lean"
+audit_notes = "Lean `MetaM` hypothesis-inhabitedness auditor (`scripts/HypothesisLedger.lean`). Fast lexical counterpart now ships in `obb-lint` (`lean/uninhabited-premise-risk`); full `Expr`-level command queued for Tier-1 Lean census."
+required_cures = [
+  "G1: Adapt to Lean v4.35 `module` imports alongside `Obend.AssertAxioms`",
+  "G6: Keep zero elaboration overhead when not invoked"
+]
+
+[[entries]]
+id = "minidregg-tower256"
+donor = "minidregg"
+source_path = "Compiler/Tower256ConcreteBackend.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Crypto/Tower256.lean"
+audit_notes = "Wiedemann binary tower field (`GF(2^256)`) arithmetic (`Tower256ConcreteBackend.lean`). Must respect `ePrint 2026/2424` binary RS / Ligerito proximity bounds."
+required_cures = [
+  "G1: Replace any `native_decide` field-law shortcuts with algebraic ring/field induction over tower levels",
+  "G3: Bound any binary PCS / sumcheck soundness strictly below the Johnson bound (`1 - sqrt(rate)`, `ePrint 2026/2424`)"
+]
+
+[[entries]]
+id = "minidregg-generic-simplex"
+donor = "minidregg"
+source_path = "Kernel/GenericSimplexQuorum.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Consensus/SimplexTrace.lean"
+audit_notes = "Quorum-intersection and finality/notarization trace lemmas (`GenericSimplexQuorum.lean`) extending `Obend.Consensus.SimplexTrace`."
+required_cures = [
+  "G2: Prove safety under `< n/3` equivocating weight without assuming static honest-only message delivery",
+  "G4: Provide multi-epoch view-change trace witness"
+]
+
+[[entries]]
+id = "minidregg-irreversible-effect-settlement"
+donor = "minidregg"
+source_path = "Kernel/IrreversibleEffectSettlement.lean"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Ledger/EffectSettlement.lean"
+audit_notes = "Two-phase escrow -> finality-certificate -> physical/external irreversible effect release (`IrreversibleEffectSettlement.lean`) preventing double-actuation across reorgs/rollbacks."
+required_cures = [
+  "G2: Compose directly with `Obend.Ledger.Book`, `Obend.Consensus.SimplexTrace`, and `svenvs/embodiment`",
+  "G4: Prove inhabitedness of both settled release and timeout-refund paths"
+]
+
+[[entries]]
+id = "minidregg-retired-4gen-host"
+donor = "minidregg"
+source_path = "Host"
+state = "retired_slop"
+target_repo = "obend"
+audit_notes = "QUARANTINED SLOP: 4 coexisting kernel generations (A-D) in `Host/`, O(height) full-history replay per step, and 39-minute monolithic rebuilds."
+required_cures = [
+  "PERMANENTLY RETIRED: `obend` enforces a single canonical `Vault` + `FFI/Bridge` spine with O(footprint) admission"
+]
+
+# ==============================================================================
+# 3. `svenvs` (HOL4 + Candle) Excavations
+# ==============================================================================
+
+[[entries]]
+id = "svenvs-genealogy"
+donor = "svenvs"
+source_path = "genealogy/genealogyScript.sml"
+state = "uptaken"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Genealogy.lean"
+audit_notes = "Gate succession (`WellFormed`, `Refusal`, `succeed?`, `LobCost` trust-base accounting, `revert@1` bedrock) translated from HOL4 `genealogyScript.sml` into Lean 4 `Obend.Judge.Genealogy` and mirrored in `obb-judge`."
+required_cures = []
+
+[[entries]]
+id = "svenvs-sv-weakening-liberty"
+donor = "svenvs"
+source_path = "sv_weakeningScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Weakening.lean"
+audit_notes = "Monotone envelope weakening & `liberty` preservation (`sv_weakeningScript.sml`): proves when relaxing or tightening a guard preserves downstream safety and non-deadlock."
+required_cures = [
+  "G1: Translate HOL4 `sv_weakeningScript.sml` into pure Lean 4 (`0 sorry`, `0 axiom`)",
+  "G4: Connect directly to `Obend.Judge.Genealogy` floor ordering"
+]
+
+[[entries]]
+id = "svenvs-rel-envelope"
+donor = "svenvs"
+source_path = "relEnvelopeScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/RelEnvelope.lean"
+audit_notes = "Relational safety envelopes (`relEnvelopeScript.sml`) bounding permissible state transitions under environmental disturbance."
+required_cures = [
+  "G1: Mechanize in Lean 4 over polymorphic state/action types",
+  "G2: Compose with `Obend.Hardware` / `PhysicalProjection` runtime monitors"
+]
+
+[[entries]]
+id = "svenvs-corrigibility"
+donor = "svenvs"
+source_path = "corrigibility/corrigibilityScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/Corrigibility.lean"
+audit_notes = "Shutdown/override reachability and non-interference theorems (`corrigibilityScript.sml`: agent transitions never disable human/ember halt or `home N` revert channels)."
+required_cures = [
+  "G1: Port HOL4 proofs to Lean 4 without axioms",
+  "G4: Prove constructive witness over `Obend.Vault.Mandate` revocation & `home N` revert"
+]
+
+[[entries]]
+id = "svenvs-specneg"
+donor = "svenvs"
+source_path = "specneg/specNegScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/SpecNegation.lean"
+audit_notes = "Specification negation & boundary-refusal duality (`specNegScript.sml`), formalizing `#tooth` mutation sensitivity and counterexample completeness."
+required_cures = [
+  "G1: Port HOL4 duality lemmas to Lean 4",
+  "G2: Link to `Obend.Judge` refusal soundness (`check o c = .refused r → ...`)"
+]
+
+[[entries]]
+id = "svenvs-pca"
+donor = "svenvs"
+source_path = "pca/pcaScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Vault/Pca.lean"
+audit_notes = "Proof-Carrying Authorization (`pcaScript.sml`, Appel-Felten / Garg-Pfenning) — explicit derivation trees carried across untrusted boundaries and checked in O(|proof|) by `Vault`."
+required_cures = [
+  "G1: Mechanize sequent/Datalog proof checker in Lean 4 (`0 sorry`)",
+  "G3: Bind signed principal statements to full 256-bit `Obend.Core.Digest` keys",
+  "G5: Integrate with `Obend.Vault.Mandate` without duplicating capability evaluators"
+]
+
+[[entries]]
+id = "svenvs-embodiment"
+donor = "svenvs"
+source_path = "embodiment/embodimentScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Hardware/Embodiment.lean"
+audit_notes = "Physical actuator/sensor envelope safety (`embodimentScript.sml`: sampled-time control latency + stopping-distance margin implies continuous-time safe region)."
+required_cures = [
+  "G1: Port HOL4 real/rational interval arithmetic proofs to exact `Int`/`Rat` arithmetic in Lean 4",
+  "G2: Connect to `Obend.Hardware.GeometryCAM` and `IrreversibleEffectSettlement`"
+]
+
+[[entries]]
+id = "svenvs-self-upgrade"
+donor = "svenvs"
+source_path = "selfUpgrade/selfUpgradeEndToEndScript.sml"
+state = "queued_for_upgrade"
+target_repo = "obend"
+destination_path = "lean/Obend/Judge/SelfUpgrade.lean"
+audit_notes = "End-to-end verified self-replacement (`selfUpgradeEndToEndScript.sml` + `candle/ouroboros.ml`): an active system hands control to a successor iff `Genealogy.succeed?` accepts AND state migration satisfies the bridge invariant."
+required_cures = [
+  "G1: Port end-to-end simulation/refinement theorem to Lean 4 over `Obend.Judge.Genealogy`",
+  "G4: Exhibit explicit `LobCost`-zero vs `LobCost`-labelled upgrade traces"
+]
+
+# ==============================================================================
+# 4. `lean-transport` Excavations
+# ==============================================================================
+
+[[entries]]
+id = "lean-transport-repair-dag"
+donor = "lean-transport"
+source_path = "Transport"
+state = "queued_for_upgrade"
+target_repo = "obebuilder"
+destination_path = "crates/obb-cli/"
+audit_notes = "Shadow-olean incremental DAG elaboration (`Transport/`: `--no-repair` spec-sensitivity census already wired in `obb lint spec-check`; bounded proof-repair transport pass queued for `obb repair`)."
+required_cures = [
+  "G1: Keep `lean-transport` strictly out of `Obend`'s trusted kernel basis unless recorded via `--lob external:lean-transport`",
+  "G5: Ensure `obb repair` emits plain Lean source patches re-checked from scratch by the Lean kernel"
+]

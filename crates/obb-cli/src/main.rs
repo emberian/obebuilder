@@ -8,6 +8,10 @@ use obb_judge::{
 };
 use obb_lint::spec_check::run_spec_sensitivity_check;
 use obb_lint::{filter_report_by_rule, run_repo_lints};
+use obb_quarry::{
+    DEFAULT_QUARRY_MANIFEST_REL, QuarryManifest, QuarryState, inspect_quarry_target, status_quarry,
+    sync_quarry,
+};
 use obb_state::StateStore;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,8 +51,18 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
+        /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
+        #[arg(long)]
+        modularity: bool,
+
         #[command(subcommand)]
         sub: Option<LintSubcommand>,
+    },
+
+    /// Donor History Namespace Manager (`refs/quarry/<donor>/*`) & 6-Gate Pre-Uptake Surgery Auditor
+    Quarry {
+        #[command(subcommand)]
+        sub: QuarrySubcommand,
     },
 
     /// Process Judge as a Value & machine-checked G4 non-regression (`JUDGE.md`)
@@ -102,6 +116,73 @@ enum LintSubcommand {
         #[arg(long)]
         transport_bin: Option<PathBuf>,
 
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum QuarrySubcommand {
+    /// Fetch donor repository branches cleanly into `refs/quarry/<donor>/*` (`--no-tags`, never touching HEAD/index/worktree)
+    Sync {
+        /// Target repository receiving `refs/quarry/<donor>/*`
+        #[arg(long)]
+        repo: PathBuf,
+
+        /// Path to `quarry.toml` manifest (defaults to `<workspace>/quarry/obend-quarry.toml`)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Preview exact `git fetch --no-tags --no-write-fetch-head` refspecs without touching `--repo`
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Summarize tracked donor subsystems across `uptaken`, `queued_for_upgrade`, `idea_only`, and `retired_slop`
+    Status {
+        /// Optional target repository override to verify `uptaken` destination paths and synced `refs/quarry/*`
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Path to `quarry.toml` manifest (defaults to `<workspace>/quarry/obend-quarry.toml`)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Filter entries by state (`uptaken`, `queued_for_upgrade`, `idea_only`, `retired_slop`)
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run `obb lint` + the 6-Gate Quarry Surgery Checklist on `<donor>:<path>` before uptake into `obend`
+    Inspect {
+        /// Donor target specification `<donor>:<path>` (e.g. `breadstuffs:orb/Crypto.lean` or `minidregg:Pred`)
+        target: String,
+
+        /// Target repository containing synced `refs/quarry/<donor>/*` git blobs
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Explicit read-only donor directory override
+        #[arg(long)]
+        donor_path: Option<PathBuf>,
+
+        /// Path to `quarry.toml` manifest (defaults to `<workspace>/quarry/obend-quarry.toml` if present)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Optional donor branch override when reading from `refs/quarry/<donor>/<branch>`
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Emit structured JSON report
         #[arg(long)]
         json: bool,
     },
@@ -361,6 +442,7 @@ async fn run() -> Result<ExitCode> {
             json,
             rule,
             strict,
+            modularity,
             sub,
         } => {
             if let Some(LintSubcommand::SpecCheck {
@@ -405,7 +487,7 @@ async fn run() -> Result<ExitCode> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                print_human_lint_report(&report);
+                print_human_lint_report(&report, modularity);
             }
 
             if strict && report.errors > 0 {
@@ -414,6 +496,83 @@ async fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         }
+
+        Commands::Quarry { sub } => match sub {
+            QuarrySubcommand::Sync {
+                repo,
+                manifest,
+                dry_run,
+                json,
+            } => {
+                let mpath = resolve_quarry_manifest_path(&cli.workspace, manifest)?;
+                let qmanifest = QuarryManifest::load_from_path(&mpath)?;
+                let rep = sync_quarry(&qmanifest, &repo, dry_run)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_quarry_sync(&rep);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+
+            QuarrySubcommand::Status {
+                repo,
+                manifest,
+                filter,
+                json,
+            } => {
+                let mpath = resolve_quarry_manifest_path(&cli.workspace, manifest)?;
+                let qmanifest = QuarryManifest::load_from_path(&mpath)?;
+                let parsed_filter = match filter {
+                    Some(ref raw) => Some(QuarryState::parse_filter(raw)?),
+                    None => None,
+                };
+                let rep = status_quarry(&qmanifest, repo.as_deref(), parsed_filter)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_quarry_status(&rep);
+                }
+                Ok(if rep.all_uptaken_verified {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+
+            QuarrySubcommand::Inspect {
+                target,
+                repo,
+                donor_path,
+                manifest,
+                branch,
+                json,
+            } => {
+                let loaded_manifest = match manifest {
+                    Some(explicit) => Some(QuarryManifest::load_from_path(&explicit)?),
+                    None => resolve_quarry_manifest_path(&cli.workspace, None)
+                        .ok()
+                        .and_then(|p| QuarryManifest::load_from_path(&p).ok()),
+                };
+                let rep = inspect_quarry_target(
+                    &target,
+                    repo.as_deref(),
+                    donor_path.as_deref(),
+                    loaded_manifest.as_ref(),
+                    branch.as_deref(),
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_quarry_inspect(&rep);
+                }
+                Ok(if rep.ready_for_uptake {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+        },
 
         Commands::Judge { sub } => match sub {
             JudgeSubcommand::Show { judge } => {
@@ -872,7 +1031,26 @@ fn resolve_judge_path(workspace: &Path, explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| workspace.join("judge.json"))
 }
 
-fn print_human_lint_report(rep: &obb_core::LintReport) {
+fn resolve_quarry_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let ws_candidate = workspace.join(DEFAULT_QUARRY_MANIFEST_REL);
+    if ws_candidate.is_file() {
+        return Ok(ws_candidate);
+    }
+    let crate_root_candidate =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../").join(DEFAULT_QUARRY_MANIFEST_REL);
+    if crate_root_candidate.is_file() {
+        return Ok(crate_root_candidate);
+    }
+    bail!(
+        "quarry manifest not found at {} (pass `--manifest <quarry.toml>`)",
+        ws_candidate.display()
+    )
+}
+
+fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: bool) {
     println!(
         "obb lint: repo={} files_scanned={} lean_decls={} lean_inductives={}",
         rep.repo_root, rep.files_scanned, rep.lean_declarations_indexed, rep.lean_inductives_indexed
@@ -881,6 +1059,61 @@ fn print_human_lint_report(rep: &obb_core::LintReport) {
         "totals: {} findings ({} errors, {} warnings)",
         rep.total_findings, rep.errors, rep.warnings
     );
+
+    if rep.modularity.lean_files > 0 || show_modularity_detail {
+        let m = &rep.modularity;
+        println!(
+            "modularity: index={:.2}/100 carriers={} (struct={}, class={}, inst={}) thms={} (composed={}, isolated_leaf={}, reuse={:.1}%) carrier/leaf={:.4} monoliths(>{}L)={}",
+            m.compositionality_index,
+            m.structures + m.classes,
+            m.structures,
+            m.classes,
+            m.instances,
+            m.total_theorems,
+            m.composed_theorems,
+            m.isolated_leaf_theorems,
+            m.theorem_reuse_ratio * 100.0,
+            m.carrier_to_leaf_ratio,
+            m.monolithic_line_threshold,
+            m.monolithic_modules.len()
+        );
+    }
+
+    if show_modularity_detail {
+        let m = &rep.modularity;
+        if !m.by_directory.is_empty() {
+            println!("\nModularity & Compositionality by directory:");
+            println!(
+                "  {:<28} {:>5} {:>8} {:>7} {:>8} {:>9} {:>9} {:>10}",
+                "Directory", "Files", "Lines", "MaxLine", "Carriers", "CompThm", "LeafThm", "Carr/Leaf"
+            );
+            for d in &m.by_directory {
+                println!(
+                    "  {:<28} {:>5} {:>8} {:>7} {:>8} {:>9} {:>9} {:>10.4}",
+                    d.directory,
+                    d.files,
+                    d.total_lines,
+                    d.max_lines,
+                    d.structures_and_classes,
+                    d.composed_theorems,
+                    d.isolated_leaf_theorems,
+                    d.carrier_to_leaf_ratio
+                );
+            }
+        }
+        if !m.monolithic_modules.is_empty() {
+            println!(
+                "\nMonolithic Lean modules (>{} lines — elaboration RSS blowup risk):",
+                m.monolithic_line_threshold
+            );
+            for mm in &m.monolithic_modules {
+                println!(
+                    "  {:>6} lines | {:>4} decls | {:>4} thms | {:>3} carriers | {}",
+                    mm.lines, mm.declarations, mm.theorems, mm.structures_and_classes, mm.path
+                );
+            }
+        }
+    }
 
     if !rep.by_rule.is_empty() {
         println!("\nFindings by rule:");
@@ -943,5 +1176,181 @@ fn print_human_lint_report(rep: &obb_core::LintReport) {
             "  ... ({} additional findings; pass `--json` for full list)",
             rep.findings.len() - 60
         );
+    }
+}
+
+fn print_human_quarry_sync(rep: &obb_quarry::QuarrySyncReport) {
+    let mode = if rep.dry_run { "DRY-RUN" } else { "SYNCED" };
+    println!(
+        "obb quarry sync [{mode}]: target={} head={} (head_unchanged={} index_unchanged={} worktree_unchanged={})",
+        rep.target_repo,
+        rep.head_after
+            .as_deref()
+            .map(|h| &h[..10.min(h.len())])
+            .unwrap_or("<unborn>"),
+        rep.head_unchanged,
+        rep.index_unchanged,
+        rep.worktree_unchanged
+    );
+    for act in &rep.actions {
+        let prev = act
+            .previous_target_sha
+            .as_deref()
+            .map(|s| &s[..10.min(s.len())])
+            .unwrap_or("<none>");
+        let next = &act.new_target_sha[..10.min(act.new_target_sha.len())];
+        let tag = if !act.updated {
+            "UP-TO-DATE"
+        } else if rep.dry_run {
+            "WOULD-FETCH"
+        } else {
+            "UPDATED"
+        };
+        println!(
+            "  [{tag:<11}] {:<16} {:<34} {prev} -> {next}\n    cmd: {}",
+            act.donor, act.target_ref, act.command_preview
+        );
+    }
+}
+
+fn print_human_quarry_status(rep: &obb_quarry::QuarryStatusReport) {
+    println!(
+        "obb quarry status: target={} total_entries={} all_uptaken_verified={}",
+        rep.target_repo.as_deref().unwrap_or("<none>"),
+        rep.total_entries,
+        rep.all_uptaken_verified
+    );
+    println!("By state:");
+    for (state, count) in &rep.by_state {
+        println!("  {:<22} {:>4}", state, count);
+    }
+
+    println!("\nDonors ({}):", rep.donors.len());
+    for d in &rep.donors {
+        let synced_str = if d.synced_quarry_refs.is_empty() {
+            "not yet synced in target".to_string()
+        } else {
+            d.synced_quarry_refs
+                .iter()
+                .map(|(br, sha)| format!("{br}@{}", &sha[..10.min(sha.len())]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  - {:<15} reachable={:<5} entries={:<3} synced=[{}] ({})",
+            d.donor, d.donor_reachable, d.total_entries, synced_str, d.donor_path
+        );
+    }
+
+    if !rep.uptake_violations.is_empty() {
+        println!("\nUPTAKE VERIFICATION VIOLATIONS ({}):", rep.uptake_violations.len());
+        for v in &rep.uptake_violations {
+            println!("  [FAIL] {} ({}): {}", v.entry_id, v.donor, v.reason);
+        }
+    }
+
+    println!(
+        "\nEntries ({}{}):",
+        rep.entries.len(),
+        rep.state_filter
+            .as_deref()
+            .map(|f| format!(", filter={f}"))
+            .unwrap_or_default()
+    );
+    for e in &rep.entries {
+        let dest = e.destination_path.as_deref().unwrap_or("-");
+        let dest_ok = match e.destination_exists {
+            Some(true) => " [exists]",
+            Some(false) => " [MISSING]",
+            None => "",
+        };
+        println!(
+            "  [{:<18}] {:<38} {}:{} -> {}{}\n    notes: {}",
+            e.state.as_str(),
+            e.id,
+            e.donor,
+            e.source_path,
+            dest,
+            dest_ok,
+            e.audit_notes
+        );
+    }
+}
+
+fn print_human_quarry_inspect(rep: &obb_quarry::QuarryInspectReport) {
+    let verdict = if rep.ready_for_uptake {
+        "READY FOR UPTAKE"
+    } else {
+        "BLOCKED — SURGERY REQUIRED"
+    };
+    println!(
+        "obb quarry inspect `{}` [{}]\n  source={} files={} defects={} ({} errors, {} warnings)",
+        rep.spec,
+        verdict,
+        rep.resolution_source,
+        rep.files_inspected,
+        rep.total_defects,
+        rep.errors,
+        rep.warnings
+    );
+
+    if !rep.matched_manifest_entries.is_empty() {
+        println!("\nManifest tracking ({}):", rep.matched_manifest_entries.len());
+        for m in &rep.matched_manifest_entries {
+            println!(
+                "  - {} [state={}] -> {}\n    audit: {}",
+                m.id,
+                m.state,
+                m.destination_path.as_deref().unwrap_or("<retired>"),
+                m.audit_notes
+            );
+            for cure in &m.required_cures {
+                println!("    cure:  {cure}");
+            }
+        }
+    }
+
+    println!("\n6-Gate Pre-Uptake Quarry Surgery Checklist:");
+    for g in &rep.gates {
+        let tag = if g.passed { "PASS" } else { "FAIL" };
+        println!("  [{tag}] {:<34} {} — {}", g.gate_id, g.summary, g.title);
+    }
+
+    if rep.modularity.lean_files > 0 {
+        let m = &rep.modularity;
+        println!(
+            "\nDonor Modularity Profile: lean_files={} lines={} max_lines={} carriers={} thms={} (composed={}, leaf={}) index={:.2}/100",
+            m.lean_files,
+            m.total_lean_lines,
+            m.max_module_lines,
+            m.structures + m.classes,
+            m.total_theorems,
+            m.composed_theorems,
+            m.isolated_leaf_theorems,
+            m.compositionality_index
+        );
+    }
+
+    if !rep.findings.is_empty() {
+        println!("\nDefects that must be cured before entering `obend` (showing up to 60):");
+        for f in rep.findings.iter().take(60) {
+            println!(
+                "  [{}][{}] {}:{}:{} ({})\n    {}\n    cure: {}",
+                f.severity,
+                f.artifact_kind,
+                f.path,
+                f.line,
+                f.column,
+                f.rule_id,
+                f.message,
+                f.remediation
+            );
+        }
+        if rep.findings.len() > 60 {
+            println!(
+                "  ... ({} additional defects; pass `--json` for full list)",
+                rep.findings.len() - 60
+            );
+        }
     }
 }

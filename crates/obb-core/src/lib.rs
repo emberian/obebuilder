@@ -185,6 +185,56 @@ pub struct DirectoryCensus {
     pub warning_count: usize,
 }
 
+/// Giant monolithic `.lean` module (> 1,500 lines) risking elaboration RSS blowup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonolithicModule {
+    pub path: String,
+    pub lines: usize,
+    pub declarations: usize,
+    pub theorems: usize,
+    pub structures_and_classes: usize,
+}
+
+/// Per-directory modularity and compositionality breakdown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryModularity {
+    pub directory: String,
+    pub files: usize,
+    pub total_lines: usize,
+    pub max_lines: usize,
+    pub structures_and_classes: usize,
+    pub instances: usize,
+    pub total_theorems: usize,
+    pub composed_theorems: usize,
+    pub isolated_leaf_theorems: usize,
+    pub carrier_to_leaf_ratio: f64,
+}
+
+/// Repository-wide Modularity & Compositionality Index (`obb lint --modularity`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModularityReport {
+    pub monolithic_line_threshold: usize,
+    pub lean_files: usize,
+    pub total_lean_lines: usize,
+    pub max_module_lines: usize,
+    pub max_module_path: Option<String>,
+    pub structures: usize,
+    pub classes: usize,
+    pub instances: usize,
+    pub inductives: usize,
+    pub total_theorems: usize,
+    pub composed_theorems: usize,
+    pub isolated_leaf_theorems: usize,
+    /// `(structures + classes) / max(1, isolated_leaf_theorems)`.
+    pub carrier_to_leaf_ratio: f64,
+    /// `composed_theorems / max(1, total_theorems)`.
+    pub theorem_reuse_ratio: f64,
+    /// Composite 0..100 modularity score weighting theorem reuse, algebraic interfaces, and module size bounds.
+    pub compositionality_index: f64,
+    pub monolithic_modules: Vec<MonolithicModule>,
+    pub by_directory: Vec<DirectoryModularity>,
+}
+
 /// Complete `obb lint` report over a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LintReport {
@@ -201,6 +251,8 @@ pub struct LintReport {
     pub by_regime: BTreeMap<String, usize>,
     pub by_sink: BTreeMap<String, usize>,
     pub directory_census: Vec<DirectoryCensus>,
+    #[serde(default)]
+    pub modularity: ModularityReport,
     pub findings: Vec<Finding>,
 }
 

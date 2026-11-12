@@ -752,6 +752,20 @@ pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> 
                             },
                         )
                     }
+                    "no_native_decide_in_proof" => {
+                        let c = count_rule("lean/native-decide-in-proof");
+                        (
+                            c,
+                            format!("{c} unaudited `native_decide`/`Lean.ofReduceBool` bypass(es) in library modules"),
+                        )
+                    }
+                    "no_narrow_digest_weld" => {
+                        let c = count_rule("lean/narrow-digest-weld");
+                        (
+                            c,
+                            format!("{c} narrow <=64-bit or 1-limb digest weld(s)"),
+                        )
+                    }
                     other => (
                         count_rule(other),
                         format!("lint rule `{other}` count"),

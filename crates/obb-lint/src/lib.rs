@@ -5,6 +5,7 @@ pub mod lean_index;
 pub mod lean_lexer;
 pub mod lean_rules;
 pub mod markdown_rules;
+pub mod modularity;
 pub mod obend_rules;
 pub mod python_rules;
 pub mod rust_rules;
@@ -15,6 +16,7 @@ use chrono::Utc;
 use lean_index::build_lean_index;
 use lean_rules::run_lean_lints;
 use markdown_rules::scan_markdown_files;
+use modularity::compute_modularity_report;
 use obb_core::{DirectoryCensus, Finding, LintReport, Severity};
 use obend_rules::scan_all_obend_files;
 use python_rules::scan_python_files;
@@ -34,6 +36,7 @@ pub fn run_repo_lints(repo_root: &Path) -> Result<LintReport> {
     let lean_decls = index.total_declarations();
     let lean_inds = index.total_inductives();
 
+    let modularity = compute_modularity_report(&index);
     let (mut findings, mut dir_census) = run_lean_lints(&index);
     let (obend_count, obend_findings) = scan_all_obend_files(&canon);
     let (py_count, py_findings) = scan_python_files(&canon);
@@ -136,6 +139,7 @@ pub fn run_repo_lints(repo_root: &Path) -> Result<LintReport> {
         by_regime,
         by_sink,
         directory_census,
+        modularity,
         findings,
     })
 }

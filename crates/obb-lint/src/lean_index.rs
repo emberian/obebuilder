@@ -24,6 +24,15 @@ pub struct BinderParam {
     pub name: String,
     pub is_underscore: bool,
     pub is_instance_bracket: bool,
+    pub type_tokens: Vec<LeanToken>,
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub type_tokens: Vec<LeanToken>,
     pub line: usize,
     pub col: usize,
 }
@@ -51,15 +60,18 @@ pub struct ParsedLeanDecl {
     pub body_tokens: Vec<LeanToken>,
     pub where_fields: Vec<WhereField>,
     pub constructors: Vec<String>,
+    pub struct_fields: Vec<StructField>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedLeanFile {
     pub rel_path: String,
     pub directory_bucket: String,
+    pub line_count: usize,
     pub declarations: Vec<ParsedLeanDecl>,
     pub tooth_targets: Vec<(String, usize)>,
     pub assert_compiled_targets: Vec<(String, usize)>,
+    pub guard_tokens: Vec<(usize, Vec<LeanToken>)>,
     pub max_heartbeats: Vec<(u64, usize)>,
     pub raw_sorry_sites: Vec<(usize, usize, String)>,
 }
@@ -215,12 +227,14 @@ fn directory_bucket_of(rel_path: &str) -> String {
 
 /// Parse a single `.lean` source file into structured declarations, inductives, tactics, and commands.
 pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
+    let line_count = src.lines().count();
     let tokens = tokenize_lean(src);
     let n = tokens.len();
     let mut ns_stack: Vec<(bool, Vec<String>)> = Vec::new(); // (is_namespace, components)
     let mut declarations = Vec::new();
     let mut tooth_targets = Vec::new();
     let mut assert_compiled_targets = Vec::new();
+    let mut guard_tokens = Vec::new();
     let mut max_heartbeats = Vec::new();
     let mut raw_sorry_sites = Vec::new();
 
@@ -287,7 +301,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
             continue;
         }
 
-        // `#tooth <target>` / `#assert_compiled <target>`
+        // `#tooth <target>` / `#assert_compiled <target>` / `#guard <expr>`
         if let LeanTokenKind::CommandHash(cmd) = &tokens[i].kind {
             if cmd == "#tooth" {
                 if let Some(LeanToken {
@@ -312,6 +326,31 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                 }
                 pending_fixture_kept = false;
                 i += 1;
+                continue;
+            } else if cmd == "#guard" || cmd == "#silicon_check" {
+                let gline = tokens[i].line;
+                let mut gend = i + 1;
+                let mut depth = 0isize;
+                while gend < n {
+                    if depth == 0 && gend > i + 1 && is_top_command_starter(&tokens[gend]) {
+                        break;
+                    }
+                    match &tokens[gend].kind {
+                        LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "#[") => {
+                            depth += 1;
+                        }
+                        LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                            if depth > 0 {
+                                depth -= 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    gend += 1;
+                }
+                guard_tokens.push((gline, tokens[i + 1..gend].to_vec()));
+                pending_fixture_kept = false;
+                i = gend;
                 continue;
             }
         }
@@ -493,9 +532,11 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
     ParsedLeanFile {
         rel_path: rel_path.to_string(),
         directory_bucket: directory_bucket_of(rel_path),
+        line_count,
         declarations,
         tooth_targets,
         assert_compiled_targets,
+        guard_tokens,
         max_heartbeats,
         raw_sorry_sites,
     }
@@ -595,6 +636,7 @@ fn parse_command_slice(
             body_tokens,
             where_fields: Vec::new(),
             constructors: Vec::new(),
+            struct_fields: Vec::new(),
         });
     }
 
@@ -664,6 +706,8 @@ fn parse_command_slice(
         let mut constructors = Vec::new();
         let mut depth = 0isize;
         let mut in_body = false;
+        let mut header_colon_idx: Option<usize> = None;
+        let mut body_start_idx: Option<usize> = None;
         let mut idx = pos;
         while idx < cmd.len() {
             match &cmd[idx].kind {
@@ -673,13 +717,25 @@ fn parse_command_slice(
                         depth -= 1;
                     }
                 }
+                LeanTokenKind::Symbol(s) if s == ":" && !in_body && depth == 0 && header_colon_idx.is_none() => {
+                    header_colon_idx = Some(idx);
+                }
                 LeanTokenKind::Ident(s) if s == "where" && depth == 0 => {
+                    if body_start_idx.is_none() {
+                        body_start_idx = Some(idx);
+                    }
                     in_body = true;
                 }
                 LeanTokenKind::Ident(s) if s == "deriving" && depth == 0 => {
+                    if body_start_idx.is_none() {
+                        body_start_idx = Some(idx);
+                    }
                     break;
                 }
                 LeanTokenKind::Symbol(s) if s == "|" && depth == 0 => {
+                    if body_start_idx.is_none() {
+                        body_start_idx = Some(idx);
+                    }
                     in_body = true;
                     // Next identifier (skipping optional doc comments or modifiers) is the constructor name!
                     let mut k = idx + 1;
@@ -700,12 +756,21 @@ fn parse_command_slice(
                         constructors.push(short_ctor);
                     }
                 }
-                _ => {
-                    let _ = in_body;
-                }
+                _ => {}
             }
             idx += 1;
         }
+        let header_type_tokens = match header_colon_idx {
+            Some(hc) => {
+                let end_hdr = body_start_idx.unwrap_or(cmd.len());
+                if hc + 1 <= end_hdr {
+                    cmd[hc + 1..end_hdr].to_vec()
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        };
         return Some(ParsedLeanDecl {
             kind,
             name,
@@ -715,18 +780,23 @@ fn parse_command_slice(
             col,
             fixture_kept,
             binders: Vec::new(),
-            type_tokens: Vec::new(),
+            type_tokens: header_type_tokens,
             body_tokens: Vec::new(),
             where_fields: Vec::new(),
             constructors,
+            struct_fields: Vec::new(),
         });
     }
 
     // Structure / Class field extraction
     if kind == DeclKind::Structure || kind == DeclKind::Class {
         let mut fields = Vec::new();
+        let mut struct_fields = Vec::new();
+        let mut header_type_tokens = Vec::new();
         let mut depth = 0isize;
         let mut after_where = false;
+        let mut header_colon_idx: Option<usize> = None;
+        let mut where_idx: Option<usize> = None;
         for (idx, tok) in cmd.iter().enumerate().skip(pos) {
             match &tok.kind {
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
@@ -735,8 +805,12 @@ fn parse_command_slice(
                         depth -= 1;
                     }
                 }
+                LeanTokenKind::Symbol(s) if s == ":" && !after_where && depth == 0 && header_colon_idx.is_none() => {
+                    header_colon_idx = Some(idx);
+                }
                 LeanTokenKind::Ident(s) if s == "where" && depth == 0 => {
                     after_where = true;
+                    where_idx = Some(idx);
                 }
                 LeanTokenKind::Ident(s) if s == "deriving" && depth == 0 => {
                     break;
@@ -751,9 +825,54 @@ fn parse_command_slice(
                         )
                     {
                         fields.push(field_id.clone());
+                        // Extract field's type tokens between `:` (at depth 0 relative to field) and `:=` or next field / `deriving`
+                        let mut k = idx + 1;
+                        let mut fdepth = 0isize;
+                        let mut fcolon = None;
+                        while k < cmd.len() {
+                            if fdepth == 0
+                                && k > idx + 1
+                                && ((cmd[k].first_on_line && cmd[k].col <= tok.col)
+                                    || matches!(&cmd[k].kind, LeanTokenKind::Ident(s) if s == "deriving")
+                                    || matches!(&cmd[k].kind, LeanTokenKind::Symbol(s) if s == ":="))
+                            {
+                                break;
+                            }
+                            match &cmd[k].kind {
+                                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
+                                    fdepth += 1;
+                                }
+                                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                                    if fdepth > 0 {
+                                        fdepth -= 1;
+                                    }
+                                }
+                                LeanTokenKind::Symbol(s) if s == ":" && fdepth == 0 && fcolon.is_none() => {
+                                    fcolon = Some(k);
+                                }
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        let ftype = match fcolon {
+                            Some(fc) if fc + 1 <= k => cmd[fc + 1..k].to_vec(),
+                            _ => Vec::new(),
+                        };
+                        struct_fields.push(StructField {
+                            name: field_id.clone(),
+                            type_tokens: ftype,
+                            line: tok.line,
+                            col: tok.col,
+                        });
                     }
                 }
                 _ => {}
+            }
+        }
+        if let Some(hc) = header_colon_idx {
+            let end_hdr = where_idx.unwrap_or(cmd.len());
+            if hc + 1 <= end_hdr {
+                header_type_tokens = cmd[hc + 1..end_hdr].to_vec();
             }
         }
         return Some(ParsedLeanDecl {
@@ -765,10 +884,11 @@ fn parse_command_slice(
             col,
             fixture_kept,
             binders: Vec::new(),
-            type_tokens: Vec::new(),
+            type_tokens: header_type_tokens,
             body_tokens: Vec::new(),
             where_fields: Vec::new(),
             constructors: fields,
+            struct_fields,
         });
     }
 
@@ -818,6 +938,7 @@ fn parse_command_slice(
                     name: param_id.clone(),
                     is_underscore: param_id.starts_with('_'),
                     is_instance_bracket: false,
+                    type_tokens: Vec::new(),
                     line: tok.line,
                     col: tok.col,
                 });
@@ -886,6 +1007,7 @@ fn parse_command_slice(
         body_tokens,
         where_fields,
         constructors: Vec::new(),
+        struct_fields: Vec::new(),
     })
 }
 
@@ -914,14 +1036,15 @@ fn extract_binder_group(group: &[LeanToken], is_instance_bracket: bool, out: &mu
             name: String::from("_inst"),
             is_underscore: true,
             is_instance_bracket: true,
+            type_tokens: group.to_vec(),
             line: group.first().map(|t| t.line).unwrap_or(1),
             col: group.first().map(|t| t.col).unwrap_or(1),
         });
         return;
     }
-    let lhs = match colon_pos {
-        Some(c) => &group[..c],
-        None => group,
+    let (lhs, rhs_type) = match colon_pos {
+        Some(c) => (&group[..c], group[c + 1..].to_vec()),
+        None => (group, Vec::new()),
     };
     for t in lhs {
         if let LeanTokenKind::Ident(name) = &t.kind {
@@ -929,6 +1052,7 @@ fn extract_binder_group(group: &[LeanToken], is_instance_bracket: bool, out: &mu
                 name: name.clone(),
                 is_underscore: name.starts_with('_'),
                 is_instance_bracket,
+                type_tokens: rhs_type.clone(),
                 line: t.line,
                 col: t.col,
             });
