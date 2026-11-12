@@ -84,26 +84,29 @@ command's time in `data/costs.tsv`.
 - **The four merges of 2026-11-05 are gated after the fact,** each page saying `gated: after` and the
   dev commit its gate passed on; DEV lists all of dev's merges of the swarm.
 
-## What is still missing
+## Closed on 2026-11-12 (Shard S5 & Chasm C5)
 
-1. **A merge replays a fork's turn one page at a time.** Writes a fork landed together are refused at
-   the tip one by one, each waiting on another (FINDINGS 41). `Branch.merge` should replay a side's turn
-   as a turn.
-2. **Authority in a fork.** A fork writes as the owner; the merge does not know which lane wrote, so a
-   lane's fork can write any page. A fork declared for a member, its writes judged against that
-   member's grants at the tip (FINDINGS 12).
-3. **Link roles.** A law over links or backlinks reads every linked page alike: a lane's law cannot tell
-   its build box from its brief, and DEV cannot see a merged lane that does not link it (FINDINGS 6, 8).
-4. **Records of facts that break a law.** A box that went down, a tally over a floor: each is refused
-   instead of recorded as an inconsistency to resolve (FINDINGS 14, 20). The reasons substrate is where
-   such facts belong; the vault's laws do not yet read it.
-5. **The judge in front of the command.** The doctrine is two texts (the lanes kind's laws and the
-   genealogy's floors), and the genealogy's habitat is a record of naturals, not the vault (FINDINGS 19,
-   20; JUDGE.md's "What does not exist yet").
-6. **Gates the root runs.** The root merged both of today's lanes with no gate of its own, and dev's
-   FORMS walkthrough now fails its cost check (FINDINGS 38, 43). A merge into dev should be a fill of
-   the lane's brief whose gate line the root's own run wrote.
-7. **Git as an environment.** `ancestor: true` is written by a script; no law reads dev's history
-   (FINDINGS 9).
-8. **cv inside the vault.** The doctrine counts and gate lines are extracted by a script over `cv show
-   --json`; the lints of PROCESS.md §2 are not yet a part of `cv` or `obb lint` that writes the pages.
+- **Sharded Merkleized checkpoints (`Obend.Vault.ChunkedWorld`).** 128-bucket `cSHAKE256` sharded
+  world storage (`Replay.sharded_checkpoint_is_cache` proved unconditionally): 20,000-page single-page
+  `land + write` drops from `1,812 ms` (`15.58 MB`) to `65 ms` (`101.6 KB`), `.obend/checkpoint`
+  drops to `8.7 KB`, and unchanged `open` writes `0` shard files.
+- **A merge replays a fork's turn atomically (`FINDINGS 41`).** `Branch.merge` and `Merge.mergeVault`
+  replay multi-page interdependent writes as a single turn (`merge_is_pushout`, `merge_vault_agrees`).
+- **Authority in a fork (`FINDINGS 12`).** `obend fork` and `obend branch` accept `--for MEMBER`,
+  judging fork writes against that member's standing grants and revocations at merge tip.
+- **Typed link roles, `Reasons`-routed telemetry, doctrine `Genealogy`, and `LawDial` repair
+  (`Obend.Vault.SwarmLedgerSeams` & `Obend.Reasons.UnifiedEquilibrium`, landing in Wave 3.7).**
+  Role-qualified link laws (`FINDINGS 6, 8`), dead-box / floor-breach observations routed into
+  `Reasons` defeaters without refusing factual telemetry (`FINDINGS 14, 20`), `vaultDoctrineHabitat`
+  enforcing monotone `Reground` (`G4`) floors (`FINDINGS 19`), and complete multi-field `LawDial`
+  witness synthesis.
+
+## What remains to wire into the live CLI workflow
+
+1. **Root gate fills on merge (`FINDINGS 38, 43`).** Merging a lane into `dev` should record an
+   `obb broker` / `obb judge` gate fill written by the coordinator's own run.
+2. **Git ancestry as an environment fact (`FINDINGS 9`).** `ancestor: true` should be supplied by an
+   authenticated `obb` git probe rather than an external script.
+3. **Direct `obb` $\to$ Vault ledger emission (`DESIGN.md` §3).** Now that 20,000-page Vault writes
+   complete in `65 ms`, `obb` segment and evaluator transitions can emit directly into the swarm
+   vault alongside `cv` transcript citations.

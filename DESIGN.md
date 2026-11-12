@@ -105,17 +105,31 @@ load; artifacts with their populations and evaluator verdicts; a "ready" column 
 ember" column; server-sent events. This is how a person follows forty segments without reading
 forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 6. Shape and milestones
+## 6. Shape and landed engines (`obb v2`)
 
-Rust workspace, one binary `obb`: `seg fork|continue|compare|merge|forget`, `art variants|critique|
-evaluate`, `lint` (plug-ins per language; the Lean one extends `Obend.Census`), `serve`, `run`
-(tokio supervisor; executors as trait objects), state in SQLite, artifacts and ledger in git.
+Rust 2024 workspace (`obb-core`, `obb-lint`, `obb-judge`, `obb-state`, `obb-broker`, `obb-cli`), one
+binary `obb`:
 
-1. `lint` over obend's tree producing the per-directory classification and the `.obend` claim check,
-   plus `serve` over a hand-written segment tree for obend's current situation.
-2. `seg` operations over `cv`, with the three executors, budgets, and the forgetting cadence.
-3. Populations and evaluators; the spec of obend run as the first population.
-4. Brief induction from `cv`; the ledger into an obend vault.
+1. **`obb lint` & `--modularity` (`obb-lint`)**: Vacuity, `atp-checkers`, uninhabited-premise,
+   `native_decide`, narrow-digest-weld (`< 128` bits), and Lean 4.35 module-hygiene rules
+   (`lean/file-wide-expose`, `lean/public-meta-import-leak`), plus `.obend` claim checks, process
+   sink detectors, and typeclass/structure compositionality indexing.
+2. **`obb cone` & `obb apex` (`obb-lint`)**: `< 25 ms` parallel Lean module-header DAG analyzer and
+   disjoint shard planner (`obb cone plan`, isolating high-fan-in Wave-0 hubs), paired with
+   whole-system Apex theorem reverse-cone coverage and leaf-island detection against
+   `quarry/obend-apex.toml`.
+3. **`obb pipeline` & `obb judge` (`obb-judge`)**: Two-stage `[HypothesisLedger]` / `[Obligations]`
+   interface-lock (`STAGE_A_LOCKED`) and non-vacuous instance-seal (`STAGE_B_SEALED`) swarm gate,
+   plus `Genealogy`-style monotone floor judging (`g0-obebuilder` self-hosting floors).
+4. **`obb quarry` (`obb-lint` / `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
+   synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
+5. **`obb broker`, `obb state`/`seg` & `obb serve` (`obb-broker`, `obb-state`)**: ZFS-ARC-aware SSH
+   probe and `cp -al` `.lake/build` seed-pool router across `bb2` and `hbox` with hard wall-clock
+   and RSS reapers, segment/worktree/ledger tracking, and live SSE dashboard.
+6. **Multi-family Mixture-of-Agents (`Principles 3 & 4`)**: Parallel Round-1 population drafts
+   across Gemini (`agy`), GPT-6-Astra (`codex exec`), and Claude-Fable-5.2 (`claude -p`) armed with
+   `~/swarm/research.py` and `~/paperbin`, followed by Round-2 cross-family synthesis before Wave
+   commits.
 
 ## 7. What this is not
 
