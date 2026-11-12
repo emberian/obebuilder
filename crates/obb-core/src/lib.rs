@@ -265,6 +265,12 @@ pub struct LintReport {
     pub total_findings: usize,
     pub errors: usize,
     pub warnings: usize,
+    #[serde(default)]
+    pub tier1_guards: usize,
+    #[serde(default)]
+    pub tier1_teeth: usize,
+    #[serde(default)]
+    pub tier1_evals: usize,
     pub by_rule: BTreeMap<String, usize>,
     pub by_artifact_kind: BTreeMap<String, usize>,
     pub by_regime: BTreeMap<String, usize>,

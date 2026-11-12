@@ -19,7 +19,7 @@ use anyhow::Result;
 use chrono::Utc;
 use cross_lang::scan_cross_lang_domain_tags;
 use lean_index::build_lean_index;
-use lean_rules::{LeanLintOptions, run_lean_lints_with_options};
+use lean_rules::{LeanLintOptions, compute_tier1_test_counts, run_lean_lints_with_options};
 use markdown_rules::scan_markdown_files;
 use modularity::compute_modularity_report;
 use obb_core::{DirectoryCensus, Finding, LintReport, Severity};
@@ -39,6 +39,8 @@ pub struct RepoLintOptions {
     pub strict_vacuity: bool,
     /// Escalate `cross-lang/domain-tag-drift` from `Severity::Warning` to `Severity::Error`.
     pub strict_wire: bool,
+    /// Enable `lean/test-in-library` (`Severity::Error` on `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules outside `lean/Obend/Teeth/`).
+    pub strict_tests: bool,
 }
 
 /// Run all mechanical anti-slop, vacuity, seam-mirror, and doc-integrity checks over `repo_root`
@@ -62,12 +64,14 @@ pub fn run_repo_lints_with_options(
     let lean_inds = index.total_inductives();
 
     let modularity = compute_modularity_report(&index);
+    let (tier1_guards, tier1_teeth, tier1_evals) = compute_tier1_test_counts(&index);
     let (mut findings, mut dir_census) = run_lean_lints_with_options(
         &index,
         LeanLintOptions {
             strict_expose: options.strict_expose,
             strict_harnesses: options.strict_harnesses,
             strict_vacuity: options.strict_vacuity,
+            strict_tests: options.strict_tests,
         },
     );
     let (obend_count, obend_findings) = scan_all_obend_files(&canon);
@@ -168,6 +172,9 @@ pub fn run_repo_lints_with_options(
         total_findings: findings.len(),
         errors,
         warnings,
+        tier1_guards,
+        tier1_teeth,
+        tier1_evals,
         by_rule,
         by_artifact_kind,
         by_regime,

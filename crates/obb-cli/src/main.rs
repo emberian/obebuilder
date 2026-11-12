@@ -80,6 +80,10 @@ enum Commands {
         #[arg(long)]
         strict_wire: bool,
 
+        /// Enforce 3-way proof/test/mutation separation (`lean/test-in-library` error on `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules outside `lean/Obend/Teeth/`)
+        #[arg(long)]
+        strict_tests: bool,
+
         /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
         #[arg(long)]
         modularity: bool,
@@ -699,6 +703,7 @@ async fn run() -> Result<ExitCode> {
             strict_harnesses,
             strict_vacuity,
             strict_wire,
+            strict_tests,
             modularity,
             sub,
         } => {
@@ -743,6 +748,7 @@ async fn run() -> Result<ExitCode> {
                     strict_harnesses,
                     strict_vacuity,
                     strict_wire,
+                    strict_tests,
                 },
             )?;
             if let Some(ref flt) = rule {
@@ -1602,6 +1608,10 @@ fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: b
     println!(
         "totals: {} findings ({} errors, {} warnings)",
         rep.total_findings, rep.errors, rep.warnings
+    );
+    println!(
+        "tier1_tests: tier1_guards={} tier1_teeth={} tier1_evals={}",
+        rep.tier1_guards, rep.tier1_teeth, rep.tier1_evals
     );
 
     if rep.modularity.lean_files > 0 || show_modularity_detail {

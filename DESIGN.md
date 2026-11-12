@@ -105,7 +105,7 @@ load; artifacts with their populations and evaluator verdicts; a "ready" column 
 ember" column; server-sent events. This is how a person follows forty segments without reading
 forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 6. Shape and landed engines (`obb v5`)
+## 6. Shape and landed engines (`obb v6`)
 
 Rust 2024 workspace (`obb-core`, `obb-lint`, `obb-judge`, `obb-state`, `obb-broker`, `obb-cli`), one
 binary `obb`:
@@ -114,7 +114,9 @@ binary `obb`:
    `Judge.Fragment` operational-check restatement (`lean/judge-fragment-restates-check`),
    Pigeonhole/Minkowski vacuous cryptographic hardness & unkeyed `Prop` collision disjunctions
    (`lean/pigeonhole-vacuous-premise`), cross-language `Rust ↔ Lean` domain-tag & static framing
-   arity drift (`cross-lang/domain-tag-drift`), `native_decide`, narrow-digest-weld (`< 128` bits),
+   arity drift (`cross-lang/domain-tag-drift`), 3-way proof/test/mutation separation
+   (`lean/test-in-library` under `--strict-tests` + always-on `tier1_guards` / `tier1_teeth` /
+   `tier1_evals` telemetry), `native_decide`, narrow-digest-weld (`< 128` bits),
    and Lean 4.35 module-hygiene rules (`lean/file-wide-expose`, `lean/public-meta-import-leak`),
    plus `.obend` claim checks, process sink detectors, and typeclass/structure compositionality
    indexing.

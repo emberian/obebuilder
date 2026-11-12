@@ -75,6 +75,34 @@ pub struct ParsedLeanDecl {
     pub struct_fields: Vec<StructField>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestCommandKind {
+    Guard,
+    GuardMsgs,
+    Tooth,
+    Eval,
+}
+
+impl TestCommandKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guard => "#guard",
+            Self::GuardMsgs => "#guard_msgs",
+            Self::Tooth => "#tooth",
+            Self::Eval => "#eval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeanTestCommandSite {
+    pub kind: TestCommandKind,
+    pub raw_cmd: String,
+    pub line: usize,
+    pub col: usize,
+    pub target_hint: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedLeanFile {
     pub rel_path: String,
@@ -88,6 +116,7 @@ pub struct ParsedLeanFile {
     pub tooth_targets: Vec<(String, usize)>,
     pub assert_compiled_targets: Vec<(String, usize)>,
     pub guard_tokens: Vec<(usize, Vec<LeanToken>)>,
+    pub test_commands: Vec<LeanTestCommandSite>,
     pub max_heartbeats: Vec<(u64, usize)>,
     pub raw_sorry_sites: Vec<(usize, usize, String)>,
 }
@@ -283,6 +312,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
     let mut tooth_targets = Vec::new();
     let mut assert_compiled_targets = Vec::new();
     let mut guard_tokens = Vec::new();
+    let mut test_commands = Vec::new();
     let mut max_heartbeats = Vec::new();
     let mut raw_sorry_sites = Vec::new();
 
@@ -297,6 +327,88 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                     raw_sorry_sites.push((tok.line, tok.col, id.clone()));
                 }
             }
+        }
+    }
+
+    // Scan for top-level `#guard`, `#guard_msgs`, `#tooth`, and `#eval` command occurrences
+    // outside comments, strings, syntax quotations `` `(...) ``, and parenthesized/bracketed terms.
+    let mut quote_depths: Vec<usize> = Vec::new();
+    let mut ordinary_bracket_depth: usize = 0;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if quote_depths.is_empty() && tok.first_on_line && tok.col == 1 {
+            ordinary_bracket_depth = 0;
+        }
+        if !quote_depths.is_empty() {
+            match &tok.kind {
+                LeanTokenKind::SyntaxQuoteOpen => {
+                    quote_depths.push(1);
+                }
+                LeanTokenKind::AntiquoteOpen => {
+                    if let Some(last) = quote_depths.last_mut() {
+                        *last += 1;
+                    }
+                }
+                LeanTokenKind::Symbol(s) if s == "(" => {
+                    if let Some(last) = quote_depths.last_mut() {
+                        *last += 1;
+                    }
+                }
+                LeanTokenKind::Symbol(s) if s == ")" => {
+                    if let Some(last) = quote_depths.last_mut() {
+                        *last = last.saturating_sub(1);
+                        if *last == 0 {
+                            quote_depths.pop();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match &tok.kind {
+            LeanTokenKind::SyntaxQuoteOpen => {
+                quote_depths.push(1);
+            }
+            LeanTokenKind::AntiquoteOpen => {
+                ordinary_bracket_depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "#[" | "@[") => {
+                ordinary_bracket_depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                ordinary_bracket_depth = ordinary_bracket_depth.saturating_sub(1);
+            }
+            LeanTokenKind::CommandHash(cmd) if ordinary_bracket_depth == 0 => {
+                let kind = match cmd.as_str() {
+                    "#guard" => Some(TestCommandKind::Guard),
+                    "#guard_msgs" => Some(TestCommandKind::GuardMsgs),
+                    "#tooth" => Some(TestCommandKind::Tooth),
+                    "#eval" | "#eval!" => Some(TestCommandKind::Eval),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let target_hint = if kind == TestCommandKind::Tooth {
+                        match tokens.get(idx + 1) {
+                            Some(LeanToken {
+                                kind: LeanTokenKind::Ident(target),
+                                ..
+                            }) => Some(target.clone()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    test_commands.push(LeanTestCommandSite {
+                        kind,
+                        raw_cmd: cmd.clone(),
+                        line: tok.line,
+                        col: tok.col,
+                        target_hint,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -718,6 +830,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
         tooth_targets,
         assert_compiled_targets,
         guard_tokens,
+        test_commands,
         max_heartbeats,
         raw_sorry_sites,
     }

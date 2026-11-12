@@ -144,6 +144,52 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
         let tok_first = first_on_line;
         first_on_line = false;
 
+        // Raw string literal `r#"..."#`, `r##"..."##`, ...
+        if c == 'r' && i + 2 < n && chars[i + 1] == '#' {
+            let mut hashes = 0usize;
+            while i + 1 + hashes < n && chars[i + 1 + hashes] == '#' {
+                hashes += 1;
+            }
+            if hashes >= 1 && i + 1 + hashes < n && chars[i + 1 + hashes] == '"' {
+                i += 2 + hashes;
+                col += 2 + hashes;
+                let mut s = String::new();
+                while i < n {
+                    if chars[i] == '"' {
+                        let mut close_ok = i + hashes < n;
+                        if close_ok {
+                            for h in 1..=hashes {
+                                if chars[i + h] != '#' {
+                                    close_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if close_ok {
+                            i += 1 + hashes;
+                            col += 1 + hashes;
+                            break;
+                        }
+                    }
+                    if chars[i] == '\n' {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                tokens.push(LeanToken {
+                    kind: LeanTokenKind::StrLit(s),
+                    line: start_line,
+                    col: start_col,
+                    first_on_line: tok_first,
+                });
+                continue;
+            }
+        }
+
         // Interpolated string prefix `s!"..."` or `m!"..."` or normal string `"..."`
         if (matches!(c, 's' | 'm' | 'f') && i + 2 < n && chars[i + 1] == '!' && chars[i + 2] == '"')
             || c == '"'
@@ -346,8 +392,13 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
             }
         }
 
-        // Hash command `#tooth`, `#assert_compiled`, `#silicon_check`, `#guard`, or BitVec literal `1#64`
-        if c == '#' && i + 1 < n && is_ident_start(chars[i + 1]) {
+        // Hash command `#tooth`, `#assert_compiled`, `#silicon_check`, `#guard`, `#eval`, `#guard_msgs`
+        // (excludes BitVec width suffixes `x#width` and name quotes `` `#foo `` where `#` immediately follows an atom)
+        let prev_blocks_hash_cmd = i > 0
+            && (is_ident_continue(chars[i - 1])
+                || chars[i - 1].is_ascii_alphanumeric()
+                || matches!(chars[i - 1], ')' | ']' | '}' | '`' | '\'' | '"'));
+        if c == '#' && !prev_blocks_hash_cmd && i + 1 < n && is_ident_start(chars[i + 1]) {
             let mut cmd = String::from("#");
             i += 1;
             col += 1;

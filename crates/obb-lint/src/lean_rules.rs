@@ -1,6 +1,8 @@
 //! Mechanical anti-slop & vacuity detectors for Lean 4 (`DESIGN.md` §2.6, `JUDGE.md`).
 
-use crate::lean_index::{BinderParam, DeclKind, LeanIndex, ParsedLeanDecl, ParsedLeanFile};
+use crate::lean_index::{
+    BinderParam, DeclKind, LeanIndex, ParsedLeanDecl, ParsedLeanFile, TestCommandKind,
+};
 use crate::lean_lexer::{LeanToken, LeanTokenKind};
 use obb_core::{ArtifactKind, DirectoryCensus, Finding, Regime, Severity, Sink};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,6 +18,36 @@ pub struct LeanLintOptions {
     pub strict_harnesses: bool,
     /// Escalate `lean/judge-fragment-restates-check` and `lean/pigeonhole-vacuous-premise` from `Severity::Warning` to `Severity::Error`.
     pub strict_vacuity: bool,
+    /// Enable `lean/test-in-library` (`Severity::Error` on `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules outside `lean/Obend/Teeth/`).
+    pub strict_tests: bool,
+}
+
+/// Returns `true` when `rel_path` is a Tier-1 library `.lean` file under `lean/Obend/`
+/// (or root `lean/Obend.lean`) excluding `lean/Obend/Teeth/`.
+pub fn is_tier1_library_lean_path(rel_path: &str) -> bool {
+    let norm = rel_path.strip_prefix("lean/").unwrap_or(rel_path);
+    (norm == "Obend.lean" || norm.starts_with("Obend/")) && !norm.starts_with("Obend/Teeth/")
+}
+
+/// Tally `(tier1_guards, tier1_teeth, tier1_evals)` across all Tier-1 library `.lean` files
+/// (`lean/Obend/` excluding `lean/Obend/Teeth/`), regardless of whether `--strict-tests` is active.
+pub fn compute_tier1_test_counts(index: &LeanIndex) -> (usize, usize, usize) {
+    let mut guards = 0usize;
+    let mut teeth = 0usize;
+    let mut evals = 0usize;
+    for file in &index.files {
+        if !is_tier1_library_lean_path(&file.rel_path) {
+            continue;
+        }
+        for site in &file.test_commands {
+            match site.kind {
+                TestCommandKind::Guard | TestCommandKind::GuardMsgs => guards += 1,
+                TestCommandKind::Tooth => teeth += 1,
+                TestCommandKind::Eval => evals += 1,
+            }
+        }
+    }
+    (guards, teeth, evals)
 }
 
 pub fn is_allowed_public_meta_import_path(rel_path: &str) -> bool {
@@ -50,6 +82,64 @@ pub fn run_lean_lints_with_options(
 
         let is_teeth_or_test = is_teeth_or_test_path(&file.rel_path);
         let is_test_only = is_test_only_path(&file.rel_path);
+
+        // 3-Way Proof / Test / Mutation Separation (`lean/test-in-library`, enabled by `--strict-tests`):
+        // Ban `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules
+        // (excluding `lean/Obend/Teeth/`).
+        if options.strict_tests && is_tier1_library_lean_path(&file.rel_path) {
+            for site in &file.test_commands {
+                let (message, remediation) = match site.kind {
+                    TestCommandKind::Guard => (
+                        format!(
+                            "Tier-1 library module `{}` executes top-level `#guard` during `lake build Obend`, mixing test execution with proof elaboration",
+                            file.rel_path
+                        ),
+                        "Move `#guard` assertions out of `lean/Obend/` to `lean/tests/` compiled native `IO` test suites (`lake exe obend-test`).".to_string(),
+                    ),
+                    TestCommandKind::GuardMsgs => (
+                        format!(
+                            "Tier-1 library module `{}` executes top-level `#guard_msgs` during `lake build Obend`, mixing elaboration message tests with proof elaboration",
+                            file.rel_path
+                        ),
+                        "Move `#guard_msgs` test assertions out of `lean/Obend/` to `lean/tests/` (`lake exe obend-test`) or `lean/Obend/Teeth/` (`lake build Teeth`).".to_string(),
+                    ),
+                    TestCommandKind::Tooth => {
+                        let target_suffix = site
+                            .target_hint
+                            .as_deref()
+                            .map(|t| format!(" (`{t}`)"))
+                            .unwrap_or_default();
+                        (
+                            format!(
+                                "Tier-1 library module `{}` executes top-level `#tooth`{target_suffix} during `lake build Obend`, running mutation replay inside pure library builds",
+                                file.rel_path
+                            ),
+                            "Move `#tooth` mutation witnesses out of `lean/Obend/` to `lean/Obend/Teeth/` (`lake build Teeth` on-demand mutation gate).".to_string(),
+                        )
+                    }
+                    TestCommandKind::Eval => (
+                        format!(
+                            "Tier-1 library module `{}` executes top-level `{}` during `lake build Obend`",
+                            file.rel_path, site.raw_cmd
+                        ),
+                        "Remove `#eval` from Tier-1 `lean/Obend/` library modules (if checking executable output, assert it in `lean/tests/` compiled `obend-test`).".to_string(),
+                    ),
+                };
+                findings.push(Finding {
+                    rule_id: "lean/test-in-library".to_string(),
+                    severity: Severity::Error,
+                    artifact_kind: ArtifactKind::P,
+                    max_regime: Regime::Decided,
+                    sink: Some(Sink::Slow),
+                    path: file.rel_path.clone(),
+                    line: site.line,
+                    column: site.col,
+                    symbol: Some(site.kind.as_str().to_string()),
+                    message,
+                    remediation,
+                });
+            }
+        }
 
         // LAW-M1: Ban top-level `@[expose] public section` in files > 80 lines
         if !is_test_only
@@ -6602,5 +6692,155 @@ end Obend.Hardware
             .collect();
         assert_eq!(vac_errs.len(), 4);
         assert!(vac_errs.iter().all(|f| f.severity == Severity::Error));
+    }
+
+    #[test]
+    fn test_in_library_flags_tier1_guard_tooth_eval_guard_msgs_under_strict_tests_and_allows_teeth_tests_comments_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let obend_dir = dir.path().join("lean/Obend");
+        let teeth_dir = dir.path().join("lean/Obend/Teeth");
+        let tests_dir = dir.path().join("lean/tests");
+        fs::create_dir_all(&obend_dir).unwrap();
+        fs::create_dir_all(&teeth_dir).unwrap();
+        fs::create_dir_all(&tests_dir).unwrap();
+
+        // 1. Tier-1 library file `lean/Obend/Foo.lean`:
+        //    - Has `#guard`, `#tooth`, `#eval`, and `#guard_msgs` (including indented inside `namespace`)
+        //    - Also has `#guard`, `#tooth`, `#eval`, `#guard_msgs` inside line comments, nested block comments,
+        //      docstrings, normal/interpolated/raw string literals, syntax quotes, and BitVec width suffixes
+        fs::write(
+            obend_dir.join("Foo.lean"),
+            r###"module
+public section
+namespace Obend.Foo
+
+-- Line comment: #guard true / #tooth foo / #eval 1 / #guard_msgs in #eval 2
+/- Block comment:
+   #guard false
+   /- Nested block comment:
+      #tooth nested_thm by mutation f := g
+      #eval 999
+   -/
+   #guard_msgs in #check Nat
+-/
+
+/-- Docstring mentioning `#guard`, `#tooth`, `#eval`, and `#guard_msgs` must be ignored. -/
+def describeCommands : String :=
+  "#guard x && #tooth y && #eval z && #guard_msgs"
+
+def interpolatedMsg (n : Nat) : String :=
+  s!"interpolated: #guard {n} #tooth #eval #guard_msgs"
+
+def rawMsg : String :=
+  r##"raw string with "inner quotes" and
+#guard true
+#tooth fake_thm
+#eval 123
+#guard_msgs in #eval 456
+"##
+
+def bitvecSuffix (x eval : Nat) : BitVec eval :=
+  x#eval
+
+def quotedStx : Lean.MacroM Lean.Syntax := do
+  `(command| #guard true)
+
+def double (n : Nat) : Nat := n + n
+
+theorem double_zero : double 0 = 0 := rfl
+
+#guard double 2 == 4
+
+  #tooth double_zero by mutation double := fun n => n + 1
+
+#eval double 21
+
+/-- info: 6 -/
+#guard_msgs in
+#check double
+
+end Obend.Foo
+"###,
+        )
+        .unwrap();
+
+        // 2. Tier-2 mutation gate file `lean/Obend/Teeth/FooTeeth.lean` -> permitted!
+        fs::write(
+            teeth_dir.join("FooTeeth.lean"),
+            r#"module
+import Obend.Foo
+namespace Obend.Teeth
+
+#tooth Obend.Foo.double_zero by mutation Obend.Foo.double := fun n => n + 1
+#guard true
+#guard_msgs in
+#eval 1 + 1
+
+end Obend.Teeth
+"#,
+        )
+        .unwrap();
+
+        // 3. Compiled test suite file `lean/tests/FooTest.lean` -> permitted!
+        fs::write(
+            tests_dir.join("FooTest.lean"),
+            r#"import Obend.Foo
+
+#guard Obend.Foo.double 3 == 6
+#tooth Obend.Foo.double_zero by mutation Obend.Foo.double := fun n => n + 1
+#guard_msgs in
+#eval Obend.Foo.double 5
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+
+        // Summary counts are ALWAYS populated even when `strict_tests` is false:
+        // `Foo.lean` has 1 `#guard` + 1 `#guard_msgs` (= 2 `tier1_guards`), 1 `#tooth` (= 1 `tier1_teeth`), 1 `#eval` (= 1 `tier1_evals`).
+        let (tier1_guards, tier1_teeth, tier1_evals) = compute_tier1_test_counts(&idx);
+        assert_eq!(tier1_guards, 2, "expected #guard + #guard_msgs in Foo.lean");
+        assert_eq!(tier1_teeth, 1, "expected #tooth in Foo.lean");
+        assert_eq!(tier1_evals, 1, "expected #eval in Foo.lean");
+
+        // Without `--strict-tests`, `lean/test-in-library` emits 0 findings so Wave-7 lanes are unaffected
+        let (default_findings, _) = run_lean_lints_with_options(&idx, LeanLintOptions::default());
+        assert!(
+            default_findings
+                .iter()
+                .all(|f| f.rule_id != "lean/test-in-library"),
+            "default lint run must not emit lean/test-in-library findings: {default_findings:#?}"
+        );
+
+        // With `--strict-tests`, exactly the 4 real top-level commands in `lean/Obend/Foo.lean` fire as `Severity::Error`
+        let (strict_findings, _) = run_lean_lints_with_options(
+            &idx,
+            LeanLintOptions {
+                strict_tests: true,
+                ..Default::default()
+            },
+        );
+        let test_errs: Vec<_> = strict_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/test-in-library")
+            .collect();
+        assert_eq!(
+            test_errs.len(),
+            4,
+            "expected exactly 4 lean/test-in-library errors in Foo.lean (0 in Teeth/ and tests/): {test_errs:#?}"
+        );
+        assert!(test_errs.iter().all(|f| {
+            f.path == "lean/Obend/Foo.lean" && f.severity == Severity::Error
+        }));
+
+        let symbols: Vec<&str> = test_errs
+            .iter()
+            .filter_map(|f| f.symbol.as_deref())
+            .collect();
+        assert_eq!(symbols, vec!["#guard", "#tooth", "#eval", "#guard_msgs"]);
+        assert!(test_errs[0].remediation.contains("lean/tests/") && test_errs[0].remediation.contains("obend-test"));
+        assert!(test_errs[1].remediation.contains("lean/Obend/Teeth/"));
+        assert!(test_errs[2].remediation.contains("Remove `#eval`"));
+        assert!(test_errs[3].remediation.contains("lean/tests/") || test_errs[3].remediation.contains("lean/Obend/Teeth/"));
     }
 }
