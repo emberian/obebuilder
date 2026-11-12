@@ -454,13 +454,28 @@ pub fn evaluate_apex_with_index(
             }
         }
 
-        let valid = sorry_count == 0 && custom_axiom_count == 0;
-        if !valid {
+        let single_turn_issue = crate::lean_rules::single_turn_apex_violation(file, root_decl);
+        if single_turn_issue.is_some() {
+            offenders.insert(format!(
+                "single-sequence-harness in {} ({})",
+                root_decl.fq_name, file.rel_path
+            ));
+        }
+
+        let valid = sorry_count == 0 && custom_axiom_count == 0 && single_turn_issue.is_none();
+        if sorry_count > 0 || custom_axiom_count > 0 {
             failure_reasons.push(format!(
                 "Apex `{}` (`{}`) cone contains {} sorry site(s) and {} custom axiom(s)",
                 entry.id, root_decl.fq_name, sorry_count, custom_axiom_count
             ));
-        } else {
+        }
+        if let Some(ref st_msg) = single_turn_issue {
+            failure_reasons.push(format!(
+                "Apex `{}` (`{}`): {}",
+                entry.id, root_decl.fq_name, st_msg
+            ));
+        }
+        if valid {
             global_apex_mod_cone.extend(mod_cone.iter().copied());
             global_apex_decl_cone.extend(decl_cone.iter().copied());
         }

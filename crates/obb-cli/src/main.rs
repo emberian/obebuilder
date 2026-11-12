@@ -14,6 +14,7 @@ use obb_lint::apex::{
     ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex,
 };
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
+use obb_lint::harness::{harness_check, harness_install, harness_list};
 use obb_lint::spec_check::run_spec_sensitivity_check;
 use obb_lint::{RepoLintOptions, filter_report_by_rule, run_repo_lints_with_options};
 use obb_quarry::{
@@ -63,9 +64,13 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
-        /// Escalate `lean/file-wide-expose` (`@[expose] public section` in >80-line files) from warning to error
+        /// Escalate `lean/file-wide-expose` (`@[expose] public section`) and `lean/excessive-decl-expose` (`> 12` `@[expose]` decls in `> 80`-line `module` files) from warning to error
         #[arg(long)]
         strict_expose: bool,
+
+        /// Escalate `lean/single-sequence-harness` (`apex_*_turn_{safe,sound}` without multi-turn trace/reachability theorem) from warning to error
+        #[arg(long)]
+        strict_harnesses: bool,
 
         /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
         #[arg(long)]
@@ -103,6 +108,12 @@ enum Commands {
     Pipeline {
         #[command(subcommand)]
         sub: PipelineSubcommand,
+    },
+
+    /// Canonical Multi-Agent Harness Customizations (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.agents/skills/*`, `.claude/skills/*`)
+    Harness {
+        #[command(subcommand)]
+        sub: HarnessSubcommand,
     },
 
     /// Remote `hbox` + `bb2` `.olean` Hardlink Seed Pool, Health Prober & Bounded `lake build` Batcher
@@ -252,6 +263,42 @@ enum PipelineSubcommand {
         #[arg(long)]
         allow_empty: bool,
 
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HarnessSubcommand {
+    /// Materialize canonical `AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.agents/skills/*`, and `.claude/skills/*`
+    Install {
+        /// Target repository root into which harness rules & skills are written
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Overwrite pre-existing unmanaged files lacking an `obb-harness` marker header
+        #[arg(long)]
+        force: bool,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify root rule budgets (`< 24,000` B with includes), YAML frontmatter, SHA-256 markers & `.agents`/`.claude` parity
+    Check {
+        /// Target repository root to check (strictly read-only)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List canonical `obb harness` customization artifacts, byte budgets, and SHA-256 digests
+    List {
         /// Emit structured JSON report
         #[arg(long)]
         json: bool,
@@ -641,6 +688,7 @@ async fn run() -> Result<ExitCode> {
             rule,
             strict,
             strict_expose,
+            strict_harnesses,
             modularity,
             sub,
         } => {
@@ -678,8 +726,13 @@ async fn run() -> Result<ExitCode> {
                 });
             }
 
-            let mut report =
-                run_repo_lints_with_options(&repo, RepoLintOptions { strict_expose })?;
+            let mut report = run_repo_lints_with_options(
+                &repo,
+                RepoLintOptions {
+                    strict_expose,
+                    strict_harnesses,
+                },
+            )?;
             if let Some(ref flt) = rule {
                 report = filter_report_by_rule(report, flt);
             }
@@ -816,6 +869,46 @@ async fn run() -> Result<ExitCode> {
                 } else {
                     ExitCode::from(2)
                 })
+            }
+        },
+
+        Commands::Harness { sub } => match sub {
+            HarnessSubcommand::Install { repo, force, json } => {
+                let rep = harness_install(&repo, force)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_harness_install(&rep);
+                }
+                Ok(if rep.passed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+
+            HarnessSubcommand::Check { repo, json } => {
+                let rep = harness_check(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_harness_check(&rep);
+                }
+                Ok(if rep.passed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+
+            HarnessSubcommand::List { json } => {
+                let rep = harness_list();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_harness_list(&rep);
+                }
+                Ok(ExitCode::SUCCESS)
             }
         },
 
@@ -2142,6 +2235,93 @@ fn print_human_broker_plan(rep: &obb_broker::BuildPlanReport) {
             }
         } else {
             println!("  recipe:\n{}", b.remote_recipe.trim_end());
+        }
+    }
+}
+
+fn print_human_harness_list(rep: &obb_lint::harness::HarnessListReport) {
+    println!(
+        "obb harness list: schema={} total_artifacts={} (root_rules={}, skills={}) rule_hard_cap={}B",
+        rep.schema_version,
+        rep.total_artifacts,
+        rep.root_rules,
+        rep.skills,
+        rep.rule_hard_cap_bytes
+    );
+    for art in &rep.artifacts {
+        println!(
+            "  [{:<9}] {:<48} {:>6}/{:<6}B sha256={} harnesses=[{}]",
+            match art.kind {
+                obb_lint::harness::HarnessArtifactKind::RootRule => "root_rule",
+                obb_lint::harness::HarnessArtifactKind::Skill => "skill",
+            },
+            art.rel_path,
+            art.byte_len,
+            art.byte_budget,
+            &art.sha256[..12],
+            art.harnesses.join(",")
+        );
+    }
+}
+
+fn print_human_harness_install(rep: &obb_lint::harness::HarnessInstallReport) {
+    let verdict = if rep.passed { "INSTALLED" } else { "REFUSED" };
+    println!(
+        "obb harness install [{verdict}]: repo={} schema={} written={} unchanged={} force={}",
+        rep.repo_root, rep.schema_version, rep.files_written, rep.files_unchanged, rep.force
+    );
+    for r in &rep.refusals {
+        eprintln!("  [REFUSED][{}] {}: {}", r.kind, r.rel_path, r.message);
+    }
+    for act in &rep.actions {
+        println!(
+            "  [{:<9}] {:<48} {:>6}B sha256={}",
+            act.action,
+            act.rel_path,
+            act.bytes_written,
+            &act.sha256[..12]
+        );
+    }
+}
+
+fn print_human_harness_check(rep: &obb_lint::harness::HarnessCheckReport) {
+    let verdict = if rep.passed { "PASS" } else { "FAIL" };
+    println!(
+        "obb harness check [{verdict}]: repo={} schema={} checked_files={} issues={}",
+        rep.repo_root,
+        rep.schema_version,
+        rep.checked_files.len(),
+        rep.issues.len()
+    );
+    for cf in &rep.checked_files {
+        let tag = if cf.exists
+            && cf.marker_valid
+            && cf.checksum_matches_template
+            && cf.frontmatter_valid.unwrap_or(true)
+            && cf.byte_len <= cf.byte_budget
+            && cf.expanded_byte_len < obb_lint::harness::RULE_FILE_HARD_CAP_BYTES
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "  [{tag}] {:<48} bytes={:>6}/{:<6} expanded={:>6}B marker={} sha_match={}",
+            cf.rel_path,
+            cf.byte_len,
+            cf.byte_budget,
+            cf.expanded_byte_len,
+            cf.marker_valid,
+            cf.checksum_matches_template
+        );
+    }
+    if !rep.issues.is_empty() {
+        println!("\nHarness Check Issues ({}):", rep.issues.len());
+        for iss in &rep.issues {
+            println!(
+                "  [FAIL][{}] {}: {}\n    fix: {}",
+                iss.kind, iss.rel_path, iss.message, iss.remediation
+            );
         }
     }
 }

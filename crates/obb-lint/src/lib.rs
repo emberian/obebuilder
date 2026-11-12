@@ -3,6 +3,7 @@
 
 pub mod apex;
 pub mod cone;
+pub mod harness;
 pub mod lean_index;
 pub mod lean_lexer;
 pub mod lean_rules;
@@ -28,8 +29,10 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RepoLintOptions {
-    /// Escalate `lean/file-wide-expose` from `Severity::Warning` to `Severity::Error`.
+    /// Escalate `lean/file-wide-expose` and `lean/excessive-decl-expose` from `Severity::Warning` to `Severity::Error`.
     pub strict_expose: bool,
+    /// Escalate `lean/single-sequence-harness` from `Severity::Warning` to `Severity::Error`.
+    pub strict_harnesses: bool,
 }
 
 /// Run all mechanical anti-slop, vacuity, seam-mirror, and doc-integrity checks over `repo_root`
@@ -57,6 +60,7 @@ pub fn run_repo_lints_with_options(
         &index,
         LeanLintOptions {
             strict_expose: options.strict_expose,
+            strict_harnesses: options.strict_harnesses,
         },
     );
     let (obend_count, obend_findings) = scan_all_obend_files(&canon);

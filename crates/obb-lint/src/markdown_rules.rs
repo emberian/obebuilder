@@ -127,7 +127,10 @@ fn should_scan_markdown_path(rel_path: &str) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    !matches!(fname, "CHANGELOG.md" | "FINDINGS.md" | "VAULT.md")
+    !matches!(
+        fname,
+        "CHANGELOG.md" | "FINDINGS.md" | "VAULT.md" | "AGENTS.md" | "GEMINI.md" | "CLAUDE.md"
+    )
 }
 
 /// Extract backticked code spans from a single markdown line: `(content, col_1_based)`.

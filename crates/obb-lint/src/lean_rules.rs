@@ -1,16 +1,19 @@
 //! Mechanical anti-slop & vacuity detectors for Lean 4 (`DESIGN.md` §2.6, `JUDGE.md`).
 
-use crate::lean_index::{DeclKind, LeanIndex, ParsedLeanDecl, ParsedLeanFile};
+use crate::lean_index::{BinderParam, DeclKind, LeanIndex, ParsedLeanDecl, ParsedLeanFile};
 use crate::lean_lexer::{LeanToken, LeanTokenKind};
 use obb_core::{ArtifactKind, DirectoryCensus, Finding, Regime, Severity, Sink};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const FILE_WIDE_EXPOSE_LINE_THRESHOLD: usize = 80;
+pub const EXCESSIVE_DECL_EXPOSE_THRESHOLD: usize = 12;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LeanLintOptions {
-    /// Escalate `lean/file-wide-expose` from `Severity::Warning` (legacy default) to `Severity::Error`.
+    /// Escalate `lean/file-wide-expose` and `lean/excessive-decl-expose` from `Severity::Warning` to `Severity::Error`.
     pub strict_expose: bool,
+    /// Escalate `lean/single-sequence-harness` from `Severity::Warning` to `Severity::Error`.
+    pub strict_harnesses: bool,
 }
 
 pub fn is_allowed_public_meta_import_path(rel_path: &str) -> bool {
@@ -71,6 +74,53 @@ pub fn run_lean_lints_with_options(
                         file.rel_path, file.line_count, FILE_WIDE_EXPOSE_LINE_THRESHOLD
                     ),
                     remediation: "Replace top-level `@[expose] public section` with Lean 4.35 `module` + `public section` so recursive bodies stay sealed in `.olean.private`, and attach selective `@[expose]` only on <= 10-line projections/types needed for definitional typechecking (use private `import all` inside `Proofs/`).".to_string(),
+                });
+            }
+        }
+
+        // LAW-M1b: Ban per-declaration `@[expose]` loophole (`> 12` `@[expose]` declarations in `module` files > 80 lines)
+        if !is_test_only
+            && file.has_module_kw
+            && file.line_count > FILE_WIDE_EXPOSE_LINE_THRESHOLD
+        {
+            let exposed_decls: Vec<&ParsedLeanDecl> = file
+                .declarations
+                .iter()
+                .filter(|d| !d.fixture_kept && d.attributes.iter().any(|a| a == "expose"))
+                .collect();
+            if exposed_decls.len() > EXCESSIVE_DECL_EXPOSE_THRESHOLD {
+                let breach_decl = exposed_decls[EXCESSIVE_DECL_EXPOSE_THRESHOLD];
+                let sample_names: Vec<&str> = exposed_decls
+                    .iter()
+                    .take(5)
+                    .map(|d| d.name.as_str())
+                    .collect();
+                findings.push(Finding {
+                    rule_id: "lean/excessive-decl-expose".to_string(),
+                    severity: if options.strict_expose {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                    artifact_kind: ArtifactKind::P,
+                    max_regime: Regime::Decided,
+                    sink: Some(Sink::Slow),
+                    path: file.rel_path.clone(),
+                    line: breach_decl.line,
+                    column: breach_decl.col,
+                    symbol: Some(breach_decl.fq_name.clone()),
+                    message: format!(
+                        "Module `{}` ({} lines) attaches `@[expose]` to {} declarations (>{} ceiling; e.g. `{}`), circumventing `LAW-M1` `.olean.private` encapsulation",
+                        file.rel_path,
+                        file.line_count,
+                        exposed_decls.len(),
+                        EXCESSIVE_DECL_EXPOSE_THRESHOLD,
+                        sample_names.join("`, `")
+                    ),
+                    remediation: format!(
+                        "Seal recursive and operational bodies inside `.olean.private` under `module` + `public section` (`LAW-M1`); restrict `@[expose]` to <= {} tiny carrier projections/constants per module and export behavioral contracts via theorems (`*_eq`, `*_sound`).",
+                        EXCESSIVE_DECL_EXPOSE_THRESHOLD
+                    ),
                 });
             }
         }
@@ -372,11 +422,38 @@ pub fn run_lean_lints_with_options(
                                 &mut findings,
                             );
                         }
+
+                        // 4c. Single-sequence / single-turn apex harness check (`lean/single-sequence-harness`)
+                        if !is_teeth_or_test
+                            && !decl.fixture_kept
+                            && let Some(st_msg) = single_turn_apex_violation(file, decl)
+                        {
+                            findings.push(Finding {
+                                rule_id: "lean/single-sequence-harness".to_string(),
+                                severity: if options.strict_harnesses {
+                                    Severity::Error
+                                } else {
+                                    Severity::Warning
+                                },
+                                artifact_kind: ArtifactKind::S,
+                                max_regime: Regime::Attested,
+                                sink: Some(Sink::Theater),
+                                path: file.rel_path.clone(),
+                                line: decl.line,
+                                column: decl.col,
+                                symbol: Some(decl.fq_name.clone()),
+                                message: st_msg,
+                                remediation: "Pair single-turn step theorems with a multi-turn trace/reachability invariant (`List *Turn`, `Reach`, `SafeWP`, `ValidTrace`, or `MultiTurnHoare`) over arbitrary sequences, and prove environment completeness (`skip_implies_contract_violation` / multi-handle reachability) so state-accumulation bugs (`RevokedSet` growth, `Mandate` budget depletion, persistent `UMem`) cannot hide behind single-turn resets.".to_string(),
+                            });
+                        }
                     }
 
-                    // 5. `Judge` instance tautological `Meaning` detector
+                    // 5. `Judge` instance tautological `Meaning` & empty `Fragment`/`refutes` detectors
                     if is_judge_instance_decl(decl) {
                         check_judge_meaning(file, decl, &decl_by_name, &mut findings);
+                        if !is_test_only && !decl.fixture_kept {
+                            check_judge_empty_fragment(file, decl, &mut findings);
+                        }
                     }
 
                     // 5b. `*Obligations` / `HypothesisLedger` 1–3 line projection/determinism cosplay detector
@@ -396,6 +473,16 @@ pub fn run_lean_lints_with_options(
                             || (decl.name.starts_with("decode") && !format_decoder_fns.is_empty()))
                     {
                         check_wire_decoder_def(file, decl, &mut findings);
+                    }
+                }
+                DeclKind::Class => {
+                    if !is_test_only && !decl.fixture_kept {
+                        check_obligation_class_tautological_fields(
+                            file,
+                            decl,
+                            &obligation_classes,
+                            &mut findings,
+                        );
                     }
                 }
                 _ => {}
@@ -885,12 +972,83 @@ fn is_judge_instance_decl(decl: &ParsedLeanDecl) -> bool {
     if !matches!(decl.kind, DeclKind::Instance | DeclKind::Def) {
         return false;
     }
-    decl.type_tokens.first().is_some_and(|t| {
+    if decl.type_tokens.first().is_some_and(|t| {
         matches!(
             &t.kind,
             LeanTokenKind::Ident(id) if id == "Judge" || id == "Obend.Judge"
         )
-    })
+    }) {
+        return true;
+    }
+    instance_target_head_class(&decl.type_tokens)
+        .is_some_and(|h| h == "Judge" || h == "Obend.Judge")
+}
+
+fn check_judge_empty_fragment(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    findings: &mut Vec<Finding>,
+) {
+    let extracted = extract_instance_fields(decl, None);
+    for ef in extracted {
+        let Some(fname) = ef.name.as_deref() else {
+            continue;
+        };
+        if fname != "Fragment" && fname != "refutes" {
+            continue;
+        }
+        let mut bound = HashSet::new();
+        for p in &ef.params {
+            if p != "_" {
+                bound.insert(p.clone());
+            }
+        }
+        let core = strip_leading_lambdas(&ef.rhs_tokens, &mut bound);
+        let core = strip_outer_parens_tokens(core);
+        if core.len() != 1 {
+            continue;
+        }
+        if let LeanTokenKind::Ident(id) = &core[0].kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            if fname == "Fragment" && (short == "False" || short == "Empty") {
+                findings.push(Finding {
+                    rule_id: "lean/judge-empty-fragment".to_string(),
+                    severity: Severity::Warning,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: ef.line,
+                    column: ef.col,
+                    symbol: Some(format!("{}.Fragment", decl.fq_name)),
+                    message: format!(
+                        "`{}` defines `Fragment := {}` (`{short}`), vacating completeness (`Judge.complete` holds vacuously on an empty fragment)",
+                        decl.fq_name,
+                        render_tokens_compact(&ef.rhs_tokens)
+                    ),
+                    remediation: "Define `Fragment` as the inhabited decidable domain predicate handled by `check` and prove `complete` constructively over that fragment.".to_string(),
+                });
+            } else if fname == "refutes" && (short == "false" || id == "Bool.false") {
+                findings.push(Finding {
+                    rule_id: "lean/judge-empty-fragment".to_string(),
+                    severity: Severity::Warning,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: ef.line,
+                    column: ef.col,
+                    symbol: Some(format!("{}.refutes", decl.fq_name)),
+                    message: format!(
+                        "`{}` defines `refutes := {}` (`false`), vacating refusal soundness (`Judge.refuted` never certifies a negative verdict)",
+                        decl.fq_name,
+                        render_tokens_compact(&ef.rhs_tokens)
+                    ),
+                    remediation: "Set `refutes` to `true` on genuine counterexample/refusal clauses and prove `refuted` (`check = .refused c _ → ¬ Meaning`) from completeness or clause soundness.".to_string(),
+                });
+            }
+        }
+    }
 }
 
 fn is_judge_format_decl(decl: &ParsedLeanDecl) -> bool {
@@ -1912,6 +2070,8 @@ fn is_obligation_class_name(name: &str) -> bool {
     let short = name.rsplit('.').next().unwrap_or(name);
     short == "HypothesisLedger"
         || short.contains("HypothesisLedger")
+        || short == "Ledger"
+        || short.ends_with("Ledger")
         || short == "Obligations"
         || short.ends_with("Obligations")
 }
@@ -2641,6 +2801,884 @@ fn check_obligation_projection_cosplay(
     }
 }
 
+fn strip_outer_parens_tokens(mut slice: &[LeanToken]) -> &[LeanToken] {
+    while slice.len() >= 2
+        && matches!(&slice[0].kind, LeanTokenKind::Symbol(s) if s == "(")
+        && matches!(&slice[slice.len() - 1].kind, LeanTokenKind::Symbol(s) if s == ")")
+    {
+        let mut depth = 0isize;
+        let mut wraps_all = true;
+        for (idx, tok) in slice.iter().enumerate() {
+            match &tok.kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                    depth += 1;
+                }
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                    depth -= 1;
+                    if depth == 0 && idx + 1 < slice.len() {
+                        wraps_all = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if wraps_all && depth == 0 {
+            slice = &slice[1..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    slice
+}
+
+#[derive(Debug, Clone)]
+struct QuantBinder {
+    name: String,
+    is_underscore: bool,
+    is_instance_bracket: bool,
+    type_tokens: Vec<LeanToken>,
+}
+
+fn parse_forall_binder_tokens(slice: &[LeanToken], out: &mut Vec<QuantBinder>) {
+    let mut i = 0usize;
+    while i < slice.len() {
+        match &slice[i].kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[") => {
+                let open = s.as_str();
+                let close = match open {
+                    "(" => ")",
+                    "{" => "}",
+                    _ => "]",
+                };
+                let gstart = i + 1;
+                let mut d = 1usize;
+                i += 1;
+                while i < slice.len() && d > 0 {
+                    match &slice[i].kind {
+                        LeanTokenKind::Symbol(o) if o == open => d += 1,
+                        LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let gend = i.saturating_sub(1);
+                if gstart <= gend && gend <= slice.len() {
+                    let group = &slice[gstart..gend];
+                    let is_inst = open == "[";
+                    let mut depth = 0isize;
+                    let mut colon_pos = None;
+                    for (k, t) in group.iter().enumerate() {
+                        match &t.kind {
+                            LeanTokenKind::Symbol(sym)
+                                if matches!(sym.as_str(), "(" | "[" | "{") =>
+                            {
+                                depth += 1;
+                            }
+                            LeanTokenKind::Symbol(sym)
+                                if matches!(sym.as_str(), ")" | "]" | "}") =>
+                            {
+                                if depth > 0 {
+                                    depth -= 1;
+                                }
+                            }
+                            LeanTokenKind::Symbol(sym) if sym == ":" && depth == 0 => {
+                                colon_pos = Some(k);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if is_inst && colon_pos.is_none() {
+                        continue;
+                    }
+                    let (lhs, rhs_ty) = match colon_pos {
+                        Some(c) => (&group[..c], group[c + 1..].to_vec()),
+                        None => (group, Vec::new()),
+                    };
+                    for t in lhs {
+                        if let LeanTokenKind::Ident(id) = &t.kind {
+                            out.push(QuantBinder {
+                                name: id.clone(),
+                                is_underscore: id.starts_with('_'),
+                                is_instance_bracket: is_inst,
+                                type_tokens: rhs_ty.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            LeanTokenKind::Symbol(s) if s == ":" => {
+                // Unparenthesized typed binder `∀ x y : T, ...`
+                let rhs_ty = slice[i + 1..].to_vec();
+                for qb in out.iter_mut().rev() {
+                    if qb.type_tokens.is_empty() {
+                        qb.type_tokens = rhs_ty.clone();
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            }
+            LeanTokenKind::Ident(id) => {
+                out.push(QuantBinder {
+                    name: id.clone(),
+                    is_underscore: id.starts_with('_'),
+                    is_instance_bracket: false,
+                    type_tokens: Vec::new(),
+                });
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+}
+
+fn peel_forall_and_arrows<'a>(
+    tokens: &'a [LeanToken],
+    binders: &mut Vec<QuantBinder>,
+    hyps: &mut Vec<&'a [LeanToken]>,
+) -> &'a [LeanToken] {
+    let mut slice = strip_outer_parens_tokens(tokens);
+    loop {
+        slice = strip_outer_parens_tokens(slice);
+        if slice.is_empty() {
+            return slice;
+        }
+
+        let starts_forall = matches!(
+            &slice[0].kind,
+            LeanTokenKind::Symbol(s) if s == "∀"
+        ) || matches!(
+            &slice[0].kind,
+            LeanTokenKind::Ident(id) if id == "forall"
+        );
+
+        if starts_forall {
+            let mut depth = 0isize;
+            let mut comma_idx = None;
+            for (idx, tok) in slice.iter().enumerate().skip(1) {
+                match &tok.kind {
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                        depth += 1;
+                    }
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                        if depth > 0 {
+                            depth -= 1;
+                        }
+                    }
+                    LeanTokenKind::Symbol(s) if s == "," && depth == 0 => {
+                        comma_idx = Some(idx);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(cidx) = comma_idx {
+                parse_forall_binder_tokens(&slice[1..cidx], binders);
+                slice = &slice[cidx + 1..];
+                continue;
+            }
+        }
+
+        // Otherwise split at the first top-level `→` / `->`
+        let mut depth = 0isize;
+        let mut arrow_idx = None;
+        for (idx, tok) in slice.iter().enumerate() {
+            match &tok.kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                    depth += 1;
+                }
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                LeanTokenKind::Symbol(s) if (s == "→" || s == "->") && depth == 0 => {
+                    arrow_idx = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(aidx) = arrow_idx {
+            let ant = strip_outer_parens_tokens(&slice[..aidx]);
+            if !ant.is_empty() {
+                hyps.push(ant);
+            }
+            slice = &slice[aidx + 1..];
+            continue;
+        }
+
+        return slice;
+    }
+}
+
+fn is_non_obligation_sort_or_data_concl(concl: &[LeanToken]) -> bool {
+    let c = strip_outer_parens_tokens(concl);
+    let Some(first) = c.first() else {
+        return true;
+    };
+    if let LeanTokenKind::Ident(id) = &first.kind {
+        let short = id.rsplit('.').next().unwrap_or(id.as_str());
+        if matches!(
+            short,
+            "Prop"
+                | "Type"
+                | "Sort"
+                | "Bool"
+                | "Nat"
+                | "Int"
+                | "String"
+                | "Unit"
+                | "PUnit"
+                | "ByteArray"
+                | "UInt8"
+                | "UInt16"
+                | "UInt32"
+                | "UInt64"
+                | "USize"
+                | "Float"
+                | "Option"
+                | "List"
+                | "Array"
+                | "BitVec"
+                | "Fin"
+                | "Except"
+        ) {
+            // Ensure it's not an equality/comparison starting with `Nat.ble ... = true` etc.
+            let has_rel = c.iter().any(|t| {
+                matches!(
+                    &t.kind,
+                    LeanTokenKind::Symbol(s)
+                        if matches!(
+                            s.as_str(),
+                            "=" | "==" | "≠" | "!=" | "<" | ">" | "≤" | "<=" | "≥" | ">=" | "↔" | "<->" | "∧" | "∨"
+                        )
+                )
+            });
+            if !has_rel {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_sort_binder_type(type_tokens: &[LeanToken]) -> bool {
+    let t = strip_outer_parens_tokens(type_tokens);
+    let (_, concl) = split_top_level_arrows(t);
+    let concl = strip_outer_parens_tokens(concl);
+    concl.first().is_some_and(|tok| {
+        matches!(
+            &tok.kind,
+            LeanTokenKind::Ident(id) if matches!(id.as_str(), "Type" | "Sort" | "Prop")
+        )
+    })
+}
+
+fn normalize_prop_tokens(tokens: &[LeanToken]) -> Vec<String> {
+    let clean = strip_outer_parens_tokens(tokens);
+    clean
+        .iter()
+        .filter_map(|t| match &t.kind {
+            LeanTokenKind::Ident(s) | LeanTokenKind::Symbol(s) | LeanTokenKind::NatLit(s) => {
+                Some(s.clone())
+            }
+            LeanTokenKind::StrLit(s) => Some(format!("\"{s}\"")),
+            _ => None,
+        })
+        .collect()
+}
+
+fn split_top_level_op<'a>(tokens: &'a [LeanToken], ops: &[&str]) -> Vec<&'a [LeanToken]> {
+    let clean = strip_outer_parens_tokens(tokens);
+    let mut parts = Vec::new();
+    let mut depth = 0isize;
+    let mut start = 0usize;
+    for (idx, tok) in clean.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Symbol(s) if depth == 0 && ops.iter().any(|op| *op == s.as_str()) => {
+                if start < idx {
+                    parts.push(strip_outer_parens_tokens(&clean[start..idx]));
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < clean.len() {
+        parts.push(strip_outer_parens_tokens(&clean[start..]));
+    }
+    parts
+}
+
+fn split_top_level_binary<'a>(
+    tokens: &'a [LeanToken],
+    ops: &[&str],
+) -> Option<(&'a [LeanToken], &'a str, &'a [LeanToken])> {
+    let clean = strip_outer_parens_tokens(tokens);
+    let mut depth = 0isize;
+    for (idx, tok) in clean.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Symbol(s) if depth == 0 => {
+                if ops.iter().any(|&op| op == s.as_str()) && idx > 0 && idx + 1 < clean.len() {
+                    return Some((
+                        strip_outer_parens_tokens(&clean[..idx]),
+                        s.as_str(),
+                        strip_outer_parens_tokens(&clean[idx + 1..]),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn substitute_ident_in_norm(norm: &[String], from: &str, to: &str) -> Vec<String> {
+    let prefix = format!("{from}.");
+    norm.iter()
+        .map(|tok| {
+            if tok == from {
+                to.to_string()
+            } else if let Some(rest) = tok.strip_prefix(&prefix) {
+                format!("{to}.{rest}")
+            } else {
+                tok.clone()
+            }
+        })
+        .collect()
+}
+
+fn is_lattice_meet_implies_tautology(concl: &[LeanToken]) -> bool {
+    let Some((lhs, _, rhs)) = split_top_level_binary(concl, &["=", "=="]) else {
+        return false;
+    };
+    if rhs.len() != 1
+        || !matches!(&rhs[0].kind, LeanTokenKind::Ident(id) if id == "true" || id == "Bool.true")
+    {
+        return false;
+    }
+
+    // Pattern 1: `φ.implies φ`
+    if lhs.len() == 2 {
+        if let (LeanTokenKind::Ident(a_imp), LeanTokenKind::Ident(b)) = (&lhs[0].kind, &lhs[1].kind)
+        {
+            if let Some(a) = a_imp.strip_suffix(".implies") {
+                if a == b {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Pattern 2: `(φ.meet ψ).implies φ` or `(φ.meet ψ).implies ψ`
+    if lhs.len() == 6
+        && matches!(&lhs[0].kind, LeanTokenKind::Symbol(s) if s == "(")
+        && matches!(&lhs[3].kind, LeanTokenKind::Symbol(s) if s == ")")
+        && matches!(&lhs[4].kind, LeanTokenKind::Symbol(s) if s == ".implies")
+    {
+        if let (
+            LeanTokenKind::Ident(a_meet),
+            LeanTokenKind::Ident(b),
+            LeanTokenKind::Ident(target),
+        ) = (&lhs[1].kind, &lhs[2].kind, &lhs[5].kind)
+        {
+            if let Some(a) = a_meet.strip_suffix(".meet") {
+                if target == a || target == b {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Pattern 3: `φ.implies (φ.join ψ)` or `ψ.implies (φ.join ψ)`
+    if lhs.len() == 5
+        && matches!(&lhs[1].kind, LeanTokenKind::Symbol(s) if s == "(")
+        && matches!(&lhs[4].kind, LeanTokenKind::Symbol(s) if s == ")")
+    {
+        if let (
+            LeanTokenKind::Ident(t_imp),
+            LeanTokenKind::Ident(a_join),
+            LeanTokenKind::Ident(b),
+        ) = (&lhs[0].kind, &lhs[2].kind, &lhs[3].kind)
+        {
+            if let (Some(target), Some(a)) =
+                (t_imp.strip_suffix(".implies"), a_join.strip_suffix(".join"))
+            {
+                if target == a || target == b {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_forall_instantiation_tautology(hyp: &[LeanToken], concl: &[LeanToken]) -> bool {
+    let mut h_binders = Vec::new();
+    let mut h_inner_hyps = Vec::new();
+    let h_body = peel_forall_and_arrows(hyp, &mut h_binders, &mut h_inner_hyps);
+    if h_binders.len() != 1 || !h_inner_hyps.is_empty() {
+        return false;
+    }
+    let var = &h_binders[0].name;
+    let body_norm = normalize_prop_tokens(h_body);
+    let concl_norm = normalize_prop_tokens(concl);
+    let var_positions: Vec<usize> = body_norm
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| if t == var { Some(i) } else { None })
+        .collect();
+    if var_positions.len() != 1 {
+        return false;
+    }
+    let pos = var_positions[0];
+    let prefix = &body_norm[..pos];
+    let suffix = &body_norm[pos + 1..];
+    concl_norm.len() >= prefix.len() + suffix.len() + 1
+        && concl_norm.starts_with(prefix)
+        && concl_norm.ends_with(suffix)
+}
+
+fn field_name_claims_crypto_or_protocol_soundness(field_name: &str) -> bool {
+    let lower = field_name.to_ascii_lowercase();
+    lower.contains("gkr")
+        || lower.contains("zeroknowledge")
+        || lower.contains("attested")
+        || lower.contains("refines")
+        || lower.contains("extract")
+        || lower.contains("isaequiv")
+        || lower.contains("kernelproof")
+}
+
+fn is_simple_scalar_zero_bound(concl: &[LeanToken]) -> bool {
+    let Some((lhs, op, rhs)) =
+        split_top_level_binary(concl, &[">", "<", ">=", "≥", "<=", "≤", "≠", "!="])
+    else {
+        return false;
+    };
+    let is_zero = |slice: &[LeanToken]| -> bool {
+        slice.len() == 1 && matches!(&slice[0].kind, LeanTokenKind::NatLit(n) if n == "0")
+    };
+    let is_single_atom =
+        |slice: &[LeanToken]| -> bool { slice.len() == 1 && matches!(&slice[0].kind, LeanTokenKind::Ident(_)) };
+
+    match op {
+        ">" | ">=" | "≥" | "≠" | "!=" => is_single_atom(lhs) && is_zero(rhs),
+        "<" | "<=" | "≤" => is_zero(lhs) && is_single_atom(rhs),
+        _ => false,
+    }
+}
+
+fn classify_obligation_field_signature(
+    field_name: &str,
+    field_binders: &[BinderParam],
+    field_type_tokens: &[LeanToken],
+) -> Option<String> {
+    if field_type_tokens.is_empty() {
+        return None;
+    }
+
+    let mut qbinders: Vec<QuantBinder> = field_binders
+        .iter()
+        .map(|b| QuantBinder {
+            name: b.name.clone(),
+            is_underscore: b.is_underscore,
+            is_instance_bracket: b.is_instance_bracket,
+            type_tokens: b.type_tokens.clone(),
+        })
+        .collect();
+    let mut hyps: Vec<&[LeanToken]> = Vec::new();
+    let concl = peel_forall_and_arrows(field_type_tokens, &mut qbinders, &mut hyps);
+
+    if concl.is_empty() || is_non_obligation_sort_or_data_concl(concl) {
+        return None;
+    }
+
+    // 1. Trivial `True` or syntactic reflexivity `e = e` / `e ↔ e`
+    if is_pure_true_proposition(concl) {
+        return Some("tautological `True` conclusion (`... → True`)".to_string());
+    }
+    if let Some((clhs, op, crhs)) = split_top_level_binary(concl, &["=", "==", "↔", "<->"]) {
+        let nl = normalize_prop_tokens(clhs);
+        let nr = normalize_prop_tokens(crhs);
+        if !nl.is_empty() && nl == nr {
+            return Some(format!(
+                "syntactic reflexivity tautology (`{} {op} {}`)",
+                render_tokens_compact(clhs),
+                render_tokens_compact(crhs)
+            ));
+        }
+    }
+
+    // 2. Tautological implication / conjunction repackaging (`P → Q → P ∧ Q`, `P ∧ Q → P`, `P → P`)
+    let mut hyp_atoms: Vec<Vec<String>> = Vec::new();
+    let mut raw_hyp_atoms: Vec<&[LeanToken]> = Vec::new();
+    for h in &hyps {
+        for atom in split_top_level_op(h, &["∧"]) {
+            let norm = normalize_prop_tokens(atom);
+            if !norm.is_empty() {
+                hyp_atoms.push(norm);
+                raw_hyp_atoms.push(atom);
+            }
+        }
+    }
+    if !hyp_atoms.is_empty() {
+        let concl_conjs: Vec<Vec<String>> = split_top_level_op(concl, &["∧"])
+            .into_iter()
+            .map(normalize_prop_tokens)
+            .filter(|v| !v.is_empty())
+            .collect();
+        if !concl_conjs.is_empty()
+            && concl_conjs
+                .iter()
+                .all(|cj| hyp_atoms.iter().any(|ha| ha == cj))
+        {
+            return Some(
+                "tautological implication repackaging (`P → Q → P ∧ Q` / conclusion repeats hypotheses)"
+                    .to_string(),
+            );
+        }
+
+        let concl_disjs: Vec<Vec<String>> = split_top_level_op(concl, &["∨"])
+            .into_iter()
+            .map(normalize_prop_tokens)
+            .filter(|v| !v.is_empty())
+            .collect();
+        if concl_disjs.len() > 1
+            && concl_disjs
+                .iter()
+                .any(|dj| hyp_atoms.iter().any(|ha| ha == dj))
+        {
+            return Some(
+                "tautological disjunction weakening (`P → P ∨ Q`)"
+                    .to_string(),
+            );
+        }
+    }
+
+    // 3. Equality congruence (`a = b → a.toNat = b.toNat`, `x = y → f x = f y`, `a = b → (a == b) = true`)
+    let concl_eq_pair = if let Some((clhs, _, crhs)) = split_top_level_binary(concl, &["="]) {
+        if crhs.len() == 1
+            && matches!(&crhs[0].kind, LeanTokenKind::Ident(id) if id == "true" || id == "Bool.true")
+        {
+            split_top_level_binary(clhs, &["=="]).or(Some((clhs, "=", crhs)))
+        } else {
+            Some((clhs, "=", crhs))
+        }
+    } else {
+        split_top_level_binary(concl, &["=="])
+    };
+
+    if let Some((clhs, _, crhs)) = concl_eq_pair {
+        let clhs_norm = normalize_prop_tokens(clhs);
+        let crhs_norm = normalize_prop_tokens(crhs);
+        if !clhs_norm.is_empty() && clhs_norm != crhs_norm {
+            for hatom in &raw_hyp_atoms {
+                if let Some((hlhs, _, hrhs)) = split_top_level_binary(hatom, &["="])
+                    .or_else(|| split_top_level_binary(hatom, &["=="]))
+                {
+                    let hlhs_norm = normalize_prop_tokens(hlhs);
+                    let hrhs_norm = normalize_prop_tokens(hrhs);
+                    if (hlhs_norm == clhs_norm && hrhs_norm == crhs_norm)
+                        || (hlhs_norm == crhs_norm && hrhs_norm == clhs_norm)
+                    {
+                        return Some(format!(
+                            "equality/BEq congruence tautology (`{} = {} → {}`)",
+                            render_tokens_compact(hlhs),
+                            render_tokens_compact(hrhs),
+                            render_tokens_compact(concl)
+                        ));
+                    }
+                    if hlhs.len() == 1 && hrhs.len() == 1 {
+                        if let (LeanTokenKind::Ident(x), LeanTokenKind::Ident(y)) =
+                            (&hlhs[0].kind, &hrhs[0].kind)
+                        {
+                            if x != y
+                                && (substitute_ident_in_norm(&clhs_norm, x, y) == crhs_norm
+                                    || substitute_ident_in_norm(&clhs_norm, y, x) == crhs_norm)
+                            {
+                                return Some(format!(
+                                    "equality congruence tautology (`{x} = {y} → {} = {}`)",
+                                    render_tokens_compact(clhs),
+                                    render_tokens_compact(crhs)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Universal instantiation tautology (`(∀ z, P z) → ∀ y, P (g y)`)
+    for hatom in &raw_hyp_atoms {
+        if is_forall_instantiation_tautology(hatom, concl) {
+            return Some(
+                "universal instantiation tautology (`(∀ z, P z) → P term` without domain refinement)"
+                    .to_string(),
+            );
+        }
+    }
+
+    // 5. Lattice / boolean algebra meet-join-implies tautology (`(φ.meet ψ).implies φ = true`)
+    if hyps.is_empty() && is_lattice_meet_implies_tautology(concl) {
+        return Some(format!(
+            "boolean/lattice tautology (`{}`)",
+            render_tokens_compact(concl)
+        ));
+    }
+
+    // 6. Quantified domain binder never appearing in any subsequent binder type, hypothesis, or conclusion
+    for (bi, qb) in qbinders.iter().enumerate() {
+        if qb.is_instance_bracket || is_sort_binder_type(&qb.type_tokens) {
+            continue;
+        }
+        if qb.is_underscore {
+            return Some(format!(
+                "discarded quantified domain binder `{}` in obligation signature",
+                qb.name
+            ));
+        }
+        let used_in_later_binder = qbinders[bi + 1..]
+            .iter()
+            .any(|later| ident_referenced(&later.type_tokens, &qb.name));
+        let used_in_hyps = hyps.iter().any(|h| ident_referenced(h, &qb.name));
+        let used_in_concl = ident_referenced(concl, &qb.name);
+        if !used_in_later_binder && !used_in_hyps && !used_in_concl {
+            return Some(format!(
+                "quantified domain binder `{}` never appears in hypotheses or conclusion",
+                qb.name
+            ));
+        }
+    }
+
+    // 7. High-claim cryptographic/protocol soundness name paired with scalar `> 0` consequence or non-existential fake `Extract`
+    if field_name_claims_crypto_or_protocol_soundness(field_name) {
+        if is_simple_scalar_zero_bound(concl) {
+            return Some(format!(
+                "field `{field_name}` claims cryptographic/protocol soundness but only states trivial scalar zero-bound `{}`",
+                render_tokens_compact(concl)
+            ));
+        }
+        if field_name.to_ascii_lowercase().contains("extract") {
+            let has_witness_former = concl.iter().any(|t| {
+                matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "∃" || s == "Σ")
+                    || matches!(
+                        &t.kind,
+                        LeanTokenKind::Ident(id)
+                            if matches!(
+                                id.as_str(),
+                                "Exists" | "Nonempty" | "Sigma" | "PSigma" | "PSum" | "Sum"
+                            )
+                    )
+            });
+            let has_concl_unused_domain_binder = qbinders.iter().any(|qb| {
+                !qb.is_instance_bracket
+                    && !is_sort_binder_type(&qb.type_tokens)
+                    && !ident_referenced(concl, &qb.name)
+            });
+            if !has_witness_former && has_concl_unused_domain_binder && !hyps.is_empty() {
+                return Some(format!(
+                    "field `{field_name}` claims witness extraction (`*Extract`) without any existential witness (`∃`) in conclusion (`{}`)",
+                    render_tokens_compact(concl)
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Stage-A Class-Signature Anti-Cosplay Rule (`lean/obligation-tautological-field`):
+/// Inspects field signatures inside `class *Obligations`, `class *Ledger`, and `@[obb_obligation]` classes.
+fn check_obligation_class_tautological_fields(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    obligation_classes: &HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let is_obl_class = obligation_classes.contains(&decl.fq_name)
+        || obligation_classes.contains(&decl.name)
+        || is_obligation_class_name(&decl.name)
+        || decl.attributes.iter().any(|a| a == "obb_obligation");
+    if !is_obl_class {
+        return;
+    }
+
+    for sf in &decl.struct_fields {
+        if let Some(reason) =
+            classify_obligation_field_signature(&sf.name, &sf.binders, &sf.type_tokens)
+        {
+            findings.push(Finding {
+                rule_id: "lean/obligation-tautological-field".to_string(),
+                severity: Severity::Error,
+                artifact_kind: ArtifactKind::S,
+                max_regime: Regime::Attested,
+                sink: Some(Sink::Theater),
+                path: file.rel_path.clone(),
+                line: sf.line,
+                column: sf.col,
+                symbol: Some(format!("{}.{}", decl.fq_name, sf.name)),
+                message: format!(
+                    "Stage-A obligation field `{}.{}` has a tautological/cosplay signature: {reason}",
+                    decl.fq_name, sf.name
+                ),
+                remediation: "Replace tautological Stage-A obligation signatures (`P → Q → P ∧ Q`, `a = b → f a = f b`, `... → True`, lattice meet elimination, unused quantified binders, or scalar `> 0` bounds under crypto/protocol soundness names) with the real semantic, ISA, or cryptographic refinement statement (or prove trivial lemmas directly and delete the obligation field).".to_string(),
+            });
+        }
+    }
+}
+
+fn is_turn_carrier_ident(id: &str) -> bool {
+    let short = id.rsplit('.').next().unwrap_or(id);
+    short == "Turn"
+        || (short.ends_with("Turn")
+            && short.len() > 4
+            && short.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+}
+
+fn is_seq_container_ident(id: &str) -> bool {
+    let short = id.rsplit('.').next().unwrap_or(id);
+    matches!(short, "List" | "Array" | "Stream" | "Vector" | "Trace")
+}
+
+fn is_multi_turn_modal_or_trace_ident(id: &str) -> bool {
+    let short = id.rsplit('.').next().unwrap_or(id);
+    matches!(
+        short,
+        "Reach"
+            | "Reachable"
+            | "SafeWP"
+            | "ValidTrace"
+            | "MultiTurnHoare"
+            | "GPaco"
+            | "TraceSafe"
+    ) || short.starts_with("Reach")
+        || short.ends_with("Reach")
+        || short.starts_with("SafeWP")
+        || short.ends_with("SafeWP")
+        || short.starts_with("ValidTrace")
+        || short.ends_with("ValidTrace")
+        || short.contains("MultiTurn")
+}
+
+fn tokens_have_multi_turn_form(tokens: &[LeanToken]) -> bool {
+    for (i, tok) in tokens.iter().enumerate() {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            if is_multi_turn_modal_or_trace_ident(id) {
+                return true;
+            }
+            if is_seq_container_ident(id) {
+                // `List Turn`, `List (SessionTurn)`, `Array GovTurn`, `Stream Turn`
+                let rest = &tokens[i + 1..];
+                for next_tok in rest.iter().take(3) {
+                    match &next_tok.kind {
+                        LeanTokenKind::Symbol(s) if s == "(" => continue,
+                        LeanTokenKind::Ident(inner) if is_turn_carrier_ident(inner) => {
+                            return true;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn decl_has_multi_turn_signature(decl: &ParsedLeanDecl) -> bool {
+    decl.binders
+        .iter()
+        .any(|b| tokens_have_multi_turn_form(&b.type_tokens))
+        || tokens_have_multi_turn_form(&decl.type_tokens)
+}
+
+fn first_single_turn_carrier_in_tokens(tokens: &[LeanToken]) -> Option<String> {
+    for (i, tok) in tokens.iter().enumerate() {
+        if let LeanTokenKind::Ident(id) = &tok.kind
+            && is_turn_carrier_ident(id)
+        {
+            // Ignore when immediately preceded by `List` / `Array` / `Stream` (or `List (`)
+            let preceded_by_seq = (i >= 1
+                && matches!(&tokens[i - 1].kind, LeanTokenKind::Ident(prev) if is_seq_container_ident(prev)))
+                || (i >= 2
+                    && matches!(&tokens[i - 1].kind, LeanTokenKind::Symbol(s) if s == "(")
+                    && matches!(&tokens[i - 2].kind, LeanTokenKind::Ident(prev) if is_seq_container_ident(prev)));
+            if !preceded_by_seq {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
+}
+
+fn is_apex_single_turn_theorem_name(name: &str) -> bool {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    short.starts_with("apex_")
+        && (short.ends_with("_turn_safe")
+            || short.ends_with("_turn_sound")
+            || short.contains("_turn_safe_")
+            || short.contains("_turn_sound_"))
+}
+
+/// Checks whether `decl` is a single-turn `apex_*_turn_{safe,sound}` theorem taking a `*Turn`
+/// parameter in a module that lacks any multi-turn trace/reachability invariant theorem
+/// (`List *Turn`, `Reach`, `SafeWP`, `ValidTrace`, `MultiTurnHoare`, `GPaco`).
+pub fn single_turn_apex_violation(file: &ParsedLeanFile, decl: &ParsedLeanDecl) -> Option<String> {
+    if decl.kind != DeclKind::Theorem || !is_apex_single_turn_theorem_name(&decl.name) {
+        return None;
+    }
+    if decl_has_multi_turn_signature(decl) {
+        return None;
+    }
+
+    let mut qbinders: Vec<QuantBinder> = Vec::new();
+    let mut hyps: Vec<&[LeanToken]> = Vec::new();
+    let _ = peel_forall_and_arrows(&decl.type_tokens, &mut qbinders, &mut hyps);
+
+    let turn_carrier = decl
+        .binders
+        .iter()
+        .find_map(|b| first_single_turn_carrier_in_tokens(&b.type_tokens))
+        .or_else(|| {
+            qbinders
+                .iter()
+                .find_map(|qb| first_single_turn_carrier_in_tokens(&qb.type_tokens))
+        })?;
+
+    let module_has_multi_turn_thm = file.declarations.iter().any(|other| {
+        other.kind == DeclKind::Theorem && !other.fixture_kept && decl_has_multi_turn_signature(other)
+    });
+
+    if module_has_multi_turn_thm {
+        None
+    } else {
+        Some(format!(
+            "Single-turn apex theorem `{}` quantifies over single `{turn_carrier}` without any multi-turn trace/reachability invariant theorem (`List *Turn`, `Reach`, `SafeWP`, `ValidTrace`, `MultiTurnHoare`) in `{}`, leaving multi-turn state-accumulation hazards (`RevokedSet` growth, `Mandate` budget depletion, persistent `UMem`) unverified",
+            decl.fq_name, file.rel_path
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2749,5 +3787,349 @@ end Obend.Crypto
                 .all(|f| f.rule_id != "lean/obligation-projection-cosplay"),
             "clean theorem-backed instance must produce 0 cosplay findings: {clean_findings:#?}"
         );
+    }
+
+    #[test]
+    fn stage_a_obligation_tautological_field_catches_trailblaze_cosplay_and_passes_real_obligations()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let tb_dir = dir.path().join("lean/Obend/Trailblaze");
+        fs::create_dir_all(&tb_dir).unwrap();
+        fs::write(
+            tb_dir.join("CosplayStageA.lean"),
+            r#"module
+public section
+namespace Obend.Trailblaze
+
+class PolisObligations : Prop where
+  darkBazaarSameOpeningZeroKnowledge :
+    ∀ (commitA commitB : BitVec 256),
+      commitA = commitB → commitA.toNat = commitB.toNat
+  regularCoveragePullbackStable :
+    ∀ (P : PCA) (A B C : Assembly P) (f : TrackedMorphism A C) (g : TrackedMorphism B C),
+      (∀ z : C.Carrier, ∃ x : A.Carrier, f.map x = z) →
+      ∀ y : B.Carrier, ∃ x : A.Carrier, f.map x = g.map y
+
+class ClusterGovObligations : Prop where
+  qwenLogUpGkrSound :
+    ∀ (b : IntTensorBound), checkSableNoWrap b = true → b.modulusP > 0
+  teeHardwareRootAttested :
+    ∀ (step : AriadneStep),
+      step.flopsUsed ≤ step.flopsCap →
+      step.batchCallTreeRoot ≠ 0 →
+      step.flopsUsed ≤ step.flopsCap ∧ step.batchCallTreeRoot ≠ 0
+
+class LeanFpgaObligations : Prop where
+  siliconSimpKernelProofSound :
+    ∀ (φ ψ : CofibLUT16), (φ.meet ψ).implies φ = true
+
+class CustomAuditLedger : Prop where
+  unusedDomainBinder :
+    ∀ (salt : BitVec 256) (n : Nat), n > 0 → n >= 0
+  trivialTrueTail :
+    ∀ (x : Nat), x > 0 → True
+
+@[obb_obligation]
+class TaggedSoundnessGate : Prop where
+  fnCongr : ∀ (x y : Nat), x = y → hashVal x = hashVal y
+
+end Obend.Trailblaze
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (findings, _) = run_lean_lints(&idx);
+        let tauto: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/obligation-tautological-field")
+            .collect();
+        assert_eq!(
+            tauto.len(),
+            8,
+            "all 8 planted Stage-A tautological obligation fields must fire: {tauto:#?}"
+        );
+        assert!(tauto.iter().all(|f| f.severity == Severity::Error));
+        for expected_sym in [
+            "Obend.Trailblaze.PolisObligations.darkBazaarSameOpeningZeroKnowledge",
+            "Obend.Trailblaze.PolisObligations.regularCoveragePullbackStable",
+            "Obend.Trailblaze.ClusterGovObligations.qwenLogUpGkrSound",
+            "Obend.Trailblaze.ClusterGovObligations.teeHardwareRootAttested",
+            "Obend.Trailblaze.LeanFpgaObligations.siliconSimpKernelProofSound",
+            "Obend.Trailblaze.CustomAuditLedger.unusedDomainBinder",
+            "Obend.Trailblaze.CustomAuditLedger.trivialTrueTail",
+            "Obend.Trailblaze.TaggedSoundnessGate.fnCongr",
+        ] {
+            assert!(
+                tauto
+                    .iter()
+                    .any(|f| f.symbol.as_deref() == Some(expected_sym)),
+                "expected `{expected_sym}` to fire, got: {tauto:#?}"
+            );
+        }
+
+        // Positive control: genuine commitment binding & completeness obligations produce 0 findings
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean_tb = clean_dir.path().join("lean/Obend/Trailblaze");
+        fs::create_dir_all(&clean_tb).unwrap();
+        fs::write(
+            clean_tb.join("RealStageA.lean"),
+            r#"module
+public section
+namespace Obend.Trailblaze
+
+class RealTrailblazeObligations : Prop where
+  tlsnAeadCommitmentBinding :
+    ∀ (H : Hash) (t₁ t₂ : HttpsSessionNode),
+      callTreeDigest H t₁ = callTreeDigest H t₂ →
+      t₁ = t₂ ∨ Collision H
+  blumPermutationComplete :
+    ∀ (online : List MemOp),
+      checkChronologicalLog online = true →
+      (∀ op ∈ online, op.isWrite = true) →
+      ∃ offline : List MemOp, verifyBlumMemory online offline = true
+  dualPcsCallTreeExtract :
+    ∀ (H : Hash) (pol : ZkStripePolicy) (rcpt : DualPcsCallTreeReceipt),
+      verifyDualPcsReceipt H rcpt = true →
+      ∃ tree : HttpsSessionNode,
+        callTreeDigest H tree = rcpt.committedTreeRoot ∧
+        verifyZkStripeCallTree pol tree = true
+
+end Obend.Trailblaze
+"#,
+        )
+        .unwrap();
+
+        let clean_idx = build_lean_index(clean_dir.path());
+        let (clean_findings, _) = run_lean_lints(&clean_idx);
+        let clean_tauto: Vec<_> = clean_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/obligation-tautological-field")
+            .collect();
+        assert!(
+            clean_tauto.is_empty(),
+            "genuine Stage-A obligations must produce 0 findings: {clean_tauto:#?}"
+        );
+    }
+
+    #[test]
+    fn judge_empty_fragment_catches_silver_workflow_to_judge_and_passes_inhabited_judge() {
+        let dir = tempfile::tempdir().unwrap();
+        let tb_dir = dir.path().join("lean/Obend/Trailblaze");
+        fs::create_dir_all(&tb_dir).unwrap();
+        fs::write(
+            tb_dir.join("Obligations.lean"),
+            r#"module
+public section
+namespace Obend.Trailblaze
+
+@[instance_reducible] def SilverWorkflow.toJudge (W : Type) [wf : SilverWorkflow W] : Obend.Judge W Unit where
+  Clause := String
+  Meaning := fun w _cert => wf.Spec w
+  check := fun _grade w _cert => .ok
+  sound := by intro _ w _ _; exact wf.silverSound w rfl
+  refutes := fun _clause => false
+  refuted := by intro _ _ _ _ _ _ hRef; cases hRef
+  Fragment := fun _w => False
+  complete := by intro _w hFrag; cases hFrag
+  mono := by intro _ _ _ _ _ _; rfl
+
+end Obend.Trailblaze
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (findings, _) = run_lean_lints(&idx);
+        let empty_frag: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/judge-empty-fragment")
+            .collect();
+        assert_eq!(
+            empty_frag.len(),
+            2,
+            "both `refutes := fun _ => false` and `Fragment := fun _ => False` must fire: {empty_frag:#?}"
+        );
+        assert!(empty_frag.iter().all(|f| f.severity == Severity::Warning));
+
+        // Positive control: inhabited `Fragment` and `refutes := fun _ => true`
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean_tb = clean_dir.path().join("lean/Obend/Trailblaze");
+        fs::create_dir_all(&clean_tb).unwrap();
+        fs::write(
+            clean_tb.join("CompleteJudge.lean"),
+            r#"module
+public section
+namespace Obend.Trailblaze
+
+@[instance_reducible] def CompleteSilverWorkflow.toJudge (W : Type) [wf : SilverWorkflow W] : Obend.Judge W Unit where
+  Clause := String
+  Meaning := fun w _cert => wf.Spec w
+  check := fun _grade w _cert => .ok
+  sound := by intro _ w _ _; exact wf.silverSound w rfl
+  refutes := fun _clause => true
+  refuted := by intro _ _ _ _ _ hCheck _; cases hCheck
+  Fragment := wf.DecidableFragment
+  complete := by intro w hFrag; exact wf.silverComplete w hFrag
+  mono := by intro _ _ _ _ _ _; rfl
+
+end Obend.Trailblaze
+"#,
+        )
+        .unwrap();
+
+        let clean_idx = build_lean_index(clean_dir.path());
+        let (clean_findings, _) = run_lean_lints(&clean_idx);
+        assert!(
+            clean_findings
+                .iter()
+                .all(|f| f.rule_id != "lean/judge-empty-fragment"),
+            "inhabited Judge must produce 0 `lean/judge-empty-fragment` findings: {clean_findings:#?}"
+        );
+    }
+
+    #[test]
+    fn excessive_decl_expose_flags_over_12_in_module_and_escalates_with_strict_expose() {
+        let dir = tempfile::tempdir().unwrap();
+        let tb_dir = dir.path().join("lean/Obend/Trailblaze");
+        fs::create_dir_all(&tb_dir).unwrap();
+
+        let mut bad_src = String::from("module\npublic section\nnamespace Obend.Trailblaze\n");
+        for i in 0..15 {
+            bad_src.push_str(&format!(
+                "@[expose] def exposedHelper{i} (x : Nat) : Nat := x + {i}\n"
+            ));
+        }
+        for i in 0..75 {
+            bad_src.push_str(&format!("def sealedHelper{i} (x : Nat) : Nat := x + {i}\n"));
+        }
+        bad_src.push_str("end Obend.Trailblaze\n");
+        assert!(bad_src.lines().count() > 80);
+        fs::write(tb_dir.join("ExposeSpam.lean"), &bad_src).unwrap();
+
+        let mut clean_src = String::from("module\npublic section\nnamespace Obend.Trailblaze\n");
+        for i in 0..8 {
+            clean_src.push_str(&format!(
+                "@[expose] def tinyCarrierProj{i} (x : Nat) : Nat := x + {i}\n"
+            ));
+        }
+        for i in 0..85 {
+            clean_src.push_str(&format!("def privateBody{i} (x : Nat) : Nat := x + {i}\n"));
+        }
+        clean_src.push_str("end Obend.Trailblaze\n");
+        assert!(clean_src.lines().count() > 80);
+        fs::write(tb_dir.join("CleanExpose.lean"), &clean_src).unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (warn_findings, _) = run_lean_lints_with_options(&idx, LeanLintOptions::default());
+        let excessive_warn: Vec<_> = warn_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/excessive-decl-expose")
+            .collect();
+        assert_eq!(excessive_warn.len(), 1);
+        assert!(excessive_warn[0].path.ends_with("ExposeSpam.lean"));
+        assert_eq!(excessive_warn[0].severity, Severity::Warning);
+
+        let (err_findings, _) = run_lean_lints_with_options(
+            &idx,
+            LeanLintOptions {
+                strict_expose: true,
+                strict_harnesses: false,
+            },
+        );
+        let excessive_err: Vec<_> = err_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/excessive-decl-expose")
+            .collect();
+        assert_eq!(excessive_err.len(), 1);
+        assert_eq!(excessive_err[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn single_sequence_harness_flags_single_turn_apex_and_passes_with_multi_turn_invariant() {
+        let dir = tempfile::tempdir().unwrap();
+        let gov_dir = dir.path().join("lean/Obend/Consensus");
+        fs::create_dir_all(&gov_dir).unwrap();
+
+        fs::write(
+            gov_dir.join("SingleTurnOnly.lean"),
+            r#"module
+public section
+namespace Obend.Consensus
+
+structure GovState where
+  mandateBudget : Nat
+  revokedCount : Nat
+
+structure GovTurn where
+  spend : Nat
+
+def stepTurn (s : GovState) (t : GovTurn) : Option GovState :=
+  if t.spend <= s.mandateBudget then
+    some { s with mandateBudget := s.mandateBudget - t.spend }
+  else
+    none
+
+theorem apex_gov_turn_safe (s s' : GovState) (t : GovTurn)
+    (h : stepTurn s t = some s') :
+    s'.mandateBudget <= s.mandateBudget := by
+  omega
+
+end Obend.Consensus
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            gov_dir.join("MultiTurnComplete.lean"),
+            r#"module
+public section
+namespace Obend.Consensus
+
+structure SessionState where
+  budget : Nat
+
+structure SessionTurn where
+  cost : Nat
+
+def ValidTrace (s : SessionState) (ts : List SessionTurn) : Prop :=
+  ts.length >= 0 ∧ s.budget >= 0
+
+theorem apex_session_turn_sound (s : SessionState) (t : SessionTurn) :
+    ValidTrace s [t] := by
+  exact ⟨Nat.zero_le _, Nat.zero_le _⟩
+
+theorem session_trace_invariant (s : SessionState) (ts : List SessionTurn)
+    (h : ValidTrace s ts) :
+    s.budget >= 0 := h.2
+
+end Obend.Consensus
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (warn_findings, _) = run_lean_lints_with_options(&idx, LeanLintOptions::default());
+        let st_warns: Vec<_> = warn_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/single-sequence-harness")
+            .collect();
+        assert_eq!(st_warns.len(), 1, "expected 1 single-turn warning: {st_warns:#?}");
+        assert!(st_warns[0].path.ends_with("SingleTurnOnly.lean"));
+        assert_eq!(st_warns[0].severity, Severity::Warning);
+
+        let (err_findings, _) = run_lean_lints_with_options(
+            &idx,
+            LeanLintOptions {
+                strict_expose: false,
+                strict_harnesses: true,
+            },
+        );
+        let st_errs: Vec<_> = err_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/single-sequence-harness")
+            .collect();
+        assert_eq!(st_errs.len(), 1);
+        assert_eq!(st_errs[0].severity, Severity::Error);
     }
 }

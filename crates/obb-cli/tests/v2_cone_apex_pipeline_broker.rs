@@ -92,6 +92,7 @@ fn law_m1_file_wide_expose_flags_over_80_lines_and_escalates_under_strict_expose
         root,
         RepoLintOptions {
             strict_expose: true,
+            ..Default::default()
         },
     )
     .unwrap();

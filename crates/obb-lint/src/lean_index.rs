@@ -32,6 +32,7 @@ pub struct BinderParam {
 #[derive(Debug, Clone)]
 pub struct StructField {
     pub name: String,
+    pub binders: Vec<BinderParam>,
     pub type_tokens: Vec<LeanToken>,
     pub line: usize,
     pub col: usize,
@@ -1077,12 +1078,53 @@ fn parse_command_slice(
                             }
                             k += 1;
                         }
+                        let mut fbinders = Vec::new();
+                        if let Some(fc) = fcolon {
+                            let mut fb_idx = idx + 1;
+                            while fb_idx < fc {
+                                match &cmd[fb_idx].kind {
+                                    LeanTokenKind::Symbol(s)
+                                        if matches!(s.as_str(), "(" | "{" | "[") =>
+                                    {
+                                        let open = s.as_str();
+                                        let close = match open {
+                                            "(" => ")",
+                                            "{" => "}",
+                                            _ => "]",
+                                        };
+                                        let gstart = fb_idx + 1;
+                                        let mut d = 1usize;
+                                        fb_idx += 1;
+                                        while fb_idx < fc && d > 0 {
+                                            match &cmd[fb_idx].kind {
+                                                LeanTokenKind::Symbol(o) if o == open => d += 1,
+                                                LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                                                _ => {}
+                                            }
+                                            fb_idx += 1;
+                                        }
+                                        let gend = fb_idx.saturating_sub(1);
+                                        if gstart <= gend && gend <= fc {
+                                            extract_binder_group(
+                                                &cmd[gstart..gend],
+                                                open == "[",
+                                                &mut fbinders,
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        fb_idx += 1;
+                                    }
+                                }
+                            }
+                        }
                         let ftype = match fcolon {
                             Some(fc) if fc + 1 <= k => cmd[fc + 1..k].to_vec(),
                             _ => Vec::new(),
                         };
                         struct_fields.push(StructField {
                             name: field_id.clone(),
+                            binders: fbinders,
                             type_tokens: ftype,
                             line: tok.line,
                             col: tok.col,
