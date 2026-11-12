@@ -3,6 +3,7 @@
 
 pub mod apex;
 pub mod cone;
+pub mod cross_lang;
 pub mod harness;
 pub mod lean_index;
 pub mod lean_lexer;
@@ -16,6 +17,7 @@ pub mod spec_check;
 
 use anyhow::Result;
 use chrono::Utc;
+use cross_lang::scan_cross_lang_domain_tags;
 use lean_index::build_lean_index;
 use lean_rules::{LeanLintOptions, run_lean_lints_with_options};
 use markdown_rules::scan_markdown_files;
@@ -33,6 +35,10 @@ pub struct RepoLintOptions {
     pub strict_expose: bool,
     /// Escalate `lean/single-sequence-harness` from `Severity::Warning` to `Severity::Error`.
     pub strict_harnesses: bool,
+    /// Escalate `lean/judge-fragment-restates-check` and `lean/pigeonhole-vacuous-premise` from `Severity::Warning` to `Severity::Error`.
+    pub strict_vacuity: bool,
+    /// Escalate `cross-lang/domain-tag-drift` from `Severity::Warning` to `Severity::Error`.
+    pub strict_wire: bool,
 }
 
 /// Run all mechanical anti-slop, vacuity, seam-mirror, and doc-integrity checks over `repo_root`
@@ -61,16 +67,19 @@ pub fn run_repo_lints_with_options(
         LeanLintOptions {
             strict_expose: options.strict_expose,
             strict_harnesses: options.strict_harnesses,
+            strict_vacuity: options.strict_vacuity,
         },
     );
     let (obend_count, obend_findings) = scan_all_obend_files(&canon);
     let (py_count, py_findings) = scan_python_files(&canon);
     let (rs_count, rs_findings) = scan_rust_files(&canon);
+    let cross_lang_findings = scan_cross_lang_domain_tags(&canon, options.strict_wire);
     let (md_count, md_findings) = scan_markdown_files(&canon, &index);
 
     findings.extend(obend_findings);
     findings.extend(py_findings);
     findings.extend(rs_findings);
+    findings.extend(cross_lang_findings);
     findings.extend(md_findings);
 
     // Deterministic ordering by `(path, line, column, rule_id)`

@@ -72,6 +72,14 @@ enum Commands {
         #[arg(long)]
         strict_harnesses: bool,
 
+        /// Escalate `lean/judge-fragment-restates-check` and `lean/pigeonhole-vacuous-premise` from warning to error
+        #[arg(long)]
+        strict_vacuity: bool,
+
+        /// Escalate `cross-lang/domain-tag-drift` (Rust↔Lean domain tag & framing arity drift) from warning to error
+        #[arg(long)]
+        strict_wire: bool,
+
         /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
         #[arg(long)]
         modularity: bool,
@@ -689,6 +697,8 @@ async fn run() -> Result<ExitCode> {
             strict,
             strict_expose,
             strict_harnesses,
+            strict_vacuity,
+            strict_wire,
             modularity,
             sub,
         } => {
@@ -731,6 +741,8 @@ async fn run() -> Result<ExitCode> {
                 RepoLintOptions {
                     strict_expose,
                     strict_harnesses,
+                    strict_vacuity,
+                    strict_wire,
                 },
             )?;
             if let Some(ref flt) = rule {

@@ -1167,6 +1167,7 @@ fn parse_command_slice(
     let mut depth = 0isize;
     let mut colon_idx: Option<usize> = None;
     let mut body_sep_idx: Option<(usize, &str)> = None;
+    let mut pending_type_let_assigns = 0usize;
 
     let mut idx = pos;
     while idx < cmd.len() {
@@ -1229,9 +1230,18 @@ fn parse_command_slice(
             LeanTokenKind::Symbol(s) if s == ":" && depth == 0 && colon_idx.is_none() => {
                 colon_idx = Some(idx);
             }
+            LeanTokenKind::Ident(kw)
+                if colon_idx.is_some() && depth == 0 && (kw == "let" || kw == "have") =>
+            {
+                pending_type_let_assigns += 1;
+            }
             LeanTokenKind::Symbol(s) if s == ":=" && depth == 0 => {
-                body_sep_idx = Some((idx, ":="));
-                break;
+                if pending_type_let_assigns > 0 {
+                    pending_type_let_assigns -= 1;
+                } else {
+                    body_sep_idx = Some((idx, ":="));
+                    break;
+                }
             }
             LeanTokenKind::Ident(s) if s == "where" && depth == 0 => {
                 body_sep_idx = Some((idx, "where"));

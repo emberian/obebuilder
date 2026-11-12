@@ -88,10 +88,83 @@ pub fn tokenize_rust(src: &str) -> Vec<RsTok> {
             continue;
         }
 
-        // Raw string literal `r#"..."#` or `r"..."`
-        if c == 'r' && i + 1 < n && (chars[i + 1] == '#' || chars[i + 1] == '"') {
+        // Byte char literal `b'x'` or `b'\n'` or `b'\x4f'`
+        if c == 'b' && i + 2 < n && chars[i + 1] == '\'' {
+            i += 2;
+            col += 2;
+            let mut byte_val: Option<u8> = None;
+            while i < n {
+                if chars[i] == '\\' && i + 1 < n {
+                    let esc = chars[i + 1];
+                    if esc == 'x'
+                        && i + 3 < n
+                        && let (Some(d1), Some(d2)) =
+                            (chars[i + 2].to_digit(16), chars[i + 3].to_digit(16))
+                    {
+                        byte_val = Some(((d1 << 4) | d2) as u8);
+                        i += 4;
+                        col += 4;
+                        continue;
+                    }
+                    byte_val = Some(match esc {
+                        'n' => b'\n',
+                        'r' => b'\r',
+                        't' => b'\t',
+                        '0' => 0,
+                        other if other.is_ascii() => other as u8,
+                        _ => b'?',
+                    });
+                    if esc == '\n' {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 2;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '\'' {
+                    i += 1;
+                    col += 1;
+                    break;
+                }
+                if chars[i] == '\n' {
+                    line += 1;
+                    col = 1;
+                    i += 1;
+                    break;
+                }
+                if byte_val.is_none() && chars[i].is_ascii() {
+                    byte_val = Some(chars[i] as u8);
+                }
+                i += 1;
+                col += 1;
+            }
+            if let Some(bv) = byte_val {
+                out.push(RsTok {
+                    kind: RsTokKind::NumLit(bv.to_string()),
+                    line: sline,
+                    col: scol,
+                });
+            }
+            continue;
+        }
+
+        // Raw string or raw byte string literal `r#"..."#`, `r"..."`, `br#"..."#`, `br"..."`
+        let raw_prefix_len = if c == 'r' && i + 1 < n && (chars[i + 1] == '#' || chars[i + 1] == '"') {
+            Some(1usize)
+        } else if c == 'b'
+            && i + 2 < n
+            && chars[i + 1] == 'r'
+            && (chars[i + 2] == '#' || chars[i + 2] == '"')
+        {
+            Some(2usize)
+        } else {
+            None
+        };
+        if let Some(plen) = raw_prefix_len {
             let mut hashes = 0usize;
-            let mut j = i + 1;
+            let mut j = i + plen;
             while j < n && chars[j] == '#' {
                 hashes += 1;
                 j += 1;
@@ -130,20 +203,76 @@ pub fn tokenize_rust(src: &str) -> Vec<RsTok> {
             }
         }
 
-        // Normal string literal `"..."`
-        if c == '"' {
-            i += 1;
-            col += 1;
+        // Normal string `"..."` or byte string `b"..."`
+        if c == '"' || (c == 'b' && i + 1 < n && chars[i + 1] == '"') {
+            let step = if c == 'b' { 2 } else { 1 };
+            i += step;
+            col += step;
             let mut s = String::new();
             while i < n && chars[i] != '"' {
                 if chars[i] == '\\' && i + 1 < n {
-                    s.push(chars[i + 1]);
-                    if chars[i + 1] == '\n' {
+                    let esc = chars[i + 1];
+                    if esc == 'x' && i + 3 < n {
+                        let h1 = chars[i + 2];
+                        let h2 = chars[i + 3];
+                        if let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16)) {
+                            s.push(((d1 << 4) | d2) as u8 as char);
+                            i += 4;
+                            col += 4;
+                            continue;
+                        }
+                    }
+                    if esc == 'u' && i + 3 < n && chars[i + 2] == '{' {
+                        let mut k = i + 3;
+                        let mut hex = String::new();
+                        while k < n
+                            && chars[k] != '}'
+                            && hex.len() <= 8
+                            && (chars[k].is_ascii_hexdigit() || chars[k] == '_')
+                        {
+                            if chars[k] != '_' {
+                                hex.push(chars[k]);
+                            }
+                            k += 1;
+                        }
+                        if k < n
+                            && chars[k] == '}'
+                            && !hex.is_empty()
+                            && let Ok(code) = u32::from_str_radix(&hex, 16)
+                            && let Some(ch) = char::from_u32(code)
+                        {
+                            s.push(ch);
+                            let step = (k + 1) - i;
+                            i = k + 1;
+                            col += step;
+                            continue;
+                        }
+                    }
+                    // Rust string line-continuation `\` followed by `\n` (or `\r\n`) skips leading whitespace
+                    if esc == '\n' || (esc == '\r' && i + 2 < n && chars[i + 2] == '\n') {
+                        i += if esc == '\r' { 3 } else { 2 };
                         line += 1;
                         col = 1;
-                    } else {
-                        col += 2;
+                        while i < n && matches!(chars[i], ' ' | '\t' | '\r' | '\n') {
+                            if chars[i] == '\n' {
+                                line += 1;
+                                col = 1;
+                            } else {
+                                col += 1;
+                            }
+                            i += 1;
+                        }
+                        continue;
                     }
+                    let decoded = match esc {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '0' => '\0',
+                        other => other,
+                    };
+                    s.push(decoded);
+                    col += 2;
                     i += 2;
                     continue;
                 }

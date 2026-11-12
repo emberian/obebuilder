@@ -197,6 +197,8 @@ pub struct BrokerProbeReport {
 /// for `hbox` per `~/swarm/MACHINES.md` and `> 30 min` runaway `lean`/`lake` detection).
 pub fn build_probe_script() -> String {
     r#"set -u
+: "${HOME:=/tmp}"
+export PATH="${PATH:-/usr/bin:/bin}:$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
 CORES=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 LOAD=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "0.0 0.0 0.0")
 MEM_KB=$(awk '
@@ -746,8 +748,48 @@ pub fn render_safe_remote_recipe(
     )
 }
 
+pub fn is_valid_lake_target(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 256
+        && !t.starts_with('-')
+        && t.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@' | b'+' | b':')
+        })
+}
+
+fn is_safe_remote_path(p: &str) -> bool {
+    if p.is_empty() || p.len() > 512 || !(p.starts_with('/') || p.starts_with("$HOME/")) {
+        return false;
+    }
+    let after_home = p.strip_prefix("$HOME/").unwrap_or(p);
+    if after_home.contains('$') {
+        return false;
+    }
+    !p.bytes().any(|b| {
+        b <= 0x20
+            || b == 0x7f
+            || matches!(
+                b,
+                b'"' | b'\'' | b'`' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>' | b'\\'
+            )
+    }) && !Path::new(p)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn sanitize_shell_token(raw: &str, allow_slash_dollar: bool) -> String {
+    raw.chars()
+        .filter(|&c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | '@' | '+' | ':')
+                || (allow_slash_dollar && (c == '/' || c == '$'))
+        })
+        .collect()
+}
+
 /// Emit the safe remote execution recipe for one host batch:
-/// 1. Isolated per-invocation worktree + external PID file
+/// 1. Isolated per-invocation worktree (`0700` user-owned `WORK_ROOT`) + external PID file
 /// 2. `EXIT INT TERM` process-group & session reaper (`setsid` PGID + `kill -- -$$` + `pkill -P $$`)
 /// 3. Exact target commit sync (`git fetch` + `git checkout --detach <exact_sha>`) & `HEAD:lean` tree verification
 /// 4. Safe CoW/copied `.olean` + `.ir` seeding (`cp -R --reflink=auto`, never shared writable `cp -al` inodes!)
@@ -762,24 +804,81 @@ pub fn render_safe_remote_recipe_for_commit(
     timeout_secs: u64,
     max_rss_gb: u64,
 ) -> (String, String) {
-    let joined_targets = lake_targets.join(" ");
+    let safe_targets: Vec<String> = lake_targets
+        .iter()
+        .map(|t| sanitize_shell_token(t, true))
+        .filter(|t| !t.is_empty() && !t.starts_with('-'))
+        .collect();
+    let joined_targets = safe_targets.join(" ");
     let batched_lake_cmd = format!("lake build {joined_targets}");
     let ulimit_kb = max_rss_gb.saturating_mul(1_048_576);
-    let short_key = &seed_key[..seed_key.len().min(12)];
+    let safe_host = sanitize_shell_token(host, false);
+    let safe_seed_key = sanitize_shell_token(seed_key, false);
+    let short_key = &safe_seed_key[..safe_seed_key.len().min(12)];
     let base_repo = "$HOME/obend/repo";
-    let commit_pin = target_commit.unwrap_or("");
+    let safe_seed_pool = sanitize_shell_token(seed_pool_dir, true);
+    let commit_pin: String = target_commit
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
 
     let recipe = format!(
         r#"set -euo pipefail
-# Host: {host} | Target commit: {commit_pin} | Seed key: {seed_key}
-SEED_POOL="{seed_pool_dir}"
-SEED_KEY="{seed_key}"
+# Host: {safe_host} | Target commit: {commit_pin} | Seed key: {safe_seed_key}
+: "${{HOME:=/tmp}}"
+export PATH="${{PATH:-/usr/bin:/bin}}:$HOME/.elan/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
+SEED_POOL="{safe_seed_pool}"
+SEED_KEY="{safe_seed_key}"
 TARGET_COMMIT="{commit_pin}"
-BASE_REPO="${{OBB_BASE_REPO:-{base_repo}}}"
-WORK_ROOT="${{OBB_WORK_ROOT:-/tmp/obb-worktrees}}"
-mkdir -p "$WORK_ROOT" "$SEED_POOL"
-WT_DIR="$WORK_ROOT/wt-{short_key}-$$"
-PID_FILE="$WORK_ROOT/.obb-build-{short_key}-$$.pid"
+BASE_REPO=""
+if [ -n "${{OBB_BASE_REPO:-}}" ]; then
+  BASE_REPO="$OBB_BASE_REPO"
+else
+  if [ -n "$TARGET_COMMIT" ]; then
+    for cand in "$HOME/obend/repo" "$HOME/obend/dev" "$HOME/obend"; do
+      if [ -e "$cand/.git" ] && git -C "$cand" cat-file -e "${{TARGET_COMMIT}}^{{commit}}" 2>/dev/null; then
+        BASE_REPO="$cand"
+        break
+      fi
+    done
+  fi
+  if [ -z "$BASE_REPO" ]; then
+    for cand in "$HOME/obend/repo" "$HOME/obend/dev" "$HOME/obend"; do
+      if [ -e "$cand/.git" ]; then
+        BASE_REPO="$cand"
+        break
+      fi
+    done
+  fi
+  if [ -z "$BASE_REPO" ]; then
+    BASE_REPO="{base_repo}"
+  fi
+fi
+WORK_ROOT="${{OBB_WORK_ROOT:-${{XDG_RUNTIME_DIR:-$HOME/.cache}}/obb-worktrees}}"
+mkdir -p -m 700 "$WORK_ROOT"
+chmod 700 "$WORK_ROOT" 2>/dev/null || true
+if [ -L "$WORK_ROOT" ] || [ ! -O "$WORK_ROOT" ] || [ ! -w "$WORK_ROOT" ]; then
+  echo "ERROR: unsafe or unwritable WORK_ROOT: $WORK_ROOT" >&2
+  exit 68
+fi
+use_seed_pool() {{
+  [ -n "$1" ] && mkdir -p -m 700 "$1" 2>/dev/null && (chmod 700 "$1" 2>/dev/null || true) && [ ! -L "$1" ] && [ -O "$1" ] && [ -w "$1" ]
+}}
+if ! use_seed_pool "$SEED_POOL"; then
+  OBB_USER="$(id -un 2>/dev/null || echo "${{USER:-obb}}")"
+  if [ -d "/othersys/lanes" ] && [ -w "/othersys/lanes" ] && use_seed_pool "/othersys/lanes/obb-seeds-$OBB_USER/obend"; then
+    SEED_POOL="/othersys/lanes/obb-seeds-$OBB_USER/obend"
+  elif use_seed_pool "$HOME/obend/obb-seeds"; then
+    SEED_POOL="$HOME/obend/obb-seeds"
+  else
+    echo "ERROR: no writable user-owned SEED_POOL available" >&2
+    exit 67
+  fi
+fi
+INV_DIR="$(mktemp -d "$WORK_ROOT/obb-{short_key}-XXXXXXXX")"
+WT_DIR="$INV_DIR/wt"
+PID_FILE="$INV_DIR/build.pid"
 BUILD_PGID=""
 echo "$$" > "$PID_FILE"
 
@@ -800,23 +899,24 @@ cleanup_obb_build() {{
   rm -f "$PID_FILE" 2>/dev/null || true
   if [ -d "$WT_DIR" ]; then
     chmod -R u+w "$WT_DIR" 2>/dev/null || true
-    if [ -d "$BASE_REPO/.git" ]; then
+    if [ -e "$BASE_REPO/.git" ]; then
       git -C "$BASE_REPO" worktree remove --force "$WT_DIR" 2>/dev/null || rm -rf "$WT_DIR"
     else
       rm -rf "$WT_DIR" 2>/dev/null || true
     fi
   fi
+  rm -rf "$INV_DIR" 2>/dev/null || true
   exit "$ec"
 }}
 trap cleanup_obb_build EXIT INT TERM
 
-if [ -d "$BASE_REPO/.git" ]; then
+if [ -e "$BASE_REPO/.git" ]; then
   if [ -n "$TARGET_COMMIT" ]; then
     if ! git -C "$BASE_REPO" cat-file -e "${{TARGET_COMMIT}}^{{commit}}" 2>/dev/null; then
       git -C "$BASE_REPO" fetch --no-tags --quiet --all --prune
     fi
     if ! git -C "$BASE_REPO" cat-file -e "${{TARGET_COMMIT}}^{{commit}}" 2>/dev/null; then
-      echo "ERROR: target commit $TARGET_COMMIT is missing on remote {host} after git fetch; push exact SHA before building." >&2
+      echo "ERROR: target commit $TARGET_COMMIT is missing on remote {safe_host} after git fetch; push exact SHA before building." >&2
       exit 65
     fi
     git -C "$BASE_REPO" worktree add --detach "$WT_DIR" "$TARGET_COMMIT" >/dev/null
@@ -831,7 +931,7 @@ if [ -d "$BASE_REPO/.git" ]; then
     git -C "$BASE_REPO" worktree add --detach "$WT_DIR" "$ORIGIN_SHA" >/dev/null
     git -C "$WT_DIR" checkout --detach --force "$ORIGIN_SHA" >/dev/null
   fi
-  if [ "$SEED_KEY" != "head-default" ]; then
+  if [ "$SEED_KEY" != "head-default" ] && [ "$SEED_KEY" != "$TARGET_COMMIT" ]; then
     REMOTE_TREE="$(git -C "$WT_DIR" rev-parse --verify HEAD:lean 2>/dev/null || git -C "$WT_DIR" rev-parse --verify HEAD^{{commit}})"
     if [ "$REMOTE_TREE" != "$SEED_KEY" ]; then
       echo "ERROR: remote checkout tree ($REMOTE_TREE) does not match local seed_key ($SEED_KEY)" >&2
@@ -971,6 +1071,11 @@ pub fn plan_build(
     for raw in targets {
         let class = classify_build_target(raw);
         let lake_target = normalize_lake_target(raw);
+        if !is_valid_lake_target(&lake_target) {
+            bail!(
+                "invalid or unsafe `lake build` target `{raw}` (normalized `{lake_target}`): targets must be non-empty alphanumeric/dot/slash/dash identifiers and must not start with `-`"
+            );
+        }
 
         let (assigned_host, reason) = match opts.host_choice {
             HostChoice::Bb2 => ("bb2".to_string(), "pinned via `--host bb2`".to_string()),
@@ -1053,6 +1158,11 @@ pub fn plan_build(
             .remote_seed_root
             .clone()
             .unwrap_or_else(|| default_seed_pool_for_host(&host));
+        if !is_safe_remote_path(&seed_pool_dir) {
+            bail!(
+                "unsafe `--remote-seed-root` path `{seed_pool_dir}`: must start with `/` or `$HOME/` and contain no `..` or shell metacharacters"
+            );
+        }
         let (batched_lake_command, remote_recipe) = render_safe_remote_recipe_for_commit(
             &host,
             &lake_targets,

@@ -14,6 +14,8 @@ pub struct LeanLintOptions {
     pub strict_expose: bool,
     /// Escalate `lean/single-sequence-harness` from `Severity::Warning` to `Severity::Error`.
     pub strict_harnesses: bool,
+    /// Escalate `lean/judge-fragment-restates-check` and `lean/pigeonhole-vacuous-premise` from `Severity::Warning` to `Severity::Error`.
+    pub strict_vacuity: bool,
 }
 
 pub fn is_allowed_public_meta_import_path(rel_path: &str) -> bool {
@@ -272,14 +274,27 @@ pub fn run_lean_lints_with_options(
             }
         }
 
-        // Map decl short name -> decl for cross-checking `Judge.check` helper bodies and `Format` decoders
+        // Map decl short & fully-qualified names -> decl for cross-checking `Judge.check` helper bodies and `Format` decoders
         let mut decl_by_name: HashMap<&str, &ParsedLeanDecl> = HashMap::new();
         for decl in &file.declarations {
             decl_by_name.insert(decl.name.as_str(), decl);
+            decl_by_name.insert(decl.fq_name.as_str(), decl);
         }
 
         // Module-level HypothesisLedger / inhabited-premise index
-        let module_witnessed_preds = collect_module_satisfiability_witnesses(file);
+        let module_witnessed_preds = collect_module_satisfiability_witnesses(file, &decl_by_name);
+
+        // Pass 1 for `lean/pigeonhole-vacuous-premise`: collect file-local vacuous crypto defs/abbrevs
+        // and check file-level `variable (...)` assumptions.
+        let flagged_crypto_defs = if !is_teeth_or_test {
+            collect_flagged_crypto_defs_and_check_section_vars(
+                file,
+                options.strict_vacuity,
+                &mut findings,
+            )
+        } else {
+            HashSet::new()
+        };
 
         for decl in &file.declarations {
             // Check 2026 compiler-trust bypass (`native_decide` / `Lean.ofReduceBool`) in library modules
@@ -317,6 +332,15 @@ pub fn run_lean_lints_with_options(
                         ),
                         remediation: "Replace the `axiom` with a constructive proof or carry an explicit hypothesis parameter on the theorems that require it.".to_string(),
                     });
+                    if !is_teeth_or_test && !decl.fixture_kept {
+                        check_pigeonhole_vacuous_premise(
+                            file,
+                            decl,
+                            &flagged_crypto_defs,
+                            options.strict_vacuity,
+                            &mut findings,
+                        );
+                    }
                 }
                 DeclKind::TacticElab => {
                     check_tactic_elab(file, decl, &mut findings);
@@ -448,12 +472,30 @@ pub fn run_lean_lints_with_options(
                         }
                     }
 
-                    // 5. `Judge` instance tautological `Meaning` & empty `Fragment`/`refutes` detectors
-                    if is_judge_instance_decl(decl) {
+                    // 5. `Judge` instance tautological `Meaning`, empty `Fragment`/`refutes`, & `Fragment` restating `check`
+                    if is_judge_instance_decl(decl, &decl_by_name) {
                         check_judge_meaning(file, decl, &decl_by_name, &mut findings);
                         if !is_test_only && !decl.fixture_kept {
-                            check_judge_empty_fragment(file, decl, &mut findings);
+                            check_judge_empty_fragment(file, decl, &decl_by_name, &mut findings);
+                            check_judge_fragment_restates_check(
+                                file,
+                                decl,
+                                &decl_by_name,
+                                options.strict_vacuity,
+                                &mut findings,
+                            );
                         }
+                    }
+
+                    // 5a. Pigeonhole-vacuous cryptographic premises & unkeyed `Prop` collision disjunctions
+                    if !is_teeth_or_test && !decl.fixture_kept {
+                        check_pigeonhole_vacuous_premise(
+                            file,
+                            decl,
+                            &flagged_crypto_defs,
+                            options.strict_vacuity,
+                            &mut findings,
+                        );
                     }
 
                     // 5b. `*Obligations` / `HypothesisLedger` 1–3 line projection/determinism cosplay detector
@@ -475,14 +517,25 @@ pub fn run_lean_lints_with_options(
                         check_wire_decoder_def(file, decl, &mut findings);
                     }
                 }
-                DeclKind::Class => {
+                DeclKind::Class | DeclKind::Structure => {
                     if !is_test_only && !decl.fixture_kept {
-                        check_obligation_class_tautological_fields(
-                            file,
-                            decl,
-                            &obligation_classes,
-                            &mut findings,
-                        );
+                        if decl.kind == DeclKind::Class {
+                            check_obligation_class_tautological_fields(
+                                file,
+                                decl,
+                                &obligation_classes,
+                                &mut findings,
+                            );
+                        }
+                        if !is_teeth_or_test {
+                            check_pigeonhole_vacuous_premise(
+                                file,
+                                decl,
+                                &flagged_crypto_defs,
+                                options.strict_vacuity,
+                                &mut findings,
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -968,28 +1021,256 @@ fn collect_meta_referenced_idents_in_eval(slice: &[LeanToken]) -> HashSet<String
     out
 }
 
-fn is_judge_instance_decl(decl: &ParsedLeanDecl) -> bool {
-    if !matches!(decl.kind, DeclKind::Instance | DeclKind::Def) {
+fn resolves_to_judge_head(
+    head: &str,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+) -> bool {
+    if head == "Judge" || head == "Obend.Judge" {
+        return true;
+    }
+    let short = head.rsplit('.').next().unwrap_or(head);
+    if let Some(ab) = decl_by_name.get(short)
+        && ab.kind == DeclKind::Abbrev
+    {
+        return ab.body_tokens.first().is_some_and(|t| {
+            matches!(&t.kind, LeanTokenKind::Ident(id) if id == "Judge" || id == "Obend.Judge")
+        });
+    }
+    false
+}
+
+fn strip_leading_at_and_parens(mut toks: &[LeanToken]) -> &[LeanToken] {
+    loop {
+        let stripped = strip_outer_parens_tokens(toks);
+        if let Some(first) = stripped.first()
+            && matches!(&first.kind, LeanTokenKind::Symbol(s) if s == "@")
+        {
+            toks = &stripped[1..];
+            continue;
+        }
+        return stripped;
+    }
+}
+
+fn struct_update_base_ident(body_tokens: &[LeanToken]) -> Option<&str> {
+    let stripped = strip_outer_parens_tokens(body_tokens);
+    if stripped.len() >= 4
+        && matches!(&stripped[0].kind, LeanTokenKind::Symbol(s) if s == "{")
+        && let LeanTokenKind::Ident(base_id) = &stripped[1].kind
+        && matches!(&stripped[2].kind, LeanTokenKind::Ident(kw) if kw == "with")
+    {
+        return Some(base_id.as_str());
+    }
+    None
+}
+
+fn is_judge_instance_decl(
+    decl: &ParsedLeanDecl,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+) -> bool {
+    is_judge_instance_decl_bounded(decl, decl_by_name, 0)
+}
+
+fn is_judge_instance_decl_bounded(
+    decl: &ParsedLeanDecl,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+    depth: usize,
+) -> bool {
+    if depth >= 6 || !matches!(decl.kind, DeclKind::Instance | DeclKind::Def) {
         return false;
     }
-    if decl.type_tokens.first().is_some_and(|t| {
+    if let Some(LeanToken {
+        kind: LeanTokenKind::Ident(id),
+        ..
+    }) = decl.type_tokens.first()
+        && resolves_to_judge_head(id, decl_by_name)
+    {
+        return true;
+    }
+    if let Some(head) = instance_target_head_class(&decl.type_tokens)
+        && resolves_to_judge_head(&head, decl_by_name)
+    {
+        return true;
+    }
+    let body_core = strip_leading_at_and_parens(&decl.body_tokens);
+    if body_core.first().is_some_and(|t| {
         matches!(
             &t.kind,
-            LeanTokenKind::Ident(id) if id == "Judge" || id == "Obend.Judge"
+            LeanTokenKind::Ident(id) if id == "Judge.mk" || id == "Obend.Judge.mk"
         )
     }) {
         return true;
     }
-    instance_target_head_class(&decl.type_tokens)
-        .is_some_and(|h| h == "Judge" || h == "Obend.Judge")
+    if let Some(base_id) = struct_update_base_ident(&decl.body_tokens) {
+        let base_short = base_id.rsplit('.').next().unwrap_or(base_id);
+        if let Some(base_decl) = decl_by_name
+            .get(base_id)
+            .or_else(|| decl_by_name.get(base_short))
+            && base_decl.fq_name != decl.fq_name
+            && is_judge_instance_decl_bounded(base_decl, decl_by_name, depth + 1)
+        {
+            return true;
+        }
+    }
+    let has_check = decl.where_fields.iter().any(|f| f.name == "check");
+    let has_fragment = decl.where_fields.iter().any(|f| f.name == "Fragment");
+    let has_meaning = decl.where_fields.iter().any(|f| f.name == "Meaning");
+    has_check && has_fragment && has_meaning
+}
+
+fn judge_canonical_field_names() -> Vec<String> {
+    vec![
+        "Clause".to_string(),
+        "Meaning".to_string(),
+        "check".to_string(),
+        "sound".to_string(),
+        "refutes".to_string(),
+        "refuted".to_string(),
+        "Fragment".to_string(),
+        "complete".to_string(),
+        "mono".to_string(),
+    ]
+}
+
+fn extract_judge_fields<'a>(
+    decl: &'a ParsedLeanDecl,
+    decl_by_name: &'a HashMap<&'a str, &'a ParsedLeanDecl>,
+) -> Vec<ExtractedInstanceField> {
+    extract_judge_fields_inner(decl, decl_by_name, 0)
+}
+
+fn extract_judge_fields_inner(
+    decl: &ParsedLeanDecl,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+    depth: usize,
+) -> Vec<ExtractedInstanceField> {
+    let fnames = judge_canonical_field_names();
+    if decl.where_fields.is_empty() {
+        let has_at = decl
+            .body_tokens
+            .first()
+            .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "@"));
+        let body_core = strip_leading_at_and_parens(&decl.body_tokens);
+        let is_mk = body_core.first().is_some_and(|t| {
+            matches!(
+                &t.kind,
+                LeanTokenKind::Ident(id) if id == "Judge.mk" || id == "Obend.Judge.mk"
+            ) || matches!(&t.kind, LeanTokenKind::Symbol(s) if s == ".mk")
+        });
+        if is_mk {
+            let mut args_slice = &body_core[1..];
+            if args_slice
+                .first()
+                .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "<|"))
+            {
+                args_slice = &args_slice[1..];
+            }
+            let mut named_fields: Vec<ExtractedInstanceField> = Vec::new();
+            let mut pos_args: Vec<Vec<LeanToken>> = Vec::new();
+            let mut i = 0usize;
+            while i < args_slice.len() {
+                match &args_slice[i].kind {
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[" | "⟨") => {
+                        let open = s.as_str();
+                        let close = match open {
+                            "(" => ")",
+                            "{" => "}",
+                            "[" => "]",
+                            _ => "⟩",
+                        };
+                        let start = i;
+                        let mut bdepth = 1usize;
+                        i += 1;
+                        while i < args_slice.len() && bdepth > 0 {
+                            match &args_slice[i].kind {
+                                LeanTokenKind::Symbol(o) if o == open => bdepth += 1,
+                                LeanTokenKind::Symbol(c) if c == close => bdepth -= 1,
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                        let end = i;
+                        if open == "(" && end >= start + 3 {
+                            let inner = &args_slice[start + 1..end - 1];
+                            if let Some(f) = parse_field_assignment_chunk(inner) {
+                                named_fields.push(f);
+                                continue;
+                            }
+                        }
+                        pos_args.push(args_slice[start..end].to_vec());
+                    }
+                    LeanTokenKind::Symbol(s) if s.starts_with('@') || s == "<|" => {
+                        i += 1;
+                    }
+                    _ => {
+                        pos_args.push(vec![args_slice[i].clone()]);
+                        i += 1;
+                    }
+                }
+            }
+            //Under `@Judge.mk Obj Cert ...`, the first 2 positional args are `{Obj Cert : Type}`
+            let pos_skip = if has_at && pos_args.len() >= 9 { 2 } else { 0 };
+            let pos_slice = &pos_args[pos_skip.min(pos_args.len())..];
+            let mut merged = Vec::new();
+            let named_set: HashSet<String> = named_fields
+                .iter()
+                .filter_map(|f| f.name.clone())
+                .collect();
+            if !pos_slice.is_empty() && (pos_slice.len() + named_fields.len() >= 7) {
+                let mut fname_iter = fnames.iter().filter(|n| !named_set.contains(*n));
+                for rhs in pos_slice {
+                    if let Some(fname) = fname_iter.next() {
+                        let first = &rhs[0];
+                        let inner = strip_outer_parens_tokens(rhs).to_vec();
+                        merged.push(ExtractedInstanceField {
+                            name: Some(fname.clone()),
+                            params: Vec::new(),
+                            line: first.line,
+                            col: first.col,
+                            rhs_tokens: inner,
+                        });
+                    }
+                }
+            }
+            merged.extend(named_fields);
+            if !merged.is_empty() {
+                return merged;
+            }
+        }
+    }
+
+    let mut fields = extract_instance_fields(decl, Some(&fnames));
+    // Inherit un-overridden fields (such as `check`) from `{ baseJudge with Fragment := ... }`
+    if depth < 4
+        && let Some(base_id) = struct_update_base_ident(&decl.body_tokens)
+    {
+        let base_short = base_id.rsplit('.').next().unwrap_or(base_id);
+        if let Some(base_decl) = decl_by_name
+            .get(base_id)
+            .or_else(|| decl_by_name.get(base_short))
+            && base_decl.fq_name != decl.fq_name
+        {
+            let present: HashSet<String> =
+                fields.iter().filter_map(|f| f.name.clone()).collect();
+            for bf in extract_judge_fields_inner(base_decl, decl_by_name, depth + 1) {
+                if let Some(ref bname) = bf.name
+                    && !present.contains(bname)
+                {
+                    fields.push(bf);
+                }
+            }
+        }
+    }
+    fields
 }
 
 fn check_judge_empty_fragment(
     file: &ParsedLeanFile,
     decl: &ParsedLeanDecl,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
     findings: &mut Vec<Finding>,
 ) {
-    let extracted = extract_instance_fields(decl, None);
+    let extracted = extract_judge_fields(decl, decl_by_name);
     for ef in extracted {
         let Some(fname) = ef.name.as_deref() else {
             continue;
@@ -1048,6 +1329,1917 @@ fn check_judge_empty_fragment(
                 });
             }
         }
+    }
+}
+
+fn is_ignored_check_combinator(short: &str) -> bool {
+    matches!(
+        short,
+        "_"
+            | "fun"
+            | "λ"
+            | "if"
+            | "then"
+            | "else"
+            | "match"
+            | "matches"
+            | "with"
+            | "let"
+            | "in"
+            | "do"
+            | "by"
+            | "true"
+            | "false"
+            | "True"
+            | "False"
+            | "some"
+            | "none"
+            | "ok"
+            | "error"
+            | "refused"
+            | "uncovered"
+            | "verified"
+            | "isOk"
+            | "isVerified"
+            | "decide"
+            | "ite"
+            | "dite"
+            | "not"
+            | "deepen"
+            | "map"
+            | "mk"
+            | "inl"
+            | "inr"
+            | "intro"
+            | "Nat"
+            | "Int"
+            | "UInt8"
+            | "UInt64"
+            | "ByteArray"
+            | "Unit"
+            | "PUnit"
+            | "Bool"
+            | "Option"
+            | "Except"
+            | "Verdict"
+            | "String"
+            | "List"
+            | "Array"
+            | "Prod"
+            | "And"
+            | "Or"
+            | "Exists"
+            | "fst"
+            | "snd"
+    )
+}
+
+fn is_verdict_acceptance_token(tok: &LeanToken) -> bool {
+    match &tok.kind {
+        LeanTokenKind::Symbol(s) => {
+            matches!(s.as_str(), ".ok" | ".verified" | ".isOk" | ".isVerified")
+        }
+        LeanTokenKind::Ident(id) => {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            matches!(short, "ok" | "verified" | "isOk" | "isVerified")
+                && (id == short || id.contains("Verdict") || id.starts_with("Except"))
+        }
+        _ => false,
+    }
+}
+
+fn is_verdict_rejection_token(tok: &LeanToken) -> bool {
+    match &tok.kind {
+        LeanTokenKind::Symbol(s) => matches!(s.as_str(), ".refused" | ".uncovered" | ".error"),
+        LeanTokenKind::Ident(id) => {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            matches!(short, "refused" | "uncovered" | "error")
+                && (id == short || id.contains("Verdict") || id.starts_with("Except"))
+                || matches!(id.as_str(), "false" | "Bool.false" | "none" | "Option.none")
+        }
+        _ => false,
+    }
+}
+
+fn is_bool_or_verdict_acceptance_token(tok: &LeanToken) -> bool {
+    is_verdict_acceptance_token(tok)
+        || matches!(
+            &tok.kind,
+            LeanTokenKind::Ident(id) if matches!(id.as_str(), "true" | "Bool.true" | "some" | "Option.some")
+        )
+}
+
+fn has_prefix_word(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix).is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+    })
+}
+
+fn looks_like_operational_checker_ident(short: &str) -> bool {
+    has_prefix_word(short, "check")
+        || has_prefix_word(short, "verify")
+        || has_prefix_word(short, "validate")
+        || has_prefix_word(short, "judge")
+        || short.ends_with("Check")
+        || short.ends_with("Verify")
+        || short.ends_with("Checker")
+        || short.ends_with("Verifier")
+}
+
+/// Collect inner local binders (`fun x =>`, `let x :=`, `| pat =>`) inside a term slice so local
+/// pattern variables never leak out as fake global checker identifiers.
+fn collect_term_local_binders(tokens: &[LeanToken], bound: &mut HashSet<String>) {
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let is_lam_or_forall = matches!(
+            &tokens[i].kind,
+            LeanTokenKind::Ident(id) if id == "fun" || id == "λ"
+        ) || matches!(&tokens[i].kind, LeanTokenKind::Symbol(s) if s == "∀" || s == "∃");
+        if is_lam_or_forall {
+            let mut j = i + 1;
+            let mut depth = 0usize;
+            while j < tokens.len() {
+                match &tokens[j].kind {
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[") => depth += 1,
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "}" | "]") => {
+                        depth = depth.saturating_sub(1);
+                    }
+                    LeanTokenKind::Symbol(s) if (s == "=>" || s == ",") && depth == 0 => break,
+                    LeanTokenKind::Symbol(s) if s == ":" && depth > 0 => {
+                        // Skip type annotation inside `(x : T)` until matching `)`
+                        while j + 1 < tokens.len()
+                            && !matches!(&tokens[j + 1].kind, LeanTokenKind::Symbol(c) if matches!(c.as_str(), ")" | "}" | "]"))
+                        {
+                            j += 1;
+                        }
+                    }
+                    LeanTokenKind::Ident(id) if id != "_" && !id.contains('.') => {
+                        bound.insert(id.clone());
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        if matches!(&tokens[i].kind, LeanTokenKind::Ident(id) if id == "let")
+            && let Some(LeanToken {
+                kind: LeanTokenKind::Ident(var),
+                ..
+            }) = tokens.get(i + 1)
+            && var != "_"
+        {
+            bound.insert(var.clone());
+        }
+        if matches!(&tokens[i].kind, LeanTokenKind::Symbol(s) if s == "|") {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                if matches!(&tokens[j].kind, LeanTokenKind::Symbol(s) if s == "=>") {
+                    break;
+                }
+                if let LeanTokenKind::Ident(id) = &tokens[j].kind
+                    && id != "_"
+                    && !id.contains('.')
+                    && id.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                {
+                    bound.insert(id.clone());
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn is_operational_check_callee_candidate(
+    short: &str,
+    is_head_of_check: bool,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+) -> bool {
+    if short.len() < 2 || is_ignored_check_combinator(short) {
+        return false;
+    }
+    if short.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && !looks_like_operational_checker_ident(short)
+    {
+        return false;
+    }
+    if let Some(d) = decl_by_name.get(short) {
+        // Pure `: Prop` domain predicates (`WellFormed q : Prop`) are NOT operational checkers!
+        if tokens_end_with_prop(&d.type_tokens) {
+            return false;
+        }
+        if !is_head_of_check && !looks_like_operational_checker_ident(short) {
+            // Non-head helpers called inside `check` (e.g. `normalize q`) only count if their
+            // declared return type is an acceptance/verdict/boolean carrier (`Bool`, `Verdict`, `Except`, `Option`).
+            let (_, ret_concl) = split_top_level_arrows(&d.type_tokens);
+            let returns_verdict_like = ret_concl.iter().any(|t| {
+                matches!(
+                    &t.kind,
+                    LeanTokenKind::Ident(id)
+                        if matches!(
+                            id.rsplit('.').next().unwrap_or(id.as_str()),
+                            "Bool" | "Verdict" | "CheckVerdict" | "CheckResult" | "Except" | "Option"
+                        )
+                )
+            });
+            if !returns_verdict_like {
+                return false;
+            }
+        }
+    } else if !is_head_of_check && !looks_like_operational_checker_ident(short) {
+        // Unknown non-head helper (e.g. imported pure projection/normalizer `normalize`) is NOT assumed to be a checker
+        return false;
+    }
+    true
+}
+
+/// Extract the application sub-slice immediately to the left of `op_idx` up to the nearest
+/// logical connective / quantifier comma / enclosing paren.
+fn comparand_slice_before(slice: &[LeanToken], op_idx: usize) -> &[LeanToken] {
+    let mut k = op_idx;
+    let mut depth = 0i32;
+    while k > 0 {
+        let prev = &slice[k - 1];
+        match &prev.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            LeanTokenKind::Symbol(s)
+                if depth == 0
+                    && matches!(
+                        s.as_str(),
+                        "∧" | "∨" | "," | "→" | "->" | "↔" | "=>" | ";" | ":=" | "|" | "¬"
+                    ) =>
+            {
+                break;
+            }
+            LeanTokenKind::Ident(id)
+                if depth == 0 && matches!(id.as_str(), "if" | "then" | "else" | "in" | "with") =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        k -= 1;
+    }
+    strip_outer_parens_tokens(&slice[k..op_idx])
+}
+
+/// Extract the application sub-slice immediately to the right of `op_idx`.
+fn comparand_slice_after(slice: &[LeanToken], op_idx: usize) -> &[LeanToken] {
+    let start = op_idx + 1;
+    if start >= slice.len() {
+        return &[];
+    }
+    let mut k = start;
+    let mut depth = 0i32;
+    while k < slice.len() {
+        let cur = &slice[k];
+        match &cur.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            LeanTokenKind::Symbol(s)
+                if depth == 0
+                    && matches!(
+                        s.as_str(),
+                        "∧" | "∨" | "," | "→" | "->" | "↔" | "=>" | ";" | "|"
+                    ) =>
+            {
+                break;
+            }
+            LeanTokenKind::Ident(id)
+                if depth == 0 && matches!(id.as_str(), "then" | "else" | "in" | "with") =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    strip_outer_parens_tokens(&slice[start..k])
+}
+
+fn extract_call_head_ident<'a>(
+    expr: &'a [LeanToken],
+    local_bound: &HashSet<String>,
+    bound_check_heads: &HashSet<String>,
+) -> Option<&'a str> {
+    let stripped = strip_outer_parens_tokens(expr);
+    for tok in stripped {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            let root = id.split('.').next().unwrap_or(id.as_str());
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            if bound_check_heads.contains(id.as_str()) {
+                return Some(id.as_str());
+            }
+            if local_bound.contains(id.as_str())
+                || local_bound.contains(root)
+                || is_ignored_check_combinator(short)
+            {
+                continue;
+            }
+            return Some(id.as_str());
+        }
+    }
+    None
+}
+
+/// 2026 Soundness Rule (`lean/judge-fragment-restates-check`):
+/// Flags `Judge` instances / builders whose `Fragment` field restates the operational `check` /
+/// `verify*` verdict function (e.g. `Fragment q := ∃ c, verifySameOpening q c = .ok`), collapsing
+/// `Judge.complete` into a 1-line projection tautology.
+fn check_judge_fragment_restates_check(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+    strict_vacuity: bool,
+    findings: &mut Vec<Finding>,
+) {
+    let extracted = extract_judge_fields(decl, decl_by_name);
+    let Some(frag_field) = extracted
+        .iter()
+        .find(|ef| ef.name.as_deref() == Some("Fragment"))
+    else {
+        return;
+    };
+
+    let mut base_bound: HashSet<String> = HashSet::new();
+    for sv in &file.section_variables {
+        if !sv.is_underscore && sv.name != "_" {
+            base_bound.insert(sv.name.clone());
+        }
+    }
+    for b in &decl.binders {
+        if !b.is_underscore && b.name != "_" {
+            base_bound.insert(b.name.clone());
+        }
+    }
+
+    // Collect operational callees from `check` + bound-variable checker heads (`w.verify`, `chk`)
+    let mut direct_check_callees: HashSet<String> = HashSet::new();
+    let mut bound_check_heads: HashSet<String> = HashSet::new();
+    if let Some(check_field) = extracted
+        .iter()
+        .find(|ef| ef.name.as_deref() == Some("check"))
+    {
+        let mut check_param_bound: HashSet<String> = HashSet::new();
+        for p in &check_field.params {
+            if p != "_" {
+                check_param_bound.insert(p.clone());
+            }
+        }
+        let mut check_bound = base_bound.clone();
+        check_bound.extend(check_param_bound.iter().cloned());
+        let check_core = strip_leading_lambdas(&check_field.rhs_tokens, &mut check_bound);
+        for b in check_bound.difference(&base_bound) {
+            check_param_bound.insert(b.clone());
+        }
+        collect_term_local_binders(check_core, &mut check_bound);
+
+        let check_head_short: Option<&str> = extract_call_head_ident(
+            check_core,
+            &check_bound,
+            &bound_check_heads,
+        )
+        .map(|h| h.rsplit('.').next().unwrap_or(h));
+
+        for (tidx, tok) in check_core.iter().enumerate() {
+            if let LeanTokenKind::Ident(id) = &tok.kind {
+                let root = id.split('.').next().unwrap_or(id.as_str());
+                let short = id.rsplit('.').next().unwrap_or(id.as_str());
+                // Bound workflow/checker parameter (`w.verify q c` or `chk q c` where `w`/`chk` is in `base_bound`)
+                if base_bound.contains(root) && !check_param_bound.contains(root) {
+                    if id.contains('.') || tidx == 0 {
+                        bound_check_heads.insert(id.clone());
+                    }
+                    continue;
+                }
+                let is_head = check_head_short == Some(short);
+                if check_bound.contains(id.as_str())
+                    || check_bound.contains(root)
+                    || !is_operational_check_callee_candidate(short, is_head, decl_by_name)
+                {
+                    continue;
+                }
+                direct_check_callees.insert(short.to_string());
+                if let Some(helper) = decl_by_name.get(short)
+                    && matches!(helper.kind, DeclKind::Def | DeclKind::Abbrev)
+                    && helper.body_tokens.len() <= 18
+                {
+                    let mut hbound: HashSet<String> = helper
+                        .binders
+                        .iter()
+                        .filter(|b| !b.is_underscore && b.name != "_")
+                        .map(|b| b.name.clone())
+                        .collect();
+                    let hcore = strip_leading_lambdas(&helper.body_tokens, &mut hbound);
+                    collect_term_local_binders(hcore, &mut hbound);
+                    let empty_heads = HashSet::new();
+                    let h_head_short = extract_call_head_ident(hcore, &hbound, &empty_heads)
+                        .map(|h| h.rsplit('.').next().unwrap_or(h));
+                    for htok in hcore {
+                        if let LeanTokenKind::Ident(hid) = &htok.kind {
+                            let hroot = hid.split('.').next().unwrap_or(hid.as_str());
+                            let hshort = hid.rsplit('.').next().unwrap_or(hid.as_str());
+                            let h_is_head = is_head && h_head_short == Some(hshort);
+                            if !hbound.contains(hid.as_str())
+                                && !hbound.contains(hroot)
+                                && is_operational_check_callee_candidate(
+                                    hshort,
+                                    h_is_head,
+                                    decl_by_name,
+                                )
+                            {
+                                direct_check_callees.insert(hshort.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build candidate slices via up to 3-hop BFS over helper `Def | Abbrev | Inductive | Structure` decls
+    let mut frag_bound = base_bound.clone();
+    for p in &frag_field.params {
+        if p != "_" {
+            frag_bound.insert(p.clone());
+        }
+    }
+    let frag_core = strip_outer_parens_tokens(strip_leading_lambdas(
+        &frag_field.rhs_tokens,
+        &mut frag_bound,
+    ));
+
+    // `(tokens, bound_vars, implicit_existential_from_inductive_or_struct)`
+    let mut slices_to_check: Vec<(Vec<LeanToken>, HashSet<String>, HashSet<String>)> =
+        vec![(frag_core.to_vec(), frag_bound.clone(), HashSet::new())];
+    let mut visited_helpers: HashSet<String> = HashSet::new();
+    let mut queue_idx = 0usize;
+
+    while queue_idx < slices_to_check.len() && slices_to_check.len() < 8 {
+        let (cur_slice, cur_bound, _) = slices_to_check[queue_idx].clone();
+        queue_idx += 1;
+        for tok in &cur_slice {
+            if slices_to_check.len() >= 8 {
+                break;
+            }
+            if let LeanTokenKind::Ident(id) = &tok.kind {
+                let root = id.split('.').next().unwrap_or(id.as_str());
+                let short = id.rsplit('.').next().unwrap_or(id.as_str());
+                if cur_bound.contains(id.as_str())
+                    || cur_bound.contains(root)
+                    || direct_check_callees.contains(short)
+                    || !visited_helpers.insert(short.to_string())
+                {
+                    continue;
+                }
+                if let Some(helper) = decl_by_name.get(id.as_str()).or_else(|| decl_by_name.get(short)) {
+                    match helper.kind {
+                        DeclKind::Def | DeclKind::Abbrev if tokens_end_with_prop(&helper.type_tokens) || helper.type_tokens.is_empty() => {
+                            let mut hbound: HashSet<String> = base_bound.clone();
+                            for b in &helper.binders {
+                                if !b.is_underscore && b.name != "_" {
+                                    hbound.insert(b.name.clone());
+                                }
+                            }
+                            let hcore = strip_outer_parens_tokens(strip_leading_lambdas(
+                                &helper.body_tokens,
+                                &mut hbound,
+                            ));
+                            let capped = &hcore[..hcore.len().min(512)];
+                            slices_to_check.push((capped.to_vec(), hbound, HashSet::new()));
+                        }
+                        DeclKind::Inductive | DeclKind::Structure => {
+                            let mut hbound: HashSet<String> = base_bound.clone();
+                            for b in &helper.binders {
+                                if !b.is_underscore && b.name != "_" {
+                                    hbound.insert(b.name.clone());
+                                }
+                            }
+                            let mut witness_fields = HashSet::new();
+                            let mut combined = Vec::new();
+                            for sf in &helper.struct_fields {
+                                if sf.name != "_" {
+                                    witness_fields.insert(sf.name.clone());
+                                }
+                                for sb in &sf.binders {
+                                    if !sb.is_underscore && sb.name != "_" {
+                                        witness_fields.insert(sb.name.clone());
+                                    }
+                                    combined.extend(sb.type_tokens.iter().cloned());
+                                }
+                                combined.extend(sf.type_tokens.iter().cloned());
+                            }
+                            combined.extend(helper.body_tokens.iter().cloned());
+                            if combined.len() > 512 {
+                                combined.truncate(512);
+                            }
+                            if !combined.is_empty() {
+                                slices_to_check.push((combined, hbound, witness_fields));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let mut culprit_fn: Option<String> = None;
+
+    for (slice, bound_vars, extra_ex_vars) in &slices_to_check {
+        let mut local_bound = bound_vars.clone();
+        let mut ex_vars = extra_ex_vars.clone();
+        let mut has_existential = !ex_vars.is_empty();
+
+        // Collect `∃ c r, ...` and `Exists (fun c => ...)` existential witnesses, plus `∀` / `fun` / `let` local vars
+        let mut i = 0usize;
+        while i < slice.len() {
+            if matches!(&slice[i].kind, LeanTokenKind::Symbol(s) if s == "∃") {
+                has_existential = true;
+                let mut j = i + 1;
+                let mut depth = 0usize;
+                while j < slice.len() {
+                    match &slice[j].kind {
+                        LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[") => {
+                            depth += 1;
+                        }
+                        LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "}" | "]") => {
+                            depth = depth.saturating_sub(1);
+                        }
+                        LeanTokenKind::Symbol(s) if s == "," && depth == 0 => break,
+                        LeanTokenKind::Symbol(s) if s == ":" && depth > 0 => {
+                            while j + 1 < slice.len()
+                                && !matches!(&slice[j + 1].kind, LeanTokenKind::Symbol(c) if matches!(c.as_str(), ")" | "}" | "]"))
+                            {
+                                j += 1;
+                            }
+                        }
+                        LeanTokenKind::Ident(id) if id != "_" && !id.contains('.') => {
+                            local_bound.insert(id.clone());
+                            ex_vars.insert(id.clone());
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            } else if matches!(&slice[i].kind, LeanTokenKind::Ident(id) if id == "Exists") {
+                has_existential = true;
+                // `Exists (fun c => ...)`
+                let mut j = i + 1;
+                while j < slice.len() && j < i + 6 {
+                    if matches!(&slice[j].kind, LeanTokenKind::Ident(kw) if kw == "fun" || kw == "λ")
+                        && let Some(LeanToken {
+                            kind: LeanTokenKind::Ident(v),
+                            ..
+                        }) = slice.get(j + 1)
+                        && v != "_"
+                    {
+                        local_bound.insert(v.clone());
+                        ex_vars.insert(v.clone());
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+        collect_term_local_binders(slice, &mut local_bound);
+
+        // Pattern A: `Fragment` directly invokes an operational callee from `check` (including bound `w.verify`)
+        for tok in slice {
+            if let LeanTokenKind::Ident(id) = &tok.kind {
+                if bound_check_heads.contains(id.as_str()) {
+                    culprit_fn = Some(id.clone());
+                    break;
+                }
+                let root = id.split('.').next().unwrap_or(id.as_str());
+                let short = id.rsplit('.').next().unwrap_or(id.as_str());
+                if local_bound.contains(id.as_str()) || local_bound.contains(root) {
+                    continue;
+                }
+                if direct_check_callees.contains(short) {
+                    culprit_fn = Some(short.to_string());
+                    break;
+                }
+            }
+        }
+        if culprit_fn.is_some() {
+            break;
+        }
+
+        // Pattern B & C: Existentially quantified operational verdict / checker acceptance
+        // (`∃ c, verifyFoo q c = .ok`, `∃ c, (verifyFoo q c).isOk`, `∃ c, verifyFoo q c ≠ .refused r`, `∃ c, checkFoo q c = true`)
+        if has_existential {
+            let mut candidate_exprs: Vec<(&[LeanToken], bool)> = Vec::new();
+            for (idx, tok) in slice.iter().enumerate() {
+                match &tok.kind {
+                    LeanTokenKind::Symbol(s) if s == "=" || s == "==" => {
+                        let lhs = comparand_slice_before(slice, idx);
+                        let rhs = comparand_slice_after(slice, idx);
+                        let rhs_verdict = rhs.iter().any(is_verdict_acceptance_token);
+                        let lhs_verdict = lhs.iter().any(is_verdict_acceptance_token);
+                        let rhs_bool = rhs.iter().any(is_bool_or_verdict_acceptance_token);
+                        let lhs_bool = lhs.iter().any(is_bool_or_verdict_acceptance_token);
+                        if rhs_verdict && !lhs.is_empty() {
+                            candidate_exprs.push((lhs, true));
+                        } else if lhs_verdict && !rhs.is_empty() {
+                            candidate_exprs.push((rhs, true));
+                        } else if rhs_bool && !lhs.is_empty() {
+                            candidate_exprs.push((lhs, false));
+                        } else if lhs_bool && !rhs.is_empty() {
+                            candidate_exprs.push((rhs, false));
+                        }
+                    }
+                    LeanTokenKind::Symbol(s) if s == "≠" || s == "!=" => {
+                        let lhs = comparand_slice_before(slice, idx);
+                        let rhs = comparand_slice_after(slice, idx);
+                        if rhs.iter().any(is_verdict_rejection_token) && !lhs.is_empty() {
+                            candidate_exprs.push((lhs, true));
+                        } else if lhs.iter().any(is_verdict_rejection_token) && !rhs.is_empty() {
+                            candidate_exprs.push((rhs, true));
+                        }
+                    }
+                    LeanTokenKind::Symbol(s) if s == ".isOk" || s == ".isVerified" => {
+                        let lhs = comparand_slice_before(slice, idx);
+                        if !lhs.is_empty() {
+                            candidate_exprs.push((lhs, true));
+                        }
+                    }
+                    LeanTokenKind::Ident(id)
+                        if id == "matches"
+                            && slice
+                                .get(idx + 1)
+                                .is_some_and(is_verdict_acceptance_token) =>
+                    {
+                        let lhs = comparand_slice_before(slice, idx);
+                        if !lhs.is_empty() {
+                            candidate_exprs.push((lhs, true));
+                        }
+                    }
+                    LeanTokenKind::Ident(id)
+                        if id.ends_with(".isOk") || id.ends_with(".isVerified") =>
+                    {
+                        let rhs = comparand_slice_after(slice, idx);
+                        if !rhs.is_empty() {
+                            candidate_exprs.push((rhs, true));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            for (expr, is_verdict) in candidate_exprs {
+                let passes_ex_witness = expr.iter().any(|t| {
+                    if let LeanTokenKind::Ident(id) = &t.kind {
+                        let root = id.split('.').next().unwrap_or(id.as_str());
+                        ex_vars.contains(id.as_str()) || ex_vars.contains(root)
+                    } else {
+                        false
+                    }
+                });
+                if let Some(head_id) =
+                    extract_call_head_ident(expr, &local_bound, &bound_check_heads)
+                {
+                    let head_short = head_id.rsplit('.').next().unwrap_or(head_id);
+                    if bound_check_heads.contains(head_id)
+                        || looks_like_operational_checker_ident(head_short)
+                        || (is_verdict && passes_ex_witness)
+                    {
+                        culprit_fn = Some(
+                            if bound_check_heads.contains(head_id) {
+                                head_id.to_string()
+                            } else {
+                                head_short.to_string()
+                            },
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if culprit_fn.is_some() {
+            break;
+        }
+    }
+
+    if let Some(fn_name) = culprit_fn {
+        findings.push(Finding {
+            rule_id: "lean/judge-fragment-restates-check".to_string(),
+            severity: if strict_vacuity {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            artifact_kind: ArtifactKind::S,
+            max_regime: Regime::Attested,
+            sink: Some(Sink::Theater),
+            path: file.rel_path.clone(),
+            line: frag_field.line,
+            column: frag_field.col,
+            symbol: Some(format!("{}.Fragment", decl.fq_name)),
+            message: format!(
+                "`{}` defines `Fragment` via operational checker `{fn_name}` (`{}`), making `Judge.complete` a tautological projection instead of proving completeness over an independent input fragment",
+                decl.fq_name,
+                render_tokens_compact(&frag_field.rhs_tokens)
+            ),
+            remediation: format!(
+                "Define `Fragment` as a purely semantic/syntactic input-domain predicate independent of `{fn_name}` (e.g. structural well-formedness or valid domain parameters), and prove in `complete` that an honest prover constructs an accepted certificate whenever `Meaning` holds."
+            ),
+        });
+    }
+}
+
+fn is_crypto_pigeonhole_def_name(name: &str) -> bool {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    let lower = short.to_ascii_lowercase();
+    lower.contains("sishard")
+        || lower.contains("msisassumption")
+        || lower.contains("sisassumption")
+        || lower.contains("collisionfree")
+        || lower.contains("nocollision")
+        || lower.contains("hashinjective")
+        || lower.contains("digestinjective")
+        || lower.contains("commitinjective")
+        || lower.contains("ajtaiinjective")
+}
+
+fn name_is_intrinsically_crypto(short: &str) -> bool {
+    let l = short.to_ascii_lowercase();
+    l.contains("sis")
+        || l.contains("hash")
+        || l.contains("digest")
+        || l.contains("commit")
+        || l.contains("ajtai")
+        || l.contains("merkle")
+        || l.contains("cshake")
+}
+
+fn has_crypto_carrier(file: &ParsedLeanFile, tokens: &[LeanToken]) -> bool {
+    let p = &file.rel_path;
+    if p.contains("/Crypto/")
+        || p.starts_with("Obend/Crypto/")
+        || p.contains("/Trailblaze/")
+        || p.starts_with("Obend/Trailblaze/")
+        || p.contains("/Polis/")
+        || p.starts_with("Obend/Polis/")
+        || p.contains("/Vault/")
+        || p.starts_with("Obend/Vault/")
+        || p.contains("/Bridge/")
+        || p.starts_with("Obend/Bridge/")
+        || p.contains("/Judge/")
+        || p.starts_with("Obend/Judge/")
+    {
+        return true;
+    }
+    tokens.iter().any(|t| {
+        if let LeanTokenKind::Ident(id) = &t.kind {
+            let l = id.to_ascii_lowercase();
+            [
+                "hash",
+                "digest",
+                "ajtai",
+                "sis",
+                "commit",
+                "merkle",
+                "verkle",
+                "cshake",
+                "keccak",
+                "sha256",
+                "sha3",
+                "blake",
+                "poseidon",
+                "lattice",
+                "preimage",
+                "collision256",
+            ]
+            .iter()
+            .any(|kw| l.contains(kw))
+        } else {
+            false
+        }
+    })
+}
+
+fn tokens_end_with_prop(type_tokens: &[LeanToken]) -> bool {
+    let stripped = strip_outer_parens_tokens(type_tokens);
+    stripped
+        .last()
+        .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Ident(id) if id == "Prop"))
+}
+
+fn parse_small_nat_token(tok: &LeanToken) -> Option<u64> {
+    if let LeanTokenKind::NatLit(s) = &tok.kind {
+        let cleaned: String = s.chars().filter(|&c| c != '_').collect();
+        if let Some(hex) = cleaned
+            .strip_prefix("0x")
+            .or_else(|| cleaned.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            cleaned.parse::<u64>().ok()
+        }
+    } else {
+        None
+    }
+}
+
+fn token_short_lower(tok: &LeanToken) -> Option<String> {
+    if let LeanTokenKind::Ident(id) = &tok.kind {
+        Some(id.rsplit('.').next().unwrap_or(id.as_str()).to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Extract balanced application argument slices following `tokens[head_idx]`, stopping at
+/// depth-0 logical/relational/structural delimiters.
+fn extract_app_args(tokens: &[LeanToken], head_idx: usize) -> Vec<&[LeanToken]> {
+    let mut args: Vec<&[LeanToken]> = Vec::new();
+    let mut i = head_idx + 1;
+    while i < tokens.len() {
+        match &tokens[i].kind {
+            LeanTokenKind::Symbol(s)
+                if matches!(
+                    s.as_str(),
+                    "∧"
+                        | "∨"
+                        | "→"
+                        | "->"
+                        | "↔"
+                        | "="
+                        | "=="
+                        | "≠"
+                        | "!="
+                        | "≤"
+                        | "<="
+                        | "<"
+                        | "≥"
+                        | ">="
+                        | ">"
+                        | ","
+                        | ";"
+                        | ":="
+                        | "|"
+                        | ")"
+                        | "]"
+                        | "}"
+                        | "⟩"
+                ) =>
+            {
+                break;
+            }
+            LeanTokenKind::Ident(kw)
+                if matches!(kw.as_str(), "where" | "by" | "with" | "then" | "else" | "in") =>
+            {
+                break;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                let open = s.as_str();
+                let close = match open {
+                    "(" => ")",
+                    "[" => "]",
+                    "{" => "}",
+                    _ => "⟩",
+                };
+                let start = i;
+                let mut depth = 1usize;
+                i += 1;
+                while i < tokens.len() && depth > 0 {
+                    match &tokens[i].kind {
+                        LeanTokenKind::Symbol(o) if o == open => depth += 1,
+                        LeanTokenKind::Symbol(c) if c == close => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                while i < tokens.len()
+                    && matches!(&tokens[i].kind, LeanTokenKind::Symbol(p) if p.starts_with('.'))
+                {
+                    i += 1;
+                }
+                args.push(strip_outer_parens_tokens(&tokens[start..i]));
+            }
+            _ => {
+                let start = i;
+                i += 1;
+                while i < tokens.len()
+                    && matches!(&tokens[i].kind, LeanTokenKind::Symbol(p) if p.starts_with('.'))
+                {
+                    i += 1;
+                }
+                args.push(&tokens[start..i]);
+            }
+        }
+    }
+    args
+}
+
+fn is_safe_preimage_byte_bound_arg(arg: &[LeanToken]) -> bool {
+    let core = strip_outer_parens_tokens(arg);
+    if core.len() == 1
+        && let Some(n) = parse_small_nat_token(&core[0])
+    {
+        return n <= 32;
+    }
+    if core.len() >= 2
+        && matches!(&core[0].kind, LeanTokenKind::Ident(fn_id) if fn_id.ends_with("merkleMaxPreimageBytes"))
+    {
+        let inner = strip_outer_parens_tokens(&core[1..]);
+        if inner.len() == 1
+            && let Some(v) = parse_small_nat_token(&inner[0])
+        {
+            return v == 0;
+        }
+    }
+    false
+}
+
+/// Returns `true` when `type_or_body_tokens` (excluding binder variable names!) carry an explicit
+/// non-compressing dimension guard (`NonPigeonhole*`, relational `cols ≤ rows` / `rows ≥ cols`,
+/// `maxBytes ≤ 32` / `32 ≥ maxBytes`) OR reference a distributional cryptographic game (`LazyRO`,
+/// `MSISGame`, `GameSoundness`, `CRHFGame`, `EUFCMAGame`, etc.).
+fn has_dimension_or_game_guard(tokens: &[LeanToken]) -> bool {
+    let is_cols = |s: &str| matches!(s, "cols" | "numcols" | "inputbits" | "domainbits");
+    let is_rows = |s: &str| matches!(s, "rows" | "numrows" | "outputbits" | "codomainbits");
+    let is_maxbytes = |s: &str| s.contains("maxbytes") || s.contains("maxpreimage");
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            let lower = short.to_ascii_lowercase();
+            if lower.contains("nonpigeonhole")
+                || lower.contains("noncompressing")
+                || lower.contains("injectivedomain")
+                || matches!(
+                    short,
+                    "LazyRO"
+                        | "GameSoundness"
+                        | "GameSecure"
+                        | "KeyedGame"
+                        | "FiniteGame"
+                        | "MSISGame"
+                        | "KeyedMSISGame"
+                        | "SISGame"
+                        | "CollisionGame"
+                        | "CRHFGame"
+                        | "EUFCMAGame"
+                        | "Advantage"
+                        | "AdvBound"
+                        | "GameAdv"
+                        | "RatSlack"
+                )
+            {
+                return true;
+            }
+        }
+
+        if let LeanTokenKind::Symbol(op) = &tok.kind {
+            let prev_tok = idx.checked_sub(1).and_then(|k| tokens.get(k));
+            let next_tok = tokens.get(idx + 1);
+            let lhs_id = prev_tok.and_then(token_short_lower);
+            let rhs_id = next_tok.and_then(token_short_lower);
+
+            if matches!(op.as_str(), "≤" | "<=" | "<") {
+                // Relational `cols ≤ rows` / `pp.cols ≤ pp.rows` (never `cols ≤ 10^9`!)
+                if lhs_id.as_deref().is_some_and(is_cols) && rhs_id.as_deref().is_some_and(is_rows)
+                {
+                    return true;
+                }
+                // `maxBytes ≤ 32` or `maxBytes < 33`
+                if lhs_id.as_deref().is_some_and(is_maxbytes)
+                    && let Some(rt) = next_tok
+                    && let Some(bound_val) = parse_small_nat_token(rt)
+                {
+                    let limit = if op == "<" { 33 } else { 32 };
+                    if bound_val <= limit {
+                        return true;
+                    }
+                }
+            } else if matches!(op.as_str(), "≥" | ">=" | ">") {
+                // Relational `rows ≥ cols` (never `pp.rows > 0`!)
+                if lhs_id.as_deref().is_some_and(is_rows) && rhs_id.as_deref().is_some_and(is_cols)
+                {
+                    return true;
+                }
+                // Reversed `32 ≥ maxBytes` or `33 > maxBytes`
+                if rhs_id.as_deref().is_some_and(is_maxbytes)
+                    && let Some(lt) = prev_tok
+                    && let Some(bound_val) = parse_small_nat_token(lt)
+                {
+                    let limit = if op == ">" { 33 } else { 32 };
+                    if bound_val <= limit {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` when the return/conclusion type constructs a `Type`-valued `PSum` or `Except`
+/// witness extractor (`0 Classical`). Checked strictly on conclusions so an unrelated `(h : Except ...)`
+/// hypothesis never silences vacuous premises!
+fn conclusion_returns_psum_or_except(concl_tokens: &[LeanToken]) -> bool {
+    let core = strip_outer_parens_tokens(concl_tokens);
+    core.first().is_some_and(|t| {
+        if let LeanTokenKind::Ident(id) = &t.kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            matches!(short, "PSum" | "Except")
+        } else {
+            false
+        }
+    })
+}
+
+fn has_negated_existential_hardness_shape(tokens: &[LeanToken], is_crypto_named: bool) -> bool {
+    let mut has_forall = false;
+    let mut has_arrow = false;
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "¬" | "≠" | "∄") => return true,
+            LeanTokenKind::Symbol(s) if s == "∀" => has_forall = true,
+            LeanTokenKind::Symbol(s) if s == "→" || s == "->" => has_arrow = true,
+            LeanTokenKind::Symbol(s) if s == "=" => {
+                // `= []` empty kernel/collision list assertion
+                if tokens
+                    .get(idx + 1)
+                    .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(b) if b == "["))
+                    && tokens
+                        .get(idx + 2)
+                        .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(b) if b == "]"))
+                {
+                    return true;
+                }
+            }
+            LeanTokenKind::Ident(id) => {
+                let short = id.rsplit('.').next().unwrap_or(id.as_str());
+                if matches!(
+                    short,
+                    "Not"
+                        | "False"
+                        | "PEmpty"
+                        | "Empty"
+                        | "IsEmpty"
+                        | "Subsingleton"
+                        | "Injective"
+                        | "InjOn"
+                        | "Unbroken"
+                ) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    is_crypto_named && has_forall && has_arrow
+}
+
+fn hyp_is_bool_equality_check(hyp: &[LeanToken]) -> bool {
+    hyp.iter().enumerate().any(|(i, t)| {
+        matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "=" || s == "==")
+            && (hyp.get(i + 1).is_some_and(|r| {
+                matches!(&r.kind, LeanTokenKind::Ident(id) if matches!(id.as_str(), "true" | "false" | "Bool.true" | "Bool.false"))
+            }) || i
+                .checked_sub(1)
+                .and_then(|k| hyp.get(k))
+                .is_some_and(|l| {
+                    matches!(&l.kind, LeanTokenKind::Ident(id) if matches!(id.as_str(), "true" | "false" | "Bool.true" | "Bool.false"))
+                }))
+    })
+}
+
+/// Count enclosing prefix negations (`¬`, `Not`) immediately governing `slice[idx]` across
+/// opening parentheses `(`. Also returns `true` when `slice` ends with `→ False` / `-> False`
+/// without an intervening negation around `idx`.
+fn negation_polarity_at(slice: &[LeanToken], idx: usize) -> usize {
+    let mut negs = 0usize;
+    let mut k = idx;
+    while k > 0 {
+        let prev = &slice[k - 1];
+        match &prev.kind {
+            LeanTokenKind::Symbol(s) if s == "(" => {
+                k -= 1;
+            }
+            LeanTokenKind::Symbol(s) if s == "¬" => {
+                negs += 1;
+                k -= 1;
+            }
+            LeanTokenKind::Ident(id)
+                if id == "Not" || id == "IsEmpty" || id.ends_with(".IsEmpty") =>
+            {
+                negs += 1;
+                k -= 1;
+            }
+            _ => break,
+        }
+    }
+    // Check trailing `→ False` / `-> PEmpty` / `-> Empty`
+    if slice.len() >= 2
+        && idx + 2 <= slice.len()
+        && matches!(
+            &slice[slice.len() - 2].kind,
+            LeanTokenKind::Symbol(s) if s == "→" || s == "->"
+        )
+        && matches!(
+            &slice[slice.len() - 1].kind,
+            LeanTokenKind::Ident(id) if matches!(id.as_str(), "False" | "PEmpty" | "Empty")
+        )
+    {
+        negs += 1;
+    }
+    negs
+}
+
+/// Inspect a hypothesis slice for unguarded negated-existential / Pigeonhole-vacuous premises:
+/// - `*SISHard*`, `*CollisionFree*`, `*NoCollision*`, `*HashInjective*`, or file-local flagged crypto defs
+/// - `Unbroken ...`
+/// - `Function.Injective H` / `IsEmpty (Collision ...)` in crypto context
+/// - `¬ Collision ...` / `Collision ... → False` (odd negation polarity only — `¬ ¬ Collision` is positive!)
+/// - `¬ BoundedCollision H maxBytes` where `maxBytes > 32`, `merkleMaxPreimageBytes ...`, or unguarded
+fn find_vacuous_premise_in_hyp(
+    hyp: &[LeanToken],
+    crypto_ctx: bool,
+    flagged_crypto_defs: &HashSet<String>,
+) -> Option<String> {
+    let is_bool_eq = hyp_is_bool_equality_check(hyp);
+
+    for (idx, tok) in hyp.iter().enumerate() {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            let negs = negation_polarity_at(hyp, idx);
+            let is_positive_polarity = negs.is_multiple_of(2);
+            let is_negated_polarity = !is_positive_polarity;
+
+            if is_positive_polarity
+                && !is_bool_eq
+                && (flagged_crypto_defs.contains(short)
+                    || (is_crypto_pigeonhole_def_name(short)
+                        && (crypto_ctx || name_is_intrinsically_crypto(short))))
+            {
+                return Some(format!(
+                    "premise assumes deterministic hardness `{short}` without a `NonPigeonhole` / `cols ≤ rows` dimension guard or `PSum` / `LazyRO` / `MSISGame` reduction (vacuously `False` by Pigeonhole/Minkowski on compressing parameters)"
+                ));
+            }
+            if is_positive_polarity && short == "Unbroken" {
+                return Some(
+                    "premise assumes set-theoretic `Unbroken` (`¬ Broken`) without a non-compressing domain bound or distributional game reduction (vacuously `False` by Pigeonhole on compressing hashes/lattices)".to_string(),
+                );
+            }
+            if is_positive_polarity
+                && crypto_ctx
+                && (short == "Injective" || short == "InjOn")
+                && extract_app_args(hyp, idx).iter().any(|arg| {
+                    arg.iter().any(|at| {
+                        matches!(&at.kind, LeanTokenKind::Ident(aid) if {
+                            let al = aid.to_ascii_lowercase();
+                            al == "h"
+                                || al.starts_with("h.")
+                                || al.contains("hash")
+                                || al.contains("digest")
+                                || al.contains("commit")
+                                || al.contains("cshake")
+                                || al.contains("ajtai")
+                        })
+                    })
+                })
+            {
+                return Some(format!(
+                    "premise assumes global `{id}` on a compressing hash/commitment (identically `False` by Pigeonhole)"
+                ));
+            }
+
+            if is_negated_polarity {
+                if short == "Collision" || short == "CshakeCollision" || short == "MsisBreak" {
+                    return Some(format!(
+                        "premise assumes unbounded `¬ {short}` on a compressing function (identically `False` by Pigeonhole since `256^33 > 2^256`)"
+                    ));
+                }
+                if short == "BoundedCollision" {
+                    let is_at = idx > 0
+                        && matches!(&hyp[idx - 1].kind, LeanTokenKind::Symbol(s) if s == "@");
+                    let args = extract_app_args(hyp, idx);
+                    let bound_arg = if is_at {
+                        args.get(2).or_else(|| args.last())
+                    } else {
+                        args.get(1)
+                    };
+                    if let Some(barg) = bound_arg
+                        && is_safe_preimage_byte_bound_arg(barg)
+                    {
+                        continue;
+                    }
+                    return Some(
+                        "premise assumes `¬ BoundedCollision` with preimage bound `> 32` bytes (or unguarded `maxBytes` / `merkleMaxPreimageBytes`), which is `False` by Pigeonhole for any 32-byte digest"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Inspect a `Theorem`'s conclusion for unkeyed `Prop`-only disjunctions (`P ∨ Collision H`,
+/// `P ∨ CshakeCollision`, `P ∨ MsisBreak pp`, `P ∨ BoundedCollision H 529`, `P ∨ (... ∧ ¬ ModuleSISHard ...)`)
+/// or unguarded implication conclusions (`¬ P → Collision H`) that are classically trivial by Pigeonhole.
+fn find_vacuous_prop_collision_disjunction(
+    concl: &[LeanToken],
+    has_any_hyp: bool,
+    premise_mentions_collision: bool,
+    flagged_crypto_defs: &HashSet<String>,
+) -> Option<String> {
+    let core = strip_outer_parens_tokens(concl);
+    let has_or = core.iter().any(|t| {
+        matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "∨")
+            || matches!(&t.kind, LeanTokenKind::Ident(id) if id == "Or")
+    });
+
+    // Direct unguarded implication conclusion `... → Collision H` / `... → CshakeCollision` / `... → MsisBreak`
+    // (skip premise-free toy-hash counterexamples like `theorem lengthHash_collides : Collision lengthHash`
+    // and witness-forgetting projections like `CollisionPair.hashBytes_collision` / `HashCollisionWitness.toCollision`).
+    if !has_or {
+        if has_any_hyp
+            && !premise_mentions_collision
+            && let Some(LeanToken {
+                kind: LeanTokenKind::Ident(head_id),
+                ..
+            }) = core.first()
+        {
+            let head_short = head_id.rsplit('.').next().unwrap_or(head_id.as_str());
+            if matches!(head_short, "Collision" | "CshakeCollision" | "MsisBreak") {
+                return Some(format!(
+                    "conclusion derives unkeyed `Prop` existence `{head_short}` (unconditionally `True` in `Prop` by Pigeonhole on compressing inputs; extract a `Type`-valued witness via `PSum` instead)"
+                ));
+            }
+        }
+        return None;
+    }
+
+    for (idx, tok) in concl.iter().enumerate() {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            let negs = negation_polarity_at(concl, idx);
+            if !negs.is_multiple_of(2) {
+                // `P ∨ ¬ ModuleSISHard pp B`, `P ∨ Not (ModuleSISHard pp B)`, or `P ∨ ¬ Unbroken A`
+                if short == "Unbroken"
+                    || is_crypto_pigeonhole_def_name(short)
+                    || flagged_crypto_defs.contains(short)
+                {
+                    return Some(format!(
+                        "conclusion states a `Prop` disjunction `... ∨ ¬ {short} ...` (`¬ {short}` is unconditionally `True` on compressing parameters, making the disjunction vacuously `True`)"
+                    ));
+                }
+                continue;
+            }
+            if short == "Collision" {
+                return Some(
+                    "conclusion states an unkeyed `Prop` disjunction `... ∨ Collision ...` (unbounded `Collision` on a 32-byte hash is unconditionally `True` in `Prop` by Pigeonhole, making `P ∨ Collision H` classically trivial)"
+                        .to_string(),
+                );
+            }
+            if short == "CshakeCollision" {
+                return Some(
+                    "conclusion states an unkeyed `Prop` disjunction `... ∨ CshakeCollision` (`CshakeCollision` over infinite `List UInt8` is unconditionally `True` in `Prop` by Pigeonhole)"
+                        .to_string(),
+                );
+            }
+            if short == "MsisBreak" {
+                return Some(
+                    "conclusion states an unkeyed `Prop` disjunction `... ∨ MsisBreak ...` (set-theoretically `True` in `Prop` on compressing lattice parameters without a `PSum` extractor or CRS game)"
+                        .to_string(),
+                );
+            }
+            if short == "BoundedCollision" {
+                let is_at = idx > 0
+                    && matches!(&concl[idx - 1].kind, LeanTokenKind::Symbol(s) if s == "@");
+                let args = extract_app_args(concl, idx);
+                let bound_arg = if is_at {
+                    args.get(2).or_else(|| args.last())
+                } else {
+                    args.get(1)
+                };
+                if let Some(barg) = bound_arg
+                    && !is_safe_preimage_byte_bound_arg(barg)
+                {
+                    let rendered = render_tokens_compact(barg);
+                    return Some(format!(
+                        "conclusion states a `Prop` disjunction `... ∨ BoundedCollision _ {rendered}` (`> 32` bytes or unguarded preimage bound guarantees a collision exists in `Prop` by Pigeonhole)"
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Pass 1 per Lean module: collect file-local vacuous `: Prop` cryptographic hardness definitions
+/// (`Def`/`Abbrev`/`Structure`/`Class`) and emit findings on offending `variable (...)` declarations.
+fn collect_flagged_crypto_defs_and_check_section_vars(
+    file: &ParsedLeanFile,
+    strict_vacuity: bool,
+    findings: &mut Vec<Finding>,
+) -> HashSet<String> {
+    let mut flagged = HashSet::new();
+    for decl in &file.declarations {
+        if decl.fixture_kept {
+            continue;
+        }
+        match decl.kind {
+            DeclKind::Def | DeclKind::Abbrev => {
+                let mut type_sig = Vec::new();
+                for b in &decl.binders {
+                    type_sig.extend(b.type_tokens.iter().cloned());
+                }
+                type_sig.extend(decl.type_tokens.iter().cloned());
+                if has_dimension_or_game_guard(&type_sig)
+                    || has_dimension_or_game_guard(&decl.body_tokens)
+                {
+                    continue;
+                }
+                let is_prop_or_unascribed =
+                    tokens_end_with_prop(&decl.type_tokens) || decl.type_tokens.is_empty();
+                if is_prop_or_unascribed {
+                    let crypto_ctx =
+                        has_crypto_carrier(file, &type_sig) || has_crypto_carrier(file, &decl.body_tokens);
+                    let named_ok = decl.name == "Unbroken"
+                        || (is_crypto_pigeonhole_def_name(&decl.name)
+                            && (crypto_ctx || name_is_intrinsically_crypto(&decl.name)));
+                    if named_ok
+                        && (decl.name == "Unbroken"
+                            || has_negated_existential_hardness_shape(&decl.body_tokens, true))
+                    {
+                        flagged.insert(decl.name.clone());
+                    } else if decl.kind == DeclKind::Abbrev
+                        && let Some(LeanToken {
+                            kind: LeanTokenKind::Ident(rhs_id),
+                            ..
+                        }) = strip_outer_parens_tokens(&decl.body_tokens).first()
+                    {
+                        let rhs_short = rhs_id.rsplit('.').next().unwrap_or(rhs_id.as_str());
+                        if rhs_short == "Unbroken"
+                            || is_crypto_pigeonhole_def_name(rhs_short)
+                            || flagged.contains(rhs_short)
+                        {
+                            flagged.insert(decl.name.clone());
+                        }
+                    }
+                }
+            }
+            DeclKind::Structure | DeclKind::Class => {
+                if is_crypto_pigeonhole_def_name(&decl.name) {
+                    let mut all_field_tokens = Vec::new();
+                    for sf in &decl.struct_fields {
+                        all_field_tokens.extend(sf.type_tokens.iter().cloned());
+                    }
+                    let crypto_ctx = has_crypto_carrier(file, &all_field_tokens)
+                        || name_is_intrinsically_crypto(&decl.name);
+                    if crypto_ctx
+                        && !has_dimension_or_game_guard(&all_field_tokens)
+                        && has_negated_existential_hardness_shape(&all_field_tokens, true)
+                    {
+                        flagged.insert(decl.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check file-level `variable (hSIS : ModuleSISHard pp 131070)` assumptions
+    let all_sv_types: Vec<LeanToken> = file
+        .section_variables
+        .iter()
+        .flat_map(|sv| sv.type_tokens.iter().cloned())
+        .collect();
+    if !has_dimension_or_game_guard(&all_sv_types) {
+        let severity = if strict_vacuity {
+            Severity::Error
+        } else {
+            Severity::Warning
+        };
+        for sv in &file.section_variables {
+            let sv_crypto = has_crypto_carrier(file, &sv.type_tokens);
+            if let Some(why) =
+                find_vacuous_premise_in_hyp(&sv.type_tokens, sv_crypto, &flagged)
+            {
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: sv.line,
+                    column: sv.col,
+                    symbol: Some(sv.name.clone()),
+                    message: format!("Section `variable ({})`: {why}", sv.name),
+                    remediation: "Remove section-wide deterministic hardness assumptions (`ModuleSISHard`, `Unbroken`, `¬ BoundedCollision`) or guard them with an explicit `NonPigeonhole` / `cols ≤ rows` / `maxBytes ≤ 32` bound.".to_string(),
+                });
+            }
+        }
+    }
+
+    flagged
+}
+
+fn check_hash_collision256_assumptions_in_decl(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    severity: Severity,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    // 1. `where` fields (`assumptions := .hashCollision256 H maxBytes`)
+    for wf in &decl.where_fields {
+        if wf.name == "assumptions" {
+            for (idx, tok) in wf.rhs_tokens.iter().enumerate() {
+                if matches!(&tok.kind, LeanTokenKind::Symbol(s) if s == ".hashCollision256")
+                    || matches!(&tok.kind, LeanTokenKind::Ident(id) if id.ends_with("hashCollision256"))
+                {
+                    let args = extract_app_args(&wf.rhs_tokens, idx);
+                    let bound_ok = args
+                        .get(1)
+                        .is_some_and(|barg| is_safe_preimage_byte_bound_arg(barg));
+                    if !bound_ok {
+                        findings.push(Finding {
+                            rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                            severity,
+                            artifact_kind: ArtifactKind::S,
+                            max_regime: Regime::Attested,
+                            sink: Some(Sink::Theater),
+                            path: file.rel_path.clone(),
+                            line: wf.line,
+                            column: wf.col,
+                            symbol: Some(format!("{}.assumptions", decl.fq_name)),
+                            message: format!(
+                                "`{}` sets `assumptions := {}` with preimage bound `> 32` bytes (or unguarded `maxBytes`), making `Unbroken J.assumptions` identically `False` by Pigeonhole on 32-byte digests",
+                                decl.fq_name,
+                                render_tokens_compact(&wf.rhs_tokens)
+                            ),
+                            remediation: "Wire `extractOrBreak` (`PSum`) to a keyed `CRHFGame` / `EUFCMAGame` / `LazyRO` advantage predicate instead of set-theoretic `.hashCollision256` with `maxBytes > 32`.".to_string(),
+                        });
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Struct literal `{ ... assumptions := .hashCollision256 H maxBytes ... }` in `decl.body_tokens`
+    if decl.where_fields.is_empty() {
+        for (idx, tok) in decl.body_tokens.iter().enumerate() {
+            if matches!(&tok.kind, LeanTokenKind::Ident(id) if id == "assumptions")
+                && decl
+                    .body_tokens
+                    .get(idx + 1)
+                    .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(s) if s == ":="))
+            {
+                let rhs = &decl.body_tokens[idx + 2..];
+                for (ridx, rtok) in rhs.iter().take(12).enumerate() {
+                    if matches!(&rtok.kind, LeanTokenKind::Symbol(s) if s == ".hashCollision256")
+                        || matches!(&rtok.kind, LeanTokenKind::Ident(id) if id.ends_with("hashCollision256"))
+                    {
+                        let args = extract_app_args(rhs, ridx);
+                        let bound_ok = args
+                            .get(1)
+                            .is_some_and(|barg| is_safe_preimage_byte_bound_arg(barg));
+                        if !bound_ok {
+                            findings.push(Finding {
+                                rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                                severity,
+                                artifact_kind: ArtifactKind::S,
+                                max_regime: Regime::Attested,
+                                sink: Some(Sink::Theater),
+                                path: file.rel_path.clone(),
+                                line: tok.line,
+                                column: tok.col,
+                                symbol: Some(format!("{}.assumptions", decl.fq_name)),
+                                message: format!(
+                                    "`{}` sets `assumptions := .hashCollision256 ...` with preimage bound `> 32` bytes (or unguarded `maxBytes`), making `Unbroken J.assumptions` identically `False` by Pigeonhole on 32-byte digests",
+                                    decl.fq_name
+                                ),
+                                remediation: "Wire `extractOrBreak` (`PSum`) to a keyed `CRHFGame` / `EUFCMAGame` / `LazyRO` advantage predicate instead of set-theoretic `.hashCollision256` with `maxBytes > 32`.".to_string(),
+                            });
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// 2026 Cryptographic Anti-Vacuity Rule (`lean/pigeonhole-vacuous-premise`):
+/// Flags Pigeonhole-False cryptographic hardness definitions/premises (`*SISHard*`, `*CollisionFree*`,
+/// `*NoCollision*`, `*HashInjective*`, `Unbroken`, `¬ BoundedCollision H maxBytes` for `maxBytes > 32`)
+/// and unkeyed `Prop`-only `∨ Collision` / `∨ CshakeCollision` disjunctions unless guarded by an
+/// explicit non-compressing domain bound (`NonPigeonhole`, `cols ≤ rows`, `maxBytes ≤ 32`) or expressed
+/// via constructive `PSum`/`Except` witness extraction or `LazyRO`/`GameSoundness` advantage bounds.
+fn check_pigeonhole_vacuous_premise(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    flagged_crypto_defs: &HashSet<String>,
+    strict_vacuity: bool,
+    findings: &mut Vec<Finding>,
+) {
+    let severity = if strict_vacuity {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+
+    // Collect referenced identifiers in `decl` so only active `section_variables` participate
+    let mut decl_ref_idents: HashSet<&str> = HashSet::new();
+    for b in &decl.binders {
+        for t in &b.type_tokens {
+            if let LeanTokenKind::Ident(id) = &t.kind {
+                decl_ref_idents.insert(id.split('.').next().unwrap_or(id.as_str()));
+            }
+        }
+    }
+    for t in decl.type_tokens.iter().chain(decl.body_tokens.iter()) {
+        if let LeanTokenKind::Ident(id) = &t.kind {
+            decl_ref_idents.insert(id.split('.').next().unwrap_or(id.as_str()));
+        }
+    }
+
+    // Gather type tokens ONLY (never binder names!) from referenced `section_variables`, `decl.binders`, and `decl.type_tokens`
+    let mut sig_type_tokens: Vec<LeanToken> = Vec::new();
+    for sv in &file.section_variables {
+        if decl_ref_idents.contains(sv.name.as_str()) {
+            sig_type_tokens.extend(sv.type_tokens.iter().cloned());
+        }
+    }
+    for b in &decl.binders {
+        sig_type_tokens.extend(b.type_tokens.iter().cloned());
+    }
+    sig_type_tokens.extend(decl.type_tokens.iter().cloned());
+
+    if has_dimension_or_game_guard(&sig_type_tokens) {
+        return;
+    }
+
+    let crypto_ctx =
+        has_crypto_carrier(file, &sig_type_tokens) || has_crypto_carrier(file, &decl.body_tokens);
+
+    // Check `assumptions := .hashCollision256 H maxBytes` across `Def`, `Abbrev`, and `Instance`
+    if matches!(
+        decl.kind,
+        DeclKind::Def | DeclKind::Abbrev | DeclKind::Instance
+    ) && check_hash_collision256_assumptions_in_decl(file, decl, severity, findings)
+    {
+        return;
+    }
+
+    match decl.kind {
+        DeclKind::Def | DeclKind::Abbrev => {
+            // 2A. Vacuous `: Prop` cryptographic hardness definitions (`ModuleSISHard`, `Unbroken`, `*CollisionFree*`, `*HashInjective*`)
+            let is_prop_or_unascribed =
+                tokens_end_with_prop(&decl.type_tokens) || decl.type_tokens.is_empty();
+            if is_prop_or_unascribed
+                && flagged_crypto_defs.contains(&decl.name)
+                && !has_dimension_or_game_guard(&decl.body_tokens)
+            {
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    column: decl.col,
+                    symbol: Some(decl.fq_name.clone()),
+                    message: format!(
+                        "Cryptographic `Prop` predicate `{}` asserts negated-existential / universal non-existence hardness (`{}`) without a `NonPigeonhole` / `cols ≤ rows` / `maxBytes ≤ 32` guard or distributional game bound (mathematically `False` by Pigeonhole/Minkowski on compressing parameters)",
+                        decl.fq_name,
+                        render_tokens_compact(&decl.body_tokens)
+                    ),
+                    remediation: "Replace set-theoretic non-existence (`Unbroken` / `¬ ∃` / `= []`) with a constructive `PSum` witness extractor (`0 Classical`) paired with a keyed CRS / `LazyRO` / `MSISGame` advantage bound, or add an explicit `NonPigeonhole` dimension guard.".to_string(),
+                });
+                return;
+            }
+
+            // Also check binders, quantified binders, and arrow hypotheses on `Def` / `Abbrev`
+            // (`def foo : ModuleSISHard pp B → Nat := ...`) unless returning `PSum`/`Except`
+            let mut qbinders = Vec::new();
+            let mut hyps = Vec::new();
+            let concl = peel_forall_and_arrows(&decl.type_tokens, &mut qbinders, &mut hyps);
+            if conclusion_returns_psum_or_except(concl) {
+                return;
+            }
+            let mut def_premise: Option<(String, usize, usize)> = None;
+            for b in &decl.binders {
+                if let Some(why) =
+                    find_vacuous_premise_in_hyp(&b.type_tokens, crypto_ctx, flagged_crypto_defs)
+                {
+                    def_premise = Some((why, b.line, b.col));
+                    break;
+                }
+            }
+            if def_premise.is_none() {
+                for qb in &qbinders {
+                    if let Some(why) = find_vacuous_premise_in_hyp(
+                        &qb.type_tokens,
+                        crypto_ctx,
+                        flagged_crypto_defs,
+                    ) {
+                        let (ln, cl) = qb
+                            .type_tokens
+                            .first()
+                            .map_or((decl.line, decl.col), |t| (t.line, t.col));
+                        def_premise = Some((why, ln, cl));
+                        break;
+                    }
+                }
+            }
+            if def_premise.is_none() {
+                for h in &hyps {
+                    if let Some(why) =
+                        find_vacuous_premise_in_hyp(h, crypto_ctx, flagged_crypto_defs)
+                    {
+                        let (ln, cl) = h
+                            .first()
+                            .map_or((decl.line, decl.col), |t| (t.line, t.col));
+                        def_premise = Some((why, ln, cl));
+                        break;
+                    }
+                }
+            }
+            if let Some((why, ln, cl)) = def_premise {
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: ln,
+                    column: cl,
+                    symbol: Some(decl.fq_name.clone()),
+                    message: format!("Definition `{}`: {why}", decl.fq_name),
+                    remediation: "Remove the Pigeonhole-False hypothesis or return a constructive `PSum` witness-extraction sum.".to_string(),
+                });
+                return;
+            }
+        }
+
+        DeclKind::Structure | DeclKind::Class => {
+            if flagged_crypto_defs.contains(&decl.name) {
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    column: decl.col,
+                    symbol: Some(decl.fq_name.clone()),
+                    message: format!(
+                        "Cryptographic structure/class `{}` encodes negated-existential hardness without a `NonPigeonhole` / `cols ≤ rows` dimension guard or distributional game bound",
+                        decl.fq_name
+                    ),
+                    remediation: "Formulate cryptographic hardness via a keyed game (`MSISGame` / `LazyRO`) or constructive `PSum` witness reduction, or include an explicit non-compressing dimension guard.".to_string(),
+                });
+                return;
+            }
+
+            // Check fields of both `Structure` and `Class` for vacuous premises or direct `ModuleSISHard` field types
+            for sf in &decl.struct_fields {
+                let mut f_sig: Vec<LeanToken> = Vec::new();
+                for b in &sf.binders {
+                    f_sig.extend(b.type_tokens.iter().cloned());
+                }
+                f_sig.extend(sf.type_tokens.iter().cloned());
+                if has_dimension_or_game_guard(&f_sig) {
+                    continue;
+                }
+                let f_crypto = crypto_ctx || has_crypto_carrier(file, &f_sig);
+                let mut qbinders = Vec::new();
+                let mut hyps = Vec::new();
+                let concl = peel_forall_and_arrows(&sf.type_tokens, &mut qbinders, &mut hyps);
+                if conclusion_returns_psum_or_except(concl) {
+                    continue;
+                }
+                let mut reason: Option<String> = None;
+                for b in &sf.binders {
+                    if let Some(r) =
+                        find_vacuous_premise_in_hyp(&b.type_tokens, f_crypto, flagged_crypto_defs)
+                    {
+                        reason = Some(r);
+                        break;
+                    }
+                }
+                if reason.is_none() {
+                    for qb in &qbinders {
+                        if let Some(r) = find_vacuous_premise_in_hyp(
+                            &qb.type_tokens,
+                            f_crypto,
+                            flagged_crypto_defs,
+                        ) {
+                            reason = Some(r);
+                            break;
+                        }
+                    }
+                }
+                if reason.is_none() {
+                    for h in &hyps {
+                        if let Some(r) =
+                            find_vacuous_premise_in_hyp(h, f_crypto, flagged_crypto_defs)
+                        {
+                            reason = Some(r);
+                            break;
+                        }
+                    }
+                }
+                // Direct field type `hard : ModuleSISHard pp B` or `noCol : ¬ BoundedCollision H 64`
+                if reason.is_none() {
+                    reason = find_vacuous_premise_in_hyp(concl, f_crypto, flagged_crypto_defs);
+                }
+                if let Some(why) = reason {
+                    findings.push(Finding {
+                        rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                        severity,
+                        artifact_kind: ArtifactKind::S,
+                        max_regime: Regime::Attested,
+                        sink: Some(Sink::Theater),
+                        path: file.rel_path.clone(),
+                        line: sf.line,
+                        column: sf.col,
+                        symbol: Some(format!("{}.{}", decl.fq_name, sf.name)),
+                        message: format!("Field `{}.{}`: {why}", decl.fq_name, sf.name),
+                        remediation: "Replace negated-existential fields/premises (`ModuleSISHard`, `Unbroken`, `¬ BoundedCollision`) with a `0 Classical` `PSum` witness extractor or keyed `MSISGame` / `LazyRO` advantage bound.".to_string(),
+                    });
+                }
+            }
+        }
+
+        DeclKind::Theorem | DeclKind::Instance | DeclKind::Axiom => {
+            let mut qbinders = Vec::new();
+            let mut hyps = Vec::new();
+            let concl = peel_forall_and_arrows(&decl.type_tokens, &mut qbinders, &mut hyps);
+            if conclusion_returns_psum_or_except(concl) {
+                return;
+            }
+
+            let concl_head_is_unbroken = strip_outer_parens_tokens(concl)
+                .first()
+                .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Ident(id) if id == "Unbroken"));
+
+            // 2B. Hypotheses assuming Pigeonhole-False premises
+            let mut premise_reason: Option<(String, usize, usize)> = None;
+            for b in &decl.binders {
+                if let Some(r) =
+                    find_vacuous_premise_in_hyp(&b.type_tokens, crypto_ctx, flagged_crypto_defs)
+                {
+                    if concl_head_is_unbroken && r.contains("`Unbroken`") {
+                        continue;
+                    }
+                    premise_reason = Some((r, b.line, b.col));
+                    break;
+                }
+            }
+            if premise_reason.is_none() {
+                for qb in &qbinders {
+                    if let Some(r) = find_vacuous_premise_in_hyp(
+                        &qb.type_tokens,
+                        crypto_ctx,
+                        flagged_crypto_defs,
+                    ) {
+                        if concl_head_is_unbroken && r.contains("`Unbroken`") {
+                            continue;
+                        }
+                        let (ln, cl) = qb
+                            .type_tokens
+                            .first()
+                            .map(|t| (t.line, t.col))
+                            .unwrap_or((decl.line, decl.col));
+                        premise_reason = Some((r, ln, cl));
+                        break;
+                    }
+                }
+            }
+            if premise_reason.is_none() {
+                for h in &hyps {
+                    if let Some(r) =
+                        find_vacuous_premise_in_hyp(h, crypto_ctx, flagged_crypto_defs)
+                    {
+                        if concl_head_is_unbroken && r.contains("`Unbroken`") {
+                            continue;
+                        }
+                        let (ln, cl) = h
+                            .first()
+                            .map(|t| (t.line, t.col))
+                            .unwrap_or((decl.line, decl.col));
+                        premise_reason = Some((r, ln, cl));
+                        break;
+                    }
+                }
+            }
+            if premise_reason.is_none() && decl.kind == DeclKind::Axiom {
+                if let Some(r) =
+                    find_vacuous_premise_in_hyp(concl, crypto_ctx, flagged_crypto_defs)
+                {
+                    premise_reason = Some((r, decl.line, decl.col));
+                }
+            }
+
+            if let Some((why, ln, cl)) = premise_reason {
+                let kind_label = match decl.kind {
+                    DeclKind::Instance => "Instance",
+                    DeclKind::Axiom => "Axiom",
+                    _ => "Theorem",
+                };
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: ln,
+                    column: cl,
+                    symbol: Some(decl.fq_name.clone()),
+                    message: format!("{kind_label} `{}`: {why}", decl.fq_name),
+                    remediation: "Remove the Pigeonhole-False hypothesis (`False → P` vacuity) and prove either a `Type`-valued `PSum` witness-extraction reduction (`0 Classical`) or a distributional `LazyRO` / `MSISGame` advantage bound.".to_string(),
+                });
+                return;
+            }
+
+            if decl.kind != DeclKind::Theorem || concl_head_is_unbroken {
+                return;
+            }
+
+            let premise_mentions_collision = decl
+                .binders
+                .iter()
+                .flat_map(|b| b.type_tokens.iter())
+                .chain(qbinders.iter().flat_map(|b| b.type_tokens.iter()))
+                .chain(hyps.iter().flat_map(|h| h.iter()))
+                .any(|t| {
+                    matches!(
+                        &t.kind,
+                        LeanTokenKind::Ident(id) if {
+                            let s = id.rsplit('.').next().unwrap_or(id.as_str());
+                            s.contains("Collision")
+                                || s.contains("MsisBreak")
+                                || s.contains("SISShortVec")
+                        }
+                    )
+                });
+            let has_any_hyp = !hyps.is_empty()
+                || !decl.binders.is_empty()
+                || !qbinders.is_empty();
+
+            // 2C. Unkeyed `Prop`-only `∨ Collision H` / `∨ CshakeCollision` / `∨ MsisBreak` / `∨ ¬ ModuleSISHard` conclusions
+            if let Some(or_why) = find_vacuous_prop_collision_disjunction(
+                concl,
+                has_any_hyp,
+                premise_mentions_collision,
+                flagged_crypto_defs,
+            ) {
+                let (ln, cl) = concl
+                    .first()
+                    .map(|t| (t.line, t.col))
+                    .unwrap_or((decl.line, decl.col));
+                findings.push(Finding {
+                    rule_id: "lean/pigeonhole-vacuous-premise".to_string(),
+                    severity,
+                    artifact_kind: ArtifactKind::S,
+                    max_regime: Regime::Attested,
+                    sink: Some(Sink::Theater),
+                    path: file.rel_path.clone(),
+                    line: ln,
+                    column: cl,
+                    symbol: Some(decl.fq_name.clone()),
+                    message: format!("Theorem `{}`: {or_why}", decl.fq_name),
+                    remediation: "Promote `Prop`-level `∨ Collision` / `∨ CshakeCollision` to a constructive `Type`-valued `PSum` witness extractor (`ExactCollisionPair` / `HashCollisionWitness`) or finite-pair `CollisionAmong H (fun x => x = m₁ ∨ x = m₂)` lifted into a keyed CRHF / `LazyRO` game.".to_string(),
+                });
+            }
+        }
+
+        _ => {}
     }
 }
 
@@ -1798,7 +3990,10 @@ fn decl_defines_prop_predicate(decl: &ParsedLeanDecl) -> bool {
 /// Collect identifiers in `file` that have at least one positive satisfiability/inhabitedness
 /// witness in the same module (`#guard`, `example`, `*_complete`, `*_sat`, `*_inhabited`,
 /// `∃`, `Judge.complete`, or positive conclusion not resting on the same unproved premise).
-fn collect_module_satisfiability_witnesses(file: &ParsedLeanFile) -> HashSet<String> {
+fn collect_module_satisfiability_witnesses(
+    file: &ParsedLeanFile,
+    decl_by_name: &HashMap<&str, &ParsedLeanDecl>,
+) -> HashSet<String> {
     let mut witnessed = HashSet::new();
 
     // 1. `#guard` / `#silicon_check` positive checks
@@ -1828,7 +4023,8 @@ fn collect_module_satisfiability_witnesses(file: &ParsedLeanFile) -> HashSet<Str
 
     // 2. `Judge` instance `complete` fields and constructive `Example` / completeness / inhabitedness theorems
     for decl in &file.declarations {
-        if is_judge_instance_decl(decl) && decl.where_fields.iter().any(|wf| wf.name == "complete")
+        if is_judge_instance_decl(decl, decl_by_name)
+            && decl.where_fields.iter().any(|wf| wf.name == "complete")
         {
             for wf in &decl.where_fields {
                 if wf.name == "check" || wf.name == "Meaning" || wf.name == "complete" {
@@ -2311,15 +4507,48 @@ fn extract_instance_fields(
         return Vec::new();
     }
 
-    // Struct literal `{ f := ..., g := ... }`
+    // Struct literal `{ f := ..., g := ... }` or struct update `{ base with f := ..., g := ... }`
     if matches!(&body.first().unwrap().kind, LeanTokenKind::Symbol(s) if s == "{")
         && matches!(&body.last().unwrap().kind, LeanTokenKind::Symbol(s) if s == "}")
         && body.len() >= 2
     {
-        let inner = &body[1..body.len() - 1];
-        let chunks = split_top_level_delim(inner, &[",", ";"]);
+        let mut inner = &body[1..body.len() - 1];
+        let mut d = 0usize;
+        for (idx, tok) in inner.iter().enumerate() {
+            match &tok.kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => d += 1,
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                    d = d.saturating_sub(1);
+                }
+                LeanTokenKind::Ident(kw) if d == 0 && kw == "with" => {
+                    inner = &inner[idx + 1..];
+                    break;
+                }
+                LeanTokenKind::Symbol(s) if d == 0 && (s == ":=" || s == "," || s == ";") => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let raw_chunks = split_top_level_delim(inner, &[",", ";"]);
+        // Re-join comma-continuations (such as `∃ c, ...` or `∀ x, ...`) that do not start a new `field :=` assignment
+        let mut merged_chunks: Vec<Vec<LeanToken>> = Vec::new();
+        for ch in raw_chunks {
+            if parse_field_assignment_chunk(&ch).is_some() || merged_chunks.is_empty() {
+                merged_chunks.push(ch);
+            } else if let Some(prev) = merged_chunks.last_mut() {
+                let (ln, cl) = ch.first().map_or((1, 1), |t| (t.line, t.col));
+                prev.push(LeanToken {
+                    kind: LeanTokenKind::Symbol(",".to_string()),
+                    line: ln,
+                    col: cl,
+                    first_on_line: false,
+                });
+                prev.extend(ch);
+            }
+        }
         let mut parsed = Vec::new();
-        for ch in &chunks {
+        for ch in &merged_chunks {
             if let Some(f) = parse_field_assignment_chunk(ch) {
                 parsed.push(f);
             }
@@ -2802,10 +5031,13 @@ fn check_obligation_projection_cosplay(
 }
 
 fn strip_outer_parens_tokens(mut slice: &[LeanToken]) -> &[LeanToken] {
-    while slice.len() >= 2
+    let mut layers = 0usize;
+    while layers < 8
+        && slice.len() >= 2
         && matches!(&slice[0].kind, LeanTokenKind::Symbol(s) if s == "(")
         && matches!(&slice[slice.len() - 1].kind, LeanTokenKind::Symbol(s) if s == ")")
     {
+        layers += 1;
         let mut depth = 0isize;
         let mut wraps_all = true;
         for (idx, tok) in slice.iter().enumerate() {
@@ -4034,7 +6266,7 @@ end Obend.Trailblaze
             &idx,
             LeanLintOptions {
                 strict_expose: true,
-                strict_harnesses: false,
+                ..Default::default()
             },
         );
         let excessive_err: Vec<_> = err_findings
@@ -4121,8 +6353,8 @@ end Obend.Consensus
         let (err_findings, _) = run_lean_lints_with_options(
             &idx,
             LeanLintOptions {
-                strict_expose: false,
                 strict_harnesses: true,
+                ..Default::default()
             },
         );
         let st_errs: Vec<_> = err_findings
@@ -4131,5 +6363,244 @@ end Obend.Consensus
             .collect();
         assert_eq!(st_errs.len(), 1);
         assert_eq!(st_errs[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn judge_fragment_restates_check_catches_same_opening_and_passes_genuine_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto_dir = dir.path().join("lean/Obend/Crypto");
+        fs::create_dir_all(&crypto_dir).unwrap();
+
+        fs::write(
+            crypto_dir.join("SameOpeningTautology.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+def aliasedFrag (q : SameOpeningInstance) : Prop :=
+  ∃ c, verifySameOpening q c = .ok
+
+instance privateConvexSameOpeningJudge :
+    Obend.Judge SameOpeningInstance SameOpeningWitness where
+  Clause := SameOpeningRefusal
+  Meaning := SameOpeningMeaning
+  check _ q c := verifySameOpening q c
+  sound {_ _ _} h := verifySameOpening_sound h
+  refutes := sameOpeningRefutes
+  refuted {_ _ _ _ _} h hr c' hm := verifySameOpening_refuted h hr c' hm
+  Fragment q := ∃ c, verifySameOpening q c = .ok
+  complete {q} ⟨c, hc⟩ _ := ⟨c, 0, hc⟩
+  mono _ _ := rfl
+
+def aliasedJudge : Obend.Judge SameOpeningInstance SameOpeningWitness where
+  Clause := SameOpeningRefusal
+  Meaning := SameOpeningMeaning
+  check _ q c := verifySameOpening q c
+  sound {_ _ _} h := verifySameOpening_sound h
+  refutes := sameOpeningRefutes
+  refuted {_ _ _ _ _} h hr c' hm := verifySameOpening_refuted h hr c' hm
+  Fragment := aliasedFrag
+  complete {q} ⟨c, hc⟩ _ := ⟨c, 0, hc⟩
+  mono _ _ := rfl
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            crypto_dir.join("HonestFragments.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+instance universalJudge : Obend.Judge Obj Cert where
+  Clause := ClauseTy
+  Meaning := SemanticMeaning
+  check _ o c := verifySemantic o c
+  sound {_ _ _} h := verifySemantic_sound h
+  refutes _ := true
+  refuted {_ _ _ _ _} h hr c' hm := verifySemantic_refuted h hr c' hm
+  Fragment := fun _ => True
+  complete {o} _ ⟨c, hm⟩ := buildCert_complete o c hm
+  mono _ _ := rfl
+
+instance syntacticDomainJudge : Obend.Judge TransportObj TransportCert where
+  Clause := TransportClause
+  Meaning := TransportMeaning
+  check := transportCheck
+  sound {_ _ _} h := transportCheck_sound h
+  refutes _ := true
+  refuted {_ _ _ _ _} h hr c' hm := transportCheck_refuted h hr c' hm
+  Fragment o := nonEmptySplits o.decideExpr = true ∧ checkL [] o.decideExpr .boolean = true
+  complete {o} hFrag _ := transport_complete o hFrag
+  mono _ _ := rfl
+
+instance wellFormedPredicateJudge : Obend.Judge HyperbolicSystem Cert where
+  Clause := String
+  Meaning := HyperbolicMeaning
+  check _ s c := verifyHyperbolic s c
+  sound {_ _ _} h := verifyHyperbolic_sound h
+  refutes _ := true
+  refuted {_ _ _ _ _} h hr c' hm := verifyHyperbolic_refuted h hr c' hm
+  Fragment := HyperbolicSystem.WellFormed
+  complete {s} hWf hMean := buildHyperbolicCert s hWf hMean
+  mono _ _ := rfl
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (warn_findings, _) = run_lean_lints_with_options(&idx, LeanLintOptions::default());
+        let frag_warns: Vec<_> = warn_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/judge-fragment-restates-check")
+            .collect();
+        assert_eq!(
+            frag_warns.len(),
+            2,
+            "both inline `SameOpening` and 1-hop aliased `Fragment` must fire while all 3 honest judges pass: {frag_warns:#?}"
+        );
+        assert!(frag_warns.iter().all(|f| {
+            f.path.ends_with("SameOpeningTautology.lean") && f.severity == Severity::Warning
+        }));
+
+        let (err_findings, _) = run_lean_lints_with_options(
+            &idx,
+            LeanLintOptions {
+                strict_vacuity: true,
+                ..Default::default()
+            },
+        );
+        let frag_errs: Vec<_> = err_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/judge-fragment-restates-check")
+            .collect();
+        assert_eq!(frag_errs.len(), 2);
+        assert!(frag_errs.iter().all(|f| f.severity == Severity::Error));
+    }
+
+    #[test]
+    fn pigeonhole_vacuous_premise_catches_compressing_sis_and_bounded_collision_and_passes_psum_and_games() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto_dir = dir.path().join("lean/Obend/Crypto");
+        let hw_dir = dir.path().join("lean/Obend/Hardware");
+        fs::create_dir_all(&crypto_dir).unwrap();
+        fs::create_dir_all(&hw_dir).unwrap();
+
+        fs::write(
+            crypto_dir.join("VacuousHardness.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+def ModuleSISHard (pp : AjtaiParams) (B : Nat) : Prop :=
+  ∀ v, nonZero v → ¬ (ajtaiEval pp v = 0 ∧ infNorm v ≤ B)
+
+theorem binding_of_sis_hard (pp : AjtaiParams) (x y : Witness)
+    (hSIS : ModuleSISHard pp 131070)
+    (hEq : ajtaiCommit pp x = ajtaiCommit pp y) :
+    x = y := by
+  exact sis_inj hSIS hEq
+
+theorem merkle_binding_of_bounded_collision_free (H : Hash32) (v : Nat) (t1 t2 : Tree)
+    (hNoCol : ¬ BoundedCollision H.eval (merkleMaxPreimageBytes v))
+    (hRoot : merkleRoot H t1 = merkleRoot H t2) :
+    t1 = t2 := by
+  exact merkle_inj hNoCol hRoot
+
+theorem prop_only_fixed_cshake_disjunction (a b : Payload)
+    (hEq : digest a = digest b) :
+    a = b ∨ CshakeCollision := by
+  exact Or.inr trivialCshakeCollision
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            crypto_dir.join("HonestReductions.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+def extractDoubleOpenOrBreak (pp : AjtaiParams) (x y : Witness)
+    (hEq : ajtaiCommit pp x = ajtaiCommit pp y) :
+    PSum (x = y) (SISShortVecWitness pp.modulus 262140 pp.matrix) :=
+  extractImpl pp x y hEq
+
+theorem nonPigeonhole_sis_binding (pp : AjtaiParams) (x y : Witness)
+    (hNP : NonPigeonholeSISParams pp)
+    (hSIS : ModuleSISHard pp 131070)
+    (hEq : ajtaiCommit pp x = ajtaiCommit pp y) :
+    x = y := by
+  exact np_inj hNP hSIS hEq
+
+theorem toyInjectiveHash_no_boundedCollision (maxBytes : Nat)
+    (hMax : maxBytes ≤ 31) :
+    ¬ BoundedCollision toyHash.eval maxBytes := by
+  exact toy_inj maxBytes hMax
+
+theorem keyed_msis_game_sound (G : KeyedMSISGame) (adv : Adversary) (eps : RatSlack)
+    (hSec : GameSecure G adv eps) :
+    Advantage G adv ≤ eps := by
+  exact hSec
+
+theorem pair_collision_among_honest (H : Hash) (a b : List UInt8)
+    (hEq : H a = H b) :
+    a = b ∨ CollisionAmong H (fun m => m = a ∨ m = b) := by
+  exact pair_binds H a b hEq
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        // Spatial placement `Bool` helper named `checkPairNoCollision` must NOT false-positive!
+        fs::write(
+            hw_dir.join("PlaceRoute.lean"),
+            r#"module
+public section
+namespace Obend.Hardware
+
+def checkPairNoCollision (c1 c2 : PlacedCell) : Bool :=
+  c1.x != c2.x || c1.y != c2.y
+
+end Obend.Hardware
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (warn_findings, _) = run_lean_lints_with_options(&idx, LeanLintOptions::default());
+        let vac_warns: Vec<_> = warn_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/pigeonhole-vacuous-premise")
+            .collect();
+        assert_eq!(
+            vac_warns.len(),
+            4,
+            "all 4 vacuous declarations in VacuousHardness.lean must fire with 0 false positives on HonestReductions.lean or PlaceRoute.lean: {vac_warns:#?}"
+        );
+        assert!(vac_warns.iter().all(|f| {
+            f.path.ends_with("VacuousHardness.lean") && f.severity == Severity::Warning
+        }));
+
+        let (err_findings, _) = run_lean_lints_with_options(
+            &idx,
+            LeanLintOptions {
+                strict_vacuity: true,
+                ..Default::default()
+            },
+        );
+        let vac_errs: Vec<_> = err_findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/pigeonhole-vacuous-premise")
+            .collect();
+        assert_eq!(vac_errs.len(), 4);
+        assert!(vac_errs.iter().all(|f| f.severity == Severity::Error));
     }
 }

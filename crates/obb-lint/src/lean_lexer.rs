@@ -158,9 +158,58 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
             }
             while i < n && chars[i] != '"' {
                 if chars[i] == '\\' && i + 1 < n {
+                    let esc = chars[i + 1];
+                    if esc == 'x' && i + 3 < n {
+                        let h1 = chars[i + 2];
+                        let h2 = chars[i + 3];
+                        if let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16)) {
+                            let byte = ((d1 << 4) | d2) as u8;
+                            s.push(byte as char);
+                            i += 4;
+                            col += 4;
+                            continue;
+                        }
+                    }
+                    if esc == 'u' && i + 3 < n && chars[i + 2] == '{' {
+                        let mut k = i + 3;
+                        let mut hex = String::new();
+                        while k < n && chars[k] != '}' && hex.len() <= 6 && chars[k].is_ascii_hexdigit() {
+                            hex.push(chars[k]);
+                            k += 1;
+                        }
+                        if k < n && chars[k] == '}' && !hex.is_empty()
+                            && let Ok(code) = u32::from_str_radix(&hex, 16)
+                            && let Some(ch) = char::from_u32(code)
+                        {
+                            s.push(ch);
+                            let step = (k + 1) - i;
+                            i = k + 1;
+                            col += step;
+                            continue;
+                        }
+                    }
+                    if esc == 'u' && i + 5 < n {
+                        let hex: String = chars[i + 2..i + 6].iter().collect();
+                        if hex.chars().all(| ch | ch.is_ascii_hexdigit())
+                            && let Ok(code) = u32::from_str_radix(&hex, 16)
+                            && let Some(ch) = char::from_u32(code)
+                        {
+                            s.push(ch);
+                            i += 6;
+                            col += 6;
+                            continue;
+                        }
+                    }
                     i += 1;
                     col += 1;
-                    s.push(chars[i]);
+                    let decoded = match chars[i] {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '0' => '\0',
+                        other => other,
+                    };
+                    s.push(decoded);
                     if chars[i] == '\n' {
                         line += 1;
                         col = 1;

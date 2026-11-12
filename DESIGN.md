@@ -105,15 +105,19 @@ load; artifacts with their populations and evaluator verdicts; a "ready" column 
 ember" column; server-sent events. This is how a person follows forty segments without reading
 forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 6. Shape and landed engines (`obb v2`)
+## 6. Shape and landed engines (`obb v5`)
 
 Rust 2024 workspace (`obb-core`, `obb-lint`, `obb-judge`, `obb-state`, `obb-broker`, `obb-cli`), one
 binary `obb`:
 
 1. **`obb lint` & `--modularity` (`obb-lint`)**: Vacuity, `atp-checkers`, uninhabited-premise,
-   `native_decide`, narrow-digest-weld (`< 128` bits), and Lean 4.35 module-hygiene rules
-   (`lean/file-wide-expose`, `lean/public-meta-import-leak`), plus `.obend` claim checks, process
-   sink detectors, and typeclass/structure compositionality indexing.
+   `Judge.Fragment` operational-check restatement (`lean/judge-fragment-restates-check`),
+   Pigeonhole/Minkowski vacuous cryptographic hardness & unkeyed `Prop` collision disjunctions
+   (`lean/pigeonhole-vacuous-premise`), cross-language `Rust ↔ Lean` domain-tag & static framing
+   arity drift (`cross-lang/domain-tag-drift`), `native_decide`, narrow-digest-weld (`< 128` bits),
+   and Lean 4.35 module-hygiene rules (`lean/file-wide-expose`, `lean/public-meta-import-leak`),
+   plus `.obend` claim checks, process sink detectors, and typeclass/structure compositionality
+   indexing.
 2. **`obb cone` & `obb apex` (`obb-lint`)**: `< 25 ms` parallel Lean module-header DAG analyzer and
    disjoint shard planner (`obb cone plan`, isolating high-fan-in Wave-0 hubs), paired with
    whole-system Apex theorem reverse-cone coverage and leaf-island detection against
@@ -124,8 +128,9 @@ binary `obb`:
 4. **`obb quarry` (`obb-lint` / `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
    synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
 5. **`obb broker`, `obb state`/`seg` & `obb serve` (`obb-broker`, `obb-state`)**: ZFS-ARC-aware SSH
-   probe and `cp -al` `.lake/build` seed-pool router across `bb2` and `hbox` with hard wall-clock
-   and RSS reapers, segment/worktree/ledger tracking, and live SSE dashboard.
+   probe and CoW/reflink (`cp -R --reflink=auto`) `.lake/build` seed-pool router across `bb2` and
+   `hbox` with `0700` per-invocation worktrees, hard wall-clock and RSS reapers, segment/worktree/ledger
+   tracking, and live SSE dashboard.
 6. **Multi-family Mixture-of-Agents (`Principles 3 & 4`)**: Parallel Round-1 population drafts
    across Gemini (`agy`), GPT-6-Astra (`codex exec`), and Claude-Fable-5.2 (`claude -p`) armed with
    `~/swarm/research.py` and `~/paperbin`, followed by Round-2 cross-family synthesis before Wave
