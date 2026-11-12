@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use obb_broker::{
     BuildPlanOptions, HostChoice, SshExecutor, plan_build as broker_plan_build, probe_hosts,
 };
-use obb_cli::serve::run_server;
-use obb_judge::pipeline::{PipelineStage, check_pipeline};
+use obb_cli::serve::run_server_with_state_dir;
+use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
     Gate, TrustBase, check_revert_clean, check_succeed, check_well_formed, evaluate_gate,
 };
@@ -31,9 +31,13 @@ use std::process::ExitCode;
     about = "Obebuilder metaharness: anti-slop linter, genealogy judge, process statechart & visualizer"
 )]
 struct Cli {
-    /// Workspace root containing `judge.json`, `spec/process.json`, `.obb/`, and `ledger/`
+    /// Workspace root containing `judge.json` and `spec/process.json`
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
+
+    /// Explicit directory for `state.db` and `events.jsonl` (defaults to `$XDG_STATE_HOME/obb/<repo_hash>/` or `<obb_workspace>/.obb-state/<repo_hash>/`, never `<target_repo>/.obb/`)
+    #[arg(long, global = true)]
+    state_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -230,15 +234,23 @@ enum ApexSubcommand {
 
 #[derive(Subcommand, Debug)]
 enum PipelineSubcommand {
-    /// Verify Stage-A `[HypothesisLedger]` interface lock or Stage-B concrete instance seal (`0 sorry`, `0 axiom`, acyclic, inhabited)
+    /// Verify Stage-A `[HypothesisLedger]` / `[*Obligations]` interface lock or Stage-B concrete instance seal (`0 sorry`, `0 axiom`, acyclic, inhabited)
     Check {
         /// Target repository root (strictly read-only)
         #[arg(long, default_value = ".")]
         repo: PathBuf,
 
-        /// Require `STAGE_B_SEALED` (fail if open Stage-A `[HypothesisLedger]` obligations remain)
+        /// Require `STAGE_B_SEALED` (fail if open Stage-A obligations remain or stage is `UNDECLARED`)
         #[arg(long)]
         require_sealed: bool,
+
+        /// Refuse (`exit 2`) when `0` obligation classes are discovered (`UNDECLARED`)
+        #[arg(long)]
+        strict: bool,
+
+        /// Allow `STAGE_B_SEALED` when `0` obligation classes are discovered in the repository
+        #[arg(long)]
+        allow_empty: bool,
 
         /// Emit structured JSON report
         #[arg(long)]
@@ -263,7 +275,7 @@ enum BrokerSubcommand {
         json: bool,
     },
 
-    /// Route & batch Lean/GPU/EDA targets into git-tree-seeded (`cp -al`), time/RSS-bounded remote `lake build` invocations
+    /// Route & batch Lean/GPU/EDA targets into git-tree-seeded (`cp -R --reflink=auto`), SHA-pinned, time/RSS-bounded remote `lake build` invocations
     PlanBuild {
         /// Build targets (module names like `Obend.Vault.Replay`, `.lean` paths, or executables like `rdna2-check`, `emit-sv`)
         #[arg(required = true)]
@@ -281,9 +293,13 @@ enum BrokerSubcommand {
         #[arg(long, default_value_t = 12)]
         max_rss_gb: u64,
 
-        /// Optional local repository path used to derive the git-tree (`HEAD:lean`) `.olean` seed cache key
+        /// Optional local repository path used to derive exact commit SHA and `HEAD:lean` `.olean` seed cache key
         #[arg(long)]
         repo: Option<PathBuf>,
+
+        /// Optional explicit git revision / SHA to checkout (`git fetch` + `git checkout --detach <sha>`) on the remote host
+        #[arg(long)]
+        commit: Option<String>,
 
         /// Optional override for the remote `.olean` seed pool directory
         #[arg(long)]
@@ -777,13 +793,21 @@ async fn run() -> Result<ExitCode> {
             PipelineSubcommand::Check {
                 repo,
                 require_sealed,
+                strict,
+                allow_empty,
                 json,
             } => {
-                let rep = check_pipeline(&repo)?;
+                let rep = check_pipeline_with_options(
+                    &repo,
+                    PipelineCheckOptions {
+                        strict,
+                        allow_empty,
+                    },
+                )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&rep)?);
                 } else {
-                    print_human_pipeline_report(&rep, require_sealed);
+                    print_human_pipeline_report(&rep, require_sealed, strict);
                 }
                 let ok = rep.passed
                     && (!require_sealed || rep.stage == PipelineStage::StageBSealed);
@@ -821,6 +845,7 @@ async fn run() -> Result<ExitCode> {
                 timeout_secs,
                 max_rss_gb,
                 repo,
+                commit,
                 seed_root,
                 dry_run,
                 exec,
@@ -834,6 +859,7 @@ async fn run() -> Result<ExitCode> {
                     dry_run,
                     exec,
                     repo_root: repo,
+                    target_commit: commit,
                     remote_seed_root: seed_root,
                 };
                 let rep = broker_plan_build(&targets, &opts, &SshExecutor)?;
@@ -1004,7 +1030,10 @@ async fn run() -> Result<ExitCode> {
                 match check_succeed(&old_gate, &new_gate, &parsed_lobs) {
                     Ok(rec) => {
                         if apply {
-                            let store = StateStore::open(&cli.workspace)?;
+                            let store = StateStore::open_with_state_dir(
+                                &cli.workspace,
+                                cli.state_dir.as_deref(),
+                            )?;
                             store.record_lob_succession(&rec)?;
                             let formatted = serde_json::to_string_pretty(&new_gate)?;
                             std::fs::write(&jpath, format!("{formatted}\n"))?;
@@ -1072,13 +1101,13 @@ async fn run() -> Result<ExitCode> {
         },
 
         Commands::State { sub } => {
-            let store = StateStore::open(&cli.workspace)?;
+            let store = StateStore::open_with_state_dir(&cli.workspace, cli.state_dir.as_deref())?;
             match sub {
                 StateSubcommand::Init => {
                     let _ = store.probe_machines(false)?;
                     println!(
-                        "Initialized `.obb/state.db` and `ledger/events.jsonl` in {}",
-                        cli.workspace.display()
+                        "Initialized `state.db` and `events.jsonl` in {}",
+                        store.state_dir().display()
                     );
                     Ok(ExitCode::SUCCESS)
                 }
@@ -1247,7 +1276,7 @@ async fn run() -> Result<ExitCode> {
         }
 
         Commands::Seg { sub } => {
-            let store = StateStore::open(&cli.workspace)?;
+            let store = StateStore::open_with_state_dir(&cli.workspace, cli.state_dir.as_deref())?;
             match sub {
                 SegSubcommand::New {
                     id,
@@ -1346,7 +1375,7 @@ async fn run() -> Result<ExitCode> {
         }
 
         Commands::Ledger { sub } => {
-            let store = StateStore::open(&cli.workspace)?;
+            let store = StateStore::open_with_state_dir(&cli.workspace, cli.state_dir.as_deref())?;
             match sub {
                 LedgerSubcommand::List { json } => {
                     let evs = store.read_ledger()?;
@@ -1379,7 +1408,15 @@ async fn run() -> Result<ExitCode> {
             if !jpath.is_file() {
                 bail!("judge.json not found at {}", jpath.display());
             }
-            run_server(&host, port, &cli.workspace, &repo, &jpath).await?;
+            run_server_with_state_dir(
+                &host,
+                port,
+                &cli.workspace,
+                cli.state_dir.as_deref(),
+                &repo,
+                &jpath,
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -1978,10 +2015,14 @@ fn print_human_apex_report(rep: &obb_lint::apex::ApexReport, subcmd: &str) {
     }
 }
 
-fn print_human_pipeline_report(rep: &obb_judge::pipeline::PipelineReport, require_sealed: bool) {
+fn print_human_pipeline_report(
+    rep: &obb_judge::pipeline::PipelineReport,
+    require_sealed: bool,
+    strict: bool,
+) {
     println!(
-        "obb pipeline check [{}]: repo={} ready_for_parallel_swarm={} ready_for_claimed={}",
-        rep.stage, rep.repo_root, rep.ready_for_parallel_swarm, rep.ready_for_claimed
+        "obb pipeline check [{}]: repo={} passed={} ready_for_parallel_swarm={} ready_for_claimed={}",
+        rep.stage, rep.repo_root, rep.passed, rep.ready_for_parallel_swarm, rep.ready_for_claimed
     );
     println!(
         "obligations: total={} sealed={} open_stage_a={} consumer_sites={} | smuggled_sorry={} smuggled_axiom={}",
@@ -1993,7 +2034,7 @@ fn print_human_pipeline_report(rep: &obb_judge::pipeline::PipelineReport, requir
         rep.smuggled_axiom_count
     );
     if !rep.obligations.is_empty() {
-        println!("\nHypothesisLedger / @[obb_obligation] classes:");
+        println!("\nHypothesisLedger / *Obligations / @[obb_obligation] classes:");
         for ob in &rep.obligations {
             let st = if ob.discharged { "SEALED" } else { "OPEN_STAGE_A" };
             println!(
@@ -2015,10 +2056,14 @@ fn print_human_pipeline_report(rep: &obb_judge::pipeline::PipelineReport, requir
                 v.kind, v.path, v.line, v.symbol, v.message, v.remediation
             );
         }
+    } else if strict && rep.stage == PipelineStage::Undeclared {
+        println!(
+            "\n[FAIL] `--strict` is set, and 0 obligation classes (`*Obligations` / `HypothesisLedger` / `@[obb_obligation]`) were declared (`UNDECLARED`)."
+        );
     } else if require_sealed && rep.stage != PipelineStage::StageBSealed {
         println!(
-            "\n[FAIL] `--require-sealed` is set, but {} Stage-A `[HypothesisLedger]` obligation(s) remain undischarged.",
-            rep.open_stage_a_obligations
+            "\n[FAIL] `--require-sealed` is set, but pipeline stage is `{}` ({} open Stage-A obligation(s)).",
+            rep.stage, rep.open_stage_a_obligations
         );
     }
 }

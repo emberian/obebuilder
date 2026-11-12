@@ -31,6 +31,7 @@ pub fn run_lean_lints_with_options(
 ) -> (Vec<Finding>, Vec<DirectoryCensus>) {
     let mut findings = Vec::new();
     let mut dir_map: BTreeMap<String, DirectoryCensus> = BTreeMap::new();
+    let (obligation_classes, obligation_class_fields) = collect_obligation_classes(index);
 
     for file in &index.files {
         let entry = dir_map
@@ -376,6 +377,17 @@ pub fn run_lean_lints_with_options(
                     // 5. `Judge` instance tautological `Meaning` detector
                     if is_judge_instance_decl(decl) {
                         check_judge_meaning(file, decl, &decl_by_name, &mut findings);
+                    }
+
+                    // 5b. `*Obligations` / `HypothesisLedger` 1–3 line projection/determinism cosplay detector
+                    if decl.kind == DeclKind::Instance && !is_test_only && !decl.fixture_kept {
+                        check_obligation_projection_cosplay(
+                            file,
+                            decl,
+                            &obligation_classes,
+                            &obligation_class_fields,
+                            &mut findings,
+                        );
                     }
 
                     // 6. Hardcoded string-literal wire decoder detector
@@ -1893,5 +1905,849 @@ fn check_uninhabited_premise_risk(
                 });
             }
         }
+    }
+}
+
+fn is_obligation_class_name(name: &str) -> bool {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    short == "HypothesisLedger"
+        || short.contains("HypothesisLedger")
+        || short == "Obligations"
+        || short.ends_with("Obligations")
+}
+
+fn extract_class_parents_for_lint(type_tokens: &[LeanToken]) -> Vec<String> {
+    let mut parents = Vec::new();
+    let mut after_extends = false;
+    let mut depth = 0isize;
+    let mut expect_head = false;
+    for tok in type_tokens {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Ident(s) if depth == 0 && s == "extends" => {
+                after_extends = true;
+                expect_head = true;
+            }
+            LeanTokenKind::Symbol(s) if after_extends && depth == 0 && s == "," => {
+                expect_head = true;
+            }
+            LeanTokenKind::Symbol(s) if after_extends && depth == 0 && s == ":" => break,
+            LeanTokenKind::Ident(s) if after_extends && depth == 0 && s == "where" => break,
+            LeanTokenKind::Ident(id) if after_extends && depth == 0 && expect_head => {
+                parents.push(id.clone());
+                expect_head = false;
+            }
+            _ => {}
+        }
+    }
+    parents
+}
+
+fn collect_obligation_classes(
+    index: &LeanIndex,
+) -> (HashSet<String>, HashMap<String, Vec<String>>) {
+    let mut classes = HashSet::new();
+    let mut class_fields: HashMap<String, Vec<String>> = HashMap::new();
+    let mut candidates: Vec<(&ParsedLeanDecl, Vec<String>)> = Vec::new();
+
+    for file in &index.files {
+        if is_test_only_path(&file.rel_path) {
+            continue;
+        }
+        for decl in &file.declarations {
+            if decl.kind != DeclKind::Class {
+                continue;
+            }
+            let parents = extract_class_parents_for_lint(&decl.type_tokens);
+            let has_attr = decl.attributes.iter().any(|a| a == "obb_obligation");
+            let extends_named = parents.iter().any(|p| is_obligation_class_name(p));
+            if is_obligation_class_name(&decl.name) || has_attr || extends_named {
+                let fnames: Vec<String> =
+                    decl.struct_fields.iter().map(|f| f.name.clone()).collect();
+                classes.insert(decl.name.clone());
+                classes.insert(decl.fq_name.clone());
+                class_fields.insert(decl.name.clone(), fnames.clone());
+                class_fields.insert(decl.fq_name.clone(), fnames);
+            } else if !parents.is_empty() {
+                candidates.push((decl, parents));
+            }
+        }
+    }
+
+    loop {
+        let mut added = false;
+        for (decl, parents) in &candidates {
+            if classes.contains(&decl.fq_name) {
+                continue;
+            }
+            let matched = parents.iter().any(|p| {
+                let short = p.rsplit('.').next().unwrap_or(p.as_str());
+                classes.contains(p.as_str()) || classes.contains(short)
+            });
+            if matched {
+                let fnames: Vec<String> =
+                    decl.struct_fields.iter().map(|f| f.name.clone()).collect();
+                classes.insert(decl.name.clone());
+                classes.insert(decl.fq_name.clone());
+                class_fields.insert(decl.name.clone(), fnames.clone());
+                class_fields.insert(decl.fq_name.clone(), fnames);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    (classes, class_fields)
+}
+
+fn instance_target_head_class(type_tokens: &[LeanToken]) -> Option<String> {
+    let mut start = 0usize;
+    let mut depth = 0isize;
+    for (idx, tok) in type_tokens.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Symbol(s) if (s == "→" || s == "->" || s == ",") && depth == 0 => {
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    for tok in &type_tokens[start..] {
+        match &tok.kind {
+            LeanTokenKind::Ident(id)
+                if matches!(id.as_str(), "∀" | "forall" | "outParam" | "semiOutParam") =>
+            {
+                continue;
+            }
+            LeanTokenKind::Ident(id) if id == "where" => break,
+            LeanTokenKind::Symbol(s) if s == ":=" => break,
+            LeanTokenKind::Ident(id) => return Some(id.clone()),
+            _ => {}
+        }
+    }
+    None
+}
+
+struct ExtractedInstanceField {
+    name: Option<String>,
+    params: Vec<String>,
+    rhs_tokens: Vec<LeanToken>,
+    line: usize,
+    col: usize,
+}
+
+fn split_top_level_delim(tokens: &[LeanToken], delims: &[&str]) -> Vec<Vec<LeanToken>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut depth = 0isize;
+    for tok in tokens {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s)
+                if depth == 0 && delims.iter().any(|d| *d == s.as_str()) =>
+            {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+        cur.push(tok.clone());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn parse_field_assignment_chunk(chunk: &[LeanToken]) -> Option<ExtractedInstanceField> {
+    if chunk.is_empty() {
+        return None;
+    }
+    let mut depth = 0isize;
+    let mut assign_idx = None;
+    for (idx, tok) in chunk.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "⟨") => {
+                depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}" | "⟩") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Symbol(s) if s == ":=" && depth == 0 => {
+                assign_idx = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let a_idx = assign_idx?;
+    let head_tok = chunk.first()?;
+    let LeanTokenKind::Ident(fname) = &head_tok.kind else {
+        return None;
+    };
+    let mut params = Vec::new();
+    for t in &chunk[1..a_idx] {
+        if let LeanTokenKind::Ident(p) = &t.kind {
+            params.push(p.clone());
+        }
+    }
+    let rhs = chunk[a_idx + 1..].to_vec();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some(ExtractedInstanceField {
+        name: Some(fname.clone()),
+        params,
+        rhs_tokens: rhs,
+        line: head_tok.line,
+        col: head_tok.col,
+    })
+}
+
+fn extract_instance_fields(
+    decl: &ParsedLeanDecl,
+    class_field_names: Option<&Vec<String>>,
+) -> Vec<ExtractedInstanceField> {
+    if !decl.where_fields.is_empty() {
+        return decl
+            .where_fields
+            .iter()
+            .filter(|wf| !wf.rhs_tokens.is_empty())
+            .map(|wf| ExtractedInstanceField {
+                name: Some(wf.name.clone()),
+                params: wf.params.clone(),
+                rhs_tokens: wf.rhs_tokens.clone(),
+                line: wf.line,
+                col: wf.col,
+            })
+            .collect();
+    }
+
+    let body = &decl.body_tokens;
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    // Struct literal `{ f := ..., g := ... }`
+    if matches!(&body.first().unwrap().kind, LeanTokenKind::Symbol(s) if s == "{")
+        && matches!(&body.last().unwrap().kind, LeanTokenKind::Symbol(s) if s == "}")
+        && body.len() >= 2
+    {
+        let inner = &body[1..body.len() - 1];
+        let chunks = split_top_level_delim(inner, &[",", ";"]);
+        let mut parsed = Vec::new();
+        for ch in &chunks {
+            if let Some(f) = parse_field_assignment_chunk(ch) {
+                parsed.push(f);
+            }
+        }
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    // Anonymous constructor `⟨e1, e2, ...⟩`
+    if matches!(&body.first().unwrap().kind, LeanTokenKind::Symbol(s) if s == "⟨")
+        && matches!(&body.last().unwrap().kind, LeanTokenKind::Symbol(s) if s == "⟩")
+        && body.len() >= 2
+    {
+        let inner = &body[1..body.len() - 1];
+        let chunks = split_top_level_delim(inner, &[","]);
+        return chunks
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ch)| !ch.is_empty())
+            .map(|(i, ch)| {
+                let first = &ch[0];
+                let fname = class_field_names.and_then(|v| v.get(i).cloned());
+                ExtractedInstanceField {
+                    name: fname,
+                    params: Vec::new(),
+                    line: first.line,
+                    col: first.col,
+                    rhs_tokens: ch,
+                }
+            })
+            .collect();
+    }
+
+    // Inline `where f := ...; g := ...`
+    let semi_chunks = split_top_level_delim(body, &[";"]);
+    let mut inline_fields = Vec::new();
+    for ch in &semi_chunks {
+        if let Some(f) = parse_field_assignment_chunk(ch) {
+            inline_fields.push(f);
+        }
+    }
+    if !inline_fields.is_empty() {
+        return inline_fields;
+    }
+
+    let first = &body[0];
+    vec![ExtractedInstanceField {
+        name: class_field_names.and_then(|v| v.first().cloned()),
+        params: Vec::new(),
+        rhs_tokens: body.clone(),
+        line: first.line,
+        col: first.col,
+    }]
+}
+
+/// Strip leading `fun x y =>` / `λ x y =>` binders and collect introduced parameter names.
+fn strip_leading_lambdas<'a>(
+    tokens: &'a [LeanToken],
+    bound_params: &mut HashSet<String>,
+) -> &'a [LeanToken] {
+    let mut slice = tokens;
+    loop {
+        let is_fun = slice.first().is_some_and(|t| {
+            matches!(&t.kind, LeanTokenKind::Ident(s) if s == "fun" || s == "λ")
+                || matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "λ")
+        });
+        if !is_fun {
+            break;
+        }
+        let mut depth = 0isize;
+        let mut arrow_pos = None;
+        for (idx, tok) in slice.iter().enumerate().skip(1) {
+            match &tok.kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                LeanTokenKind::Symbol(s) if (s == "=>" || s == "↦") && depth == 0 => {
+                    arrow_pos = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(ap) = arrow_pos else {
+            break;
+        };
+        // Collect bound identifiers before `:` inside binder groups or bare identifiers
+        let mut i = 1usize;
+        while i < ap {
+            match &slice[i].kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
+                    let open = s.as_str();
+                    let close = match open {
+                        "(" => ")",
+                        "[" => "]",
+                        _ => "}",
+                    };
+                    let mut d = 1usize;
+                    i += 1;
+                    let mut seen_colon = false;
+                    while i < ap && d > 0 {
+                        match &slice[i].kind {
+                            LeanTokenKind::Symbol(o) if o == open => d += 1,
+                            LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                            LeanTokenKind::Symbol(col) if col == ":" && d == 1 => {
+                                seen_colon = true;
+                            }
+                            LeanTokenKind::Ident(id) if d == 1 && !seen_colon && id != "_" => {
+                                bound_params.insert(id.clone());
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                LeanTokenKind::Ident(id) if id != "_" => {
+                    bound_params.insert(id.clone());
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if ap + 1 >= slice.len() {
+            break;
+        }
+        slice = &slice[ap + 1..];
+    }
+    slice
+}
+
+/// Strip leading `by`, `intro ...;`, `intros ...;`, `exact` so tactic-wrapped 1–3 line cosplay
+/// is inspected on equal footing with term-mode cosplay.
+fn strip_leading_trivial_tactics<'a>(
+    tokens: &'a [LeanToken],
+    bound_params: &mut HashSet<String>,
+) -> &'a [LeanToken] {
+    let mut slice = tokens;
+    if slice
+        .first()
+        .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Ident(s) if s == "by"))
+    {
+        slice = &slice[1..];
+    }
+    loop {
+        let Some(first) = slice.first() else {
+            break;
+        };
+        match &first.kind {
+            LeanTokenKind::Ident(s) if s == "intro" || s == "intros" => {
+                let intro_line = first.line;
+                let mut i = 1usize;
+                while i < slice.len() {
+                    if matches!(&slice[i].kind, LeanTokenKind::Symbol(sym) if sym == ";") {
+                        i += 1;
+                        break;
+                    }
+                    if slice[i].first_on_line && slice[i].line > intro_line {
+                        break;
+                    }
+                    if let LeanTokenKind::Ident(id) = &slice[i].kind {
+                        if id != "_" {
+                            bound_params.insert(id.clone());
+                        }
+                    }
+                    i += 1;
+                }
+                slice = &slice[i..];
+            }
+            LeanTokenKind::Ident(s) if s == "exact" || s == "apply" => {
+                slice = &slice[1..];
+            }
+            LeanTokenKind::Symbol(s) if s == ";" => {
+                slice = &slice[1..];
+            }
+            _ => break,
+        }
+    }
+    slice
+}
+
+fn classify_obligation_field_cosplay(
+    field_name: Option<&str>,
+    rhs_tokens: &[LeanToken],
+    initial_bound: &HashSet<String>,
+) -> Option<&'static str> {
+    if rhs_tokens.is_empty() {
+        return None;
+    }
+    let first_line = rhs_tokens.first()?.line;
+    let last_line = rhs_tokens.last()?.line;
+    let line_span = last_line.saturating_sub(first_line) + 1;
+    if line_span > 3 {
+        return None;
+    }
+
+    let mut bound = initial_bound.clone();
+    let after_lam = strip_leading_lambdas(rhs_tokens, &mut bound);
+    let core = strip_leading_trivial_tactics(after_lam, &mut bound);
+    let core = strip_leading_lambdas(core, &mut bound);
+    if core.is_empty() {
+        return None;
+    }
+
+    // 1. Vacuous `False` predicate (`Fragment := fun _ => False` or `:= False`)
+    if core.len() == 1 {
+        if let LeanTokenKind::Ident(id) = &core[0].kind {
+            let short = id.rsplit('.').next().unwrap_or(id.as_str());
+            if short == "False" {
+                return Some("vacuous `False` predicate (`fun _ => False`)");
+            }
+            if matches!(short, "false")
+                && !std::ptr::eq(after_lam, rhs_tokens)
+                && field_name.is_some_and(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.contains("fragment")
+                        || l.contains("valid")
+                        || l.contains("supported")
+                        || l.contains("pred")
+                })
+            {
+                return Some("vacuous `false` fragment predicate (`fun _ => false`)");
+            }
+        }
+    }
+
+    // 2. Trivial `True` witness (`fun _ => trivial`, `trivial`, `True.intro`)
+    if core.iter().all(|t| match &t.kind {
+        LeanTokenKind::Ident(id) => matches!(id.as_str(), "trivial" | "True.intro"),
+        LeanTokenKind::Symbol(s) => matches!(s.as_str(), "(" | ")" | "⟨" | "⟩"),
+        _ => false,
+    }) && core.iter().any(|t| {
+        matches!(&t.kind, LeanTokenKind::Ident(id) if matches!(id.as_str(), "trivial" | "True.intro"))
+    }) {
+        return Some("trivial `True` witness (`fun _ => trivial` / `True.intro`)");
+    }
+
+    // 3. 1–3 line definitional reflexivity cosplay (`rfl`, `Eq.refl`, `Eq.rfl`, `Iff.rfl`, `HEq.rfl`)
+    let is_refl_ident = |id: &str| {
+        matches!(
+            id,
+            "rfl" | "Eq.refl" | "Eq.rfl" | "Iff.rfl" | "Iff.refl" | "HEq.rfl" | "HEq.refl"
+        )
+    };
+    let has_refl = core
+        .iter()
+        .any(|t| matches!(&t.kind, LeanTokenKind::Ident(id) if is_refl_ident(id)));
+    if has_refl {
+        let only_refl_and_args = core.iter().all(|t| match &t.kind {
+            LeanTokenKind::Ident(id) => {
+                if is_refl_ident(id) || id == "_" {
+                    true
+                } else {
+                    let root = id.split('.').next().unwrap_or(id.as_str());
+                    bound.contains(id.as_str()) || bound.contains(root)
+                }
+            }
+            LeanTokenKind::Symbol(_) => true,
+            _ => false,
+        });
+        if only_refl_and_args {
+            return Some("1–3 line reflexivity cosplay (`rfl` / `Eq.refl`)");
+        }
+    }
+
+    // Helper: detect substantive domain theorem calls (anything outside bound vars, projections, and shallow rewriting tactics)
+    let is_shallow_helper_or_tactic = |id: &str| -> bool {
+        matches!(
+            id,
+            "_"
+                | "by"
+                | "intro"
+                | "intros"
+                | "exact"
+                | "apply"
+                | "rw"
+                | "simp"
+                | "simpa"
+                | "dsimp"
+                | "unfold"
+                | "at"
+                | "using"
+                | "only"
+                | "fun"
+                | "congr"
+                | "congrArg"
+                | "congrFun"
+                | "congrArg₂"
+                | "Bool.and_eq_true"
+                | "Bool.and_eq_true_iff"
+                | "and_eq_true"
+                | "And.left"
+                | "And.right"
+                | "Prod.fst"
+                | "Prod.snd"
+                | "PProd.fst"
+                | "PProd.snd"
+                | "Subtype.property"
+                | "Subtype.val"
+                | "Iff.mp"
+                | "Iff.mpr"
+                | "Eq.mp"
+                | "Eq.mpr"
+                | "Eq.symm"
+                | "Eq.trans"
+                | "id"
+        )
+    };
+    let is_domain_theorem_ident = |id: &str| -> bool {
+        let short = id.rsplit('.').next().unwrap_or(id);
+        let lower = short.to_ascii_lowercase();
+        lower.ends_with("_sound")
+            || lower.ends_with("_complete")
+            || lower.ends_with("_correct")
+            || lower.ends_with("_verified")
+            || lower.ends_with("_injective")
+            || lower.ends_with("_binding")
+            || lower.ends_with("_preserves")
+            || id == "induction"
+            || id == "omega"
+    };
+
+    // 4. 1–3 line `congrArg` / `congrFun` / `congr` determinism cosplay
+    let has_congr = core.iter().any(|t| {
+        matches!(
+            &t.kind,
+            LeanTokenKind::Ident(id)
+                if matches!(id.as_str(), "congrArg" | "congrFun" | "congrArg₂" | "congr")
+        )
+    });
+    if has_congr
+        && !core
+            .iter()
+            .any(|t| matches!(&t.kind, LeanTokenKind::Ident(id) if is_domain_theorem_ident(id)))
+    {
+        return Some("1–3 line `congrArg`/`congr` determinism cosplay");
+    }
+
+    // 5. 1–3 line `Bool.and_eq_true` boolean-arm unpacking cosplay
+    let has_bool_and_unpack = rhs_tokens.iter().any(|t| {
+        matches!(&t.kind, LeanTokenKind::Ident(id) if id == "Bool.and_eq_true"
+            || id == "Bool.and_eq_true_iff"
+            || id.starts_with("Bool.and_eq_true."))
+    });
+    if has_bool_and_unpack
+        && !core
+            .iter()
+            .any(|t| matches!(&t.kind, LeanTokenKind::Ident(id) if is_domain_theorem_ident(id)))
+    {
+        return Some("1–3 line `Bool.and_eq_true` boolean-conjunction projection cosplay");
+    }
+
+    // 6. 1–3 line `And.left` / `And.right` / `.left` / `.right` / `.1` / `.2` / `Prod.fst` / `Prod.snd` projection cosplay
+    let mut has_proj_op = false;
+    let mut has_external_call = false;
+    for (idx, tok) in core.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Ident(id) => {
+                if matches!(
+                    id.as_str(),
+                    "And.left" | "And.right" | "Prod.fst" | "Prod.snd" | "PProd.fst" | "PProd.snd"
+                ) || id.ends_with(".left")
+                    || id.ends_with(".right")
+                    || id.ends_with(".fst")
+                    || id.ends_with(".snd")
+                {
+                    has_proj_op = true;
+                }
+                let root = id.split('.').next().unwrap_or(id.as_str());
+                if !bound.contains(id.as_str())
+                    && !bound.contains(root)
+                    && !is_shallow_helper_or_tactic(id.as_str())
+                {
+                    // Note: `(expr).mp` where `id` is `Bool.and_eq_true.mp` already handled above;
+                    // any other unbound identifier is an external lemma/theorem call!
+                    has_external_call = true;
+                }
+            }
+            LeanTokenKind::Symbol(s)
+                if matches!(s.as_str(), ".left" | ".right" | ".fst" | ".snd") =>
+            {
+                has_proj_op = true;
+            }
+            LeanTokenKind::Symbol(s) if s == "." => {
+                if let Some(LeanToken {
+                    kind: LeanTokenKind::NatLit(n),
+                    ..
+                }) = core.get(idx + 1)
+                {
+                    if n == "1" || n == "2" {
+                        has_proj_op = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if has_proj_op && !has_external_call {
+        return Some("1–3 line `And.left`/`And.right` projection cosplay");
+    }
+
+    None
+}
+
+/// 2026 Obligation Instance Anti-Cosplay Rule (`lean/obligation-projection-cosplay`):
+/// Flags `instance ... *Obligations` or `HypothesisLedger` (or `@[obb_obligation]` / `extends HypothesisLedger`)
+/// fields whose bodies are 1–3 line projection/determinism/vacuity cosplay (`rfl`, `congrArg`,
+/// `Bool.and_eq_true`, `And.left`/`And.right`, `fun _ => trivial`, `Fragment := fun _ => False`).
+fn check_obligation_projection_cosplay(
+    file: &ParsedLeanFile,
+    decl: &ParsedLeanDecl,
+    obligation_classes: &HashSet<String>,
+    obligation_class_fields: &HashMap<String, Vec<String>>,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(target_head) = instance_target_head_class(&decl.type_tokens) else {
+        return;
+    };
+    let short_head = target_head.rsplit('.').next().unwrap_or(target_head.as_str());
+    let is_obl_instance = obligation_classes.contains(&target_head)
+        || obligation_classes.contains(short_head)
+        || is_obligation_class_name(&target_head)
+        || decl.attributes.iter().any(|a| a == "obb_obligation");
+    if !is_obl_instance {
+        return;
+    }
+
+    let class_fnames = obligation_class_fields
+        .get(&target_head)
+        .or_else(|| obligation_class_fields.get(short_head));
+    let extracted_fields = extract_instance_fields(decl, class_fnames);
+
+    let mut base_bound: HashSet<String> = HashSet::new();
+    for sv in &file.section_variables {
+        if !sv.is_underscore && sv.name != "_" {
+            base_bound.insert(sv.name.clone());
+        }
+    }
+    for b in &decl.binders {
+        if !b.is_underscore && b.name != "_" {
+            base_bound.insert(b.name.clone());
+        }
+    }
+
+    for ef in extracted_fields {
+        let mut field_bound = base_bound.clone();
+        for p in &ef.params {
+            if p != "_" {
+                field_bound.insert(p.clone());
+            }
+        }
+        if let Some(reason) =
+            classify_obligation_field_cosplay(ef.name.as_deref(), &ef.rhs_tokens, &field_bound)
+        {
+            let field_label = ef.name.as_deref().unwrap_or("<body_witness>");
+            findings.push(Finding {
+                rule_id: "lean/obligation-projection-cosplay".to_string(),
+                severity: Severity::Error,
+                artifact_kind: ArtifactKind::P,
+                max_regime: Regime::Attested,
+                sink: Some(Sink::Theater),
+                path: file.rel_path.clone(),
+                line: ef.line,
+                column: ef.col,
+                symbol: Some(format!("{}.{}", decl.fq_name, field_label)),
+                message: format!(
+                    "Obligation instance `{}` (`{target_head}`) discharges field `{field_label}` via {reason} (`{}`)",
+                    decl.fq_name,
+                    render_tokens_compact(&ef.rhs_tokens)
+                ),
+                remediation: "Replace 1–3 line projection/determinism/vacuity cosplay (`rfl`, `congrArg`, `Bool.and_eq_true`, `And.left`/`And.right`, `fun _ => trivial`, `Fragment := fun _ => False`) with a substantive domain soundness theorem over a non-empty fragment.".to_string(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lean_index::build_lean_index;
+    use std::fs;
+
+    #[test]
+    fn obligation_projection_cosplay_unit_planted_faults_and_clean_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let lean_dir = dir.path().join("lean/Obend/Crypto");
+        fs::create_dir_all(&lean_dir).unwrap();
+        fs::write(
+            lean_dir.join("CanopyCosplay.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+class HypothesisLedger
+
+structure PCS where
+  digest : Nat
+
+def hashPCS (p : PCS) : Nat := p.digest
+def bothTrue (a b : Bool) : Bool := a && b
+
+class CanopyPCSObligations (C : Type) where
+  Fragment : C → Prop
+  refl_cosplay : ∀ (x : C), x = x
+  congr_cosplay : ∀ (a b : PCS), a = b → hashPCS a = hashPCS b
+  bool_cosplay : ∀ (a b : Bool), bothTrue a b = true → a = true
+  and_left_cosplay : ∀ (P Q : Prop), P ∧ Q → P
+  and_right_tactic : ∀ (P Q : Prop), P ∧ Q → Q
+  trivial_witness : C → True
+
+class LedgerBridge (C : Type) extends HypothesisLedger where
+  anon_rfl : ∀ (x : C), x = x
+
+instance badCanopy : CanopyPCSObligations PCS where
+  Fragment := fun _ => False
+  refl_cosplay := fun _ => rfl
+  congr_cosplay := fun _ _ h => congrArg hashPCS h
+  bool_cosplay := by
+    intro a b h
+    exact ((Bool.and_eq_true _ _).mp h).1
+  and_left_cosplay := fun _ _ h => And.left h
+  and_right_tactic := by
+    intro _ _ h
+    exact And.right h
+  trivial_witness := fun _ => trivial
+
+instance badAnonBridge : LedgerBridge PCS := ⟨fun _ => rfl⟩
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        let idx = build_lean_index(dir.path());
+        let (findings, _) = run_lean_lints(&idx);
+        let cosplay: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "lean/obligation-projection-cosplay")
+            .collect();
+        assert_eq!(
+            cosplay.len(),
+            8,
+            "all 8 planted cosplay fields (7 where-fields + 1 anonymous ⟨...⟩ field) must fire: {cosplay:#?}"
+        );
+
+        // Positive control: substantive theorem-backed instance
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean_lean = clean_dir.path().join("lean/Obend/Crypto");
+        fs::create_dir_all(&clean_lean).unwrap();
+        fs::write(
+            clean_lean.join("CanopyReal.lean"),
+            r#"module
+public section
+namespace Obend.Crypto
+
+structure PCS where
+  digest : Nat
+
+def NonTrivialPCS (p : PCS) : Prop := p.digest > 0
+
+theorem pcs_digest_nonneg (p : PCS) : p.digest >= 0 :=
+  Nat.zero_le p.digest
+
+class CanopyPCSObligations (C : Type) where
+  Fragment : C → Prop
+  digest_nonneg : ∀ (p : PCS), p.digest >= 0
+
+instance goodCanopy : CanopyPCSObligations PCS where
+  Fragment := NonTrivialPCS
+  digest_nonneg p := pcs_digest_nonneg p
+
+end Obend.Crypto
+"#,
+        )
+        .unwrap();
+
+        let clean_idx = build_lean_index(clean_dir.path());
+        let (clean_findings, _) = run_lean_lints(&clean_idx);
+        assert!(
+            clean_findings
+                .iter()
+                .all(|f| f.rule_id != "lean/obligation-projection-cosplay"),
+            "clean theorem-backed instance must produce 0 cosplay findings: {clean_findings:#?}"
+        );
     }
 }

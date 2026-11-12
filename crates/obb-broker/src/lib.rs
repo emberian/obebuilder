@@ -580,6 +580,8 @@ pub struct HostBuildBatch {
     pub host: String,
     pub lake_targets: Vec<String>,
     pub workload_classes: Vec<TargetWorkloadClass>,
+    #[serde(default)]
+    pub target_commit: Option<String>,
     pub seed_key: String,
     pub seed_pool_dir: String,
     pub timeout_secs: u64,
@@ -597,6 +599,8 @@ pub struct BuildPlanOptions {
     pub dry_run: bool,
     pub exec: bool,
     pub repo_root: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub target_commit: Option<String>,
     pub remote_seed_root: Option<String>,
 }
 
@@ -604,6 +608,8 @@ pub struct BuildPlanOptions {
 pub struct BuildPlanReport {
     pub generated_at: String,
     pub host_choice: HostChoice,
+    #[serde(default)]
+    pub target_commit: Option<String>,
     pub seed_key: String,
     pub timeout_secs: u64,
     pub max_rss_gb: u64,
@@ -614,28 +620,102 @@ pub struct BuildPlanReport {
     pub warnings: Vec<String>,
 }
 
-fn resolve_git_seed_key(repo_root: Option<&Path>) -> String {
-    let Some(root) = repo_root else {
-        return "head-default".to_string();
-    };
-    // Prefer `HEAD:lean` tree SHA so pure docs/Rust edits reuse the exact same warm `.olean` seed!
-    for rev in ["HEAD:lean", "HEAD"] {
-        if let Ok(out) = Command::new("git")
-            .arg("--no-optional-locks")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", rev])
-            .output()
-        {
-            if out.status.success() {
-                let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if sha.len() >= 12 {
-                    return sha;
-                }
+#[derive(Debug, Clone)]
+struct ResolvedGitRevisions {
+    target_commit: Option<String>,
+    seed_key: String,
+    dirty_warning: Option<String>,
+}
+
+fn git_rev_parse(root: &Path, rev: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", rev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.len() >= 12 { Some(sha) } else { None }
+}
+
+fn resolve_git_revisions(
+    repo_root: Option<&Path>,
+    explicit_commit: Option<&str>,
+) -> Result<ResolvedGitRevisions> {
+    let cleaned_explicit = explicit_commit
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(root) = repo_root {
+        let rev_base = cleaned_explicit.unwrap_or("HEAD");
+        let commit_sha = git_rev_parse(root, &format!("{rev_base}^{{commit}}"));
+        if let Some(exp) = cleaned_explicit {
+            if commit_sha.is_none() {
+                bail!(
+                    "explicit `--commit {exp}` could not be resolved in local repository `{}`",
+                    root.display()
+                );
             }
         }
+        // Prefer `<rev>:lean` tree SHA so pure docs/Rust edits reuse the exact same warm `.olean` seed!
+        let seed_key = git_rev_parse(root, &format!("{rev_base}:lean"))
+            .or_else(|| commit_sha.clone())
+            .unwrap_or_else(|| "head-default".to_string());
+
+        let dirty_warning = if cleaned_explicit.is_none() && commit_sha.is_some() {
+            Command::new("git")
+                .arg("--no-optional-locks")
+                .arg("-C")
+                .arg(root)
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    if s.lines().any(|l| !l.trim().is_empty()) {
+                        Some(format!(
+                            "Local worktree `{}` has uncommitted modifications; remote recipe checks out exact commit `{}` (commit & push changes first so remote matches local edits).",
+                            root.display(),
+                            commit_sha.as_deref().unwrap_or("HEAD")
+                        ))
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
+        return Ok(ResolvedGitRevisions {
+            target_commit: commit_sha,
+            seed_key,
+            dirty_warning,
+        });
     }
-    "head-default".to_string()
+
+    if let Some(exp) = cleaned_explicit {
+        if !exp.chars().all(|c| c.is_ascii_hexdigit()) || exp.len() < 7 {
+            bail!(
+                "explicit `--commit {exp}` without `--repo` must be a hexadecimal commit SHA (>= 7 chars)"
+            );
+        }
+        return Ok(ResolvedGitRevisions {
+            target_commit: Some(exp.to_string()),
+            seed_key: exp.to_string(),
+            dirty_warning: None,
+        });
+    }
+
+    Ok(ResolvedGitRevisions {
+        target_commit: None,
+        seed_key: "head-default".to_string(),
+        dirty_warning: None,
+    })
 }
 
 fn default_seed_pool_for_host(host: &str) -> String {
@@ -646,15 +726,37 @@ fn default_seed_pool_for_host(host: &str) -> String {
     }
 }
 
-/// Emit the safe remote execution recipe for one host batch:
-/// 1. Isolated per-invocation worktree + PID file
-/// 2. `EXIT INT TERM` process-tree reaper (`pkill -TERM/-KILL -P $$`)
-/// 3. Git-tree-keyed hardlink `.olean` + `.ir` seeding (`cp -al`)
-/// 4. `timeout --kill-after=10s <timeout>s` + `SWARM_MEM_MAX=<N>G swarm-build` (with `ulimit -v` fallback)
-/// 5. Atomic refresh of warm `.olean` seed cache on green exit
+/// Backwards-compatible wrapper around [`render_safe_remote_recipe_for_commit`] without an explicit commit pin.
 pub fn render_safe_remote_recipe(
     host: &str,
     lake_targets: &[String],
+    seed_key: &str,
+    seed_pool_dir: &str,
+    timeout_secs: u64,
+    max_rss_gb: u64,
+) -> (String, String) {
+    render_safe_remote_recipe_for_commit(
+        host,
+        lake_targets,
+        None,
+        seed_key,
+        seed_pool_dir,
+        timeout_secs,
+        max_rss_gb,
+    )
+}
+
+/// Emit the safe remote execution recipe for one host batch:
+/// 1. Isolated per-invocation worktree + external PID file
+/// 2. `EXIT INT TERM` process-group & session reaper (`setsid` PGID + `kill -- -$$` + `pkill -P $$`)
+/// 3. Exact target commit sync (`git fetch` + `git checkout --detach <exact_sha>`) & `HEAD:lean` tree verification
+/// 4. Safe CoW/copied `.olean` + `.ir` seeding (`cp -R --reflink=auto`, never shared writable `cp -al` inodes!)
+/// 5. `timeout --kill-after=10s <timeout>s` + `swarm-build` / `systemd-run --user --scope` / `setsid` `ulimit -v`
+/// 6. Read-only sealed (`chmod -R a-w`) atomic refresh of warm `.olean` seed cache on green exit
+pub fn render_safe_remote_recipe_for_commit(
+    host: &str,
+    lake_targets: &[String],
+    target_commit: Option<&str>,
     seed_key: &str,
     seed_pool_dir: &str,
     timeout_secs: u64,
@@ -665,43 +767,83 @@ pub fn render_safe_remote_recipe(
     let ulimit_kb = max_rss_gb.saturating_mul(1_048_576);
     let short_key = &seed_key[..seed_key.len().min(12)];
     let base_repo = "$HOME/obend/repo";
+    let commit_pin = target_commit.unwrap_or("");
 
     let recipe = format!(
         r#"set -euo pipefail
-# Host: {host} | Seed key: {seed_key}
+# Host: {host} | Target commit: {commit_pin} | Seed key: {seed_key}
 SEED_POOL="{seed_pool_dir}"
 SEED_KEY="{seed_key}"
-BASE_REPO="{base_repo}"
+TARGET_COMMIT="{commit_pin}"
+BASE_REPO="${{OBB_BASE_REPO:-{base_repo}}}"
 WORK_ROOT="${{OBB_WORK_ROOT:-/tmp/obb-worktrees}}"
 mkdir -p "$WORK_ROOT" "$SEED_POOL"
 WT_DIR="$WORK_ROOT/wt-{short_key}-$$"
-PID_FILE="$WT_DIR/.obb-build.pid"
+PID_FILE="$WORK_ROOT/.obb-build-{short_key}-$$.pid"
+BUILD_PGID=""
+echo "$$" > "$PID_FILE"
 
 cleanup_obb_build() {{
   local ec=$?
-  trap - EXIT INT TERM
+  trap '' INT TERM
+  trap - EXIT
+  if [ -n "${{BUILD_PGID:-}}" ]; then
+    kill -TERM -- "-$BUILD_PGID" 2>/dev/null || true
+  fi
+  kill -TERM -- -$$ 2>/dev/null || true
   pkill -TERM -P $$ 2>/dev/null || true
   sleep 0.2 || true
+  if [ -n "${{BUILD_PGID:-}}" ]; then
+    kill -KILL -- "-$BUILD_PGID" 2>/dev/null || true
+  fi
   pkill -KILL -P $$ 2>/dev/null || true
   rm -f "$PID_FILE" 2>/dev/null || true
-  if [ -d "$BASE_REPO/.git" ] && [ -d "$WT_DIR" ]; then
-    git -C "$BASE_REPO" worktree remove --force "$WT_DIR" 2>/dev/null || rm -rf "$WT_DIR"
-  else
-    rm -rf "$WT_DIR" 2>/dev/null || true
+  if [ -d "$WT_DIR" ]; then
+    chmod -R u+w "$WT_DIR" 2>/dev/null || true
+    if [ -d "$BASE_REPO/.git" ]; then
+      git -C "$BASE_REPO" worktree remove --force "$WT_DIR" 2>/dev/null || rm -rf "$WT_DIR"
+    else
+      rm -rf "$WT_DIR" 2>/dev/null || true
+    fi
   fi
   exit "$ec"
 }}
 trap cleanup_obb_build EXIT INT TERM
 
 if [ -d "$BASE_REPO/.git" ]; then
-  git -C "$BASE_REPO" worktree add --detach "$WT_DIR" HEAD >/dev/null
+  if [ -n "$TARGET_COMMIT" ]; then
+    if ! git -C "$BASE_REPO" cat-file -e "${{TARGET_COMMIT}}^{{commit}}" 2>/dev/null; then
+      git -C "$BASE_REPO" fetch --no-tags --quiet --all --prune
+    fi
+    if ! git -C "$BASE_REPO" cat-file -e "${{TARGET_COMMIT}}^{{commit}}" 2>/dev/null; then
+      echo "ERROR: target commit $TARGET_COMMIT is missing on remote {host} after git fetch; push exact SHA before building." >&2
+      exit 65
+    fi
+    git -C "$BASE_REPO" worktree add --detach "$WT_DIR" "$TARGET_COMMIT" >/dev/null
+    git -C "$WT_DIR" checkout --detach --force "$TARGET_COMMIT" >/dev/null
+  else
+    git -C "$BASE_REPO" fetch --no-tags --quiet --all --prune 2>/dev/null || true
+    ORIGIN_SHA="$(git -C "$BASE_REPO" rev-parse --verify origin/HEAD^{{commit}} 2>/dev/null \
+      || git -C "$BASE_REPO" rev-parse --verify origin/dev^{{commit}} 2>/dev/null \
+      || git -C "$BASE_REPO" rev-parse --verify origin/main^{{commit}} 2>/dev/null \
+      || git -C "$BASE_REPO" rev-parse --verify FETCH_HEAD^{{commit}} 2>/dev/null \
+      || git -C "$BASE_REPO" rev-parse --verify HEAD^{{commit}})"
+    git -C "$BASE_REPO" worktree add --detach "$WT_DIR" "$ORIGIN_SHA" >/dev/null
+    git -C "$WT_DIR" checkout --detach --force "$ORIGIN_SHA" >/dev/null
+  fi
+  if [ "$SEED_KEY" != "head-default" ]; then
+    REMOTE_TREE="$(git -C "$WT_DIR" rev-parse --verify HEAD:lean 2>/dev/null || git -C "$WT_DIR" rev-parse --verify HEAD^{{commit}})"
+    if [ "$REMOTE_TREE" != "$SEED_KEY" ]; then
+      echo "ERROR: remote checkout tree ($REMOTE_TREE) does not match local seed_key ($SEED_KEY)" >&2
+      exit 66
+    fi
+  fi
 else
   mkdir -p "$WT_DIR/lean"
 fi
 mkdir -p "$WT_DIR/lean/.lake/build"
-echo "$$" > "$PID_FILE"
 
-# Hardlink-seed (`cp -al`) warm `.lake/build/{{lib,ir}}` from git-tree-keyed cache (fallback to `latest`)
+# Safe CoW/copy `.lake/build/{{lib,ir}}` from immutable git-tree-keyed seed pool (never shared writable hardlink inodes)
 SEED_SRC=""
 if [ -d "$SEED_POOL/$SEED_KEY/.lake/build/lib" ]; then
   SEED_SRC="$SEED_POOL/$SEED_KEY/.lake/build"
@@ -711,30 +853,61 @@ fi
 if [ -n "$SEED_SRC" ]; then
   for sub in lib ir; do
     if [ -d "$SEED_SRC/$sub" ]; then
-      cp -al "$SEED_SRC/$sub" "$WT_DIR/lean/.lake/build/"
+      cp -R --reflink=auto --preserve=timestamps "$SEED_SRC/$sub" "$WT_DIR/lean/.lake/build/" 2>/dev/null \
+        || cp -R "$SEED_SRC/$sub" "$WT_DIR/lean/.lake/build/"
+      chmod -R u+w "$WT_DIR/lean/.lake/build/$sub"
     fi
   done
 fi
 
 cd "$WT_DIR/lean"
 if command -v swarm-build >/dev/null 2>&1; then
-  SWARM_MEM_MAX="{max_rss_gb}G" swarm-build timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd}
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash -c 'SWARM_MEM_MAX="{max_rss_gb}G" exec swarm-build timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd}' &
+    BUILD_PGID=$!
+    wait "$BUILD_PGID"
+  else
+    set -m
+    ( SWARM_MEM_MAX="{max_rss_gb}G" exec swarm-build timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd} ) &
+    BUILD_PGID=$!
+    set +m
+    wait "$BUILD_PGID"
+  fi
+elif command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope true >/dev/null 2>&1; then
+  if command -v setsid >/dev/null 2>&1; then
+    setsid systemd-run --user --scope --quiet -p MemoryMax={max_rss_gb}G timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd} &
+    BUILD_PGID=$!
+    wait "$BUILD_PGID"
+  else
+    systemd-run --user --scope --quiet -p MemoryMax={max_rss_gb}G timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd}
+  fi
+elif command -v setsid >/dev/null 2>&1; then
+  setsid bash -c "ulimit -v {ulimit_kb} 2>/dev/null || true; exec timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd}" &
+  BUILD_PGID=$!
+  wait "$BUILD_PGID"
 else
-  ( ulimit -v {ulimit_kb}; exec timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd} )
+  set -m
+  ( ulimit -v {ulimit_kb} 2>/dev/null || true; if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=10s {timeout_secs}s {batched_lake_cmd}; else exec {batched_lake_cmd}; fi ) &
+  BUILD_PGID=$!
+  set +m
+  wait "$BUILD_PGID"
 fi
 
-# Refresh git-tree-keyed `.olean` seed pool atomically for downstream swarm lanes
+# Refresh git-tree-keyed `.olean` seed pool atomically with read-only sealed artifacts
 STAGE_SEED="$SEED_POOL/.stage-$SEED_KEY-$$"
 rm -rf "$STAGE_SEED"
 mkdir -p "$STAGE_SEED/.lake/build"
 for sub in lib ir; do
   if [ -d "$WT_DIR/lean/.lake/build/$sub" ]; then
-    cp -al "$WT_DIR/lean/.lake/build/$sub" "$STAGE_SEED/.lake/build/"
+    cp -R --reflink=auto --preserve=timestamps "$WT_DIR/lean/.lake/build/$sub" "$STAGE_SEED/.lake/build/" 2>/dev/null \
+      || cp -R "$WT_DIR/lean/.lake/build/$sub" "$STAGE_SEED/.lake/build/"
   fi
 done
+chmod -R a-w "$STAGE_SEED/.lake/build" 2>/dev/null || true
 if [ ! -d "$SEED_POOL/$SEED_KEY" ]; then
-  mv "$STAGE_SEED" "$SEED_POOL/$SEED_KEY" 2>/dev/null || rm -rf "$STAGE_SEED"
+  mv "$STAGE_SEED" "$SEED_POOL/$SEED_KEY" 2>/dev/null || (chmod -R u+w "$STAGE_SEED" 2>/dev/null || true; rm -rf "$STAGE_SEED")
 else
+  chmod -R u+w "$STAGE_SEED" 2>/dev/null || true
   rm -rf "$STAGE_SEED"
 fi
 ln -sfn "$SEED_POOL/$SEED_KEY" "$SEED_POOL/latest"
@@ -867,7 +1040,12 @@ pub fn plan_build(
         });
     }
 
-    let seed_key = resolve_git_seed_key(opts.repo_root.as_deref());
+    let resolved = resolve_git_revisions(opts.repo_root.as_deref(), opts.target_commit.as_deref())?;
+    if let Some(dw) = resolved.dirty_warning {
+        warnings.push(dw);
+    }
+    let seed_key = resolved.seed_key;
+    let target_commit = resolved.target_commit;
     let mut batches = Vec::with_capacity(grouped.len());
 
     for (host, (lake_targets, workload_classes)) in grouped {
@@ -875,9 +1053,10 @@ pub fn plan_build(
             .remote_seed_root
             .clone()
             .unwrap_or_else(|| default_seed_pool_for_host(&host));
-        let (batched_lake_command, remote_recipe) = render_safe_remote_recipe(
+        let (batched_lake_command, remote_recipe) = render_safe_remote_recipe_for_commit(
             &host,
             &lake_targets,
+            target_commit.as_deref(),
             &seed_key,
             &seed_pool_dir,
             opts.timeout_secs,
@@ -901,6 +1080,7 @@ pub fn plan_build(
             host,
             lake_targets,
             workload_classes,
+            target_commit: target_commit.clone(),
             seed_key: seed_key.clone(),
             seed_pool_dir,
             timeout_secs: opts.timeout_secs,
@@ -914,6 +1094,7 @@ pub fn plan_build(
     Ok(BuildPlanReport {
         generated_at: Utc::now().to_rfc3339(),
         host_choice: opts.host_choice,
+        target_commit,
         seed_key,
         timeout_secs: opts.timeout_secs,
         max_rss_gb: opts.max_rss_gb,

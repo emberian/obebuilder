@@ -8,7 +8,7 @@ use obb_judge::SuccessionRecord;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -67,6 +67,17 @@ pub enum StateRefusal {
         expected_mode: String,
         actual_mode: String,
     },
+
+    #[error("LedgerAppendFailed: failed to append `{event_type}` for `{entity_id}` to `{path}`: {reason}")]
+    LedgerAppendFailed {
+        event_type: String,
+        entity_id: String,
+        path: String,
+        reason: String,
+    },
+
+    #[error("StorageError: {0}")]
+    StorageError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +179,8 @@ pub struct LedgerEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub workspace_root: String,
+    #[serde(default)]
+    pub state_dir: String,
     pub scheduler_paused: bool,
     pub pause_reasons: Vec<String>,
     pub campaigns: Vec<CampaignRow>,
@@ -178,9 +191,56 @@ pub struct StateSnapshot {
     pub recent_ledger: Vec<LedgerEvent>,
 }
 
+/// Resolve an out-of-tree state directory so `obb` NEVER pollutes audited git worktrees with `.obb/state.db`:
+/// 1. `OBB_STATE_DIR` environment override (exact directory)
+/// 2. `$XDG_STATE_HOME/obb/<repo_hash>/`
+/// 3. `<obb_workspace>/.obb-state/<repo_hash>/` when `workspace_root` itself is the `obebuilder` workspace (`spec/process.json`)
+/// 4. `$OBB_HOME/.obb-state/<repo_hash>/` if `OBB_HOME` is set
+/// 5. `$HOME/.local/state/obb/<repo_hash>/` (fallback: `<temp_dir>/obb-state/<repo_hash>/`)
+pub fn resolve_default_state_dir(workspace_root: &Path) -> PathBuf {
+    let canon = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let repo_hash = &sha256_hex(canon.to_string_lossy().as_bytes())[..16];
+
+    if let Ok(explicit) = std::env::var("OBB_STATE_DIR") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("obb").join(repo_hash);
+        }
+    }
+    if canon.join("spec/process.json").is_file() {
+        return canon.join(".obb-state").join(repo_hash);
+    }
+    if let Ok(obb_home) = std::env::var("OBB_HOME") {
+        let trimmed = obb_home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".obb-state").join(repo_hash);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed)
+                .join(".local")
+                .join("state")
+                .join("obb")
+                .join(repo_hash);
+        }
+    }
+    std::env::temp_dir().join("obb-state").join(repo_hash)
+}
+
 /// Persistent SQLite + JSONL Statechart Supervisor.
 pub struct StateStore {
     workspace_root: PathBuf,
+    state_dir: PathBuf,
     db_path: PathBuf,
     ledger_path: PathBuf,
     pub spec: ProcessSpec,
@@ -188,6 +248,13 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn open(workspace_root: &Path) -> Result<Self> {
+        Self::open_with_state_dir(workspace_root, None)
+    }
+
+    pub fn open_with_state_dir(
+        workspace_root: &Path,
+        explicit_state_dir: Option<&Path>,
+    ) -> Result<Self> {
         let spec_path = workspace_root.join("spec/process.json");
         let spec = if spec_path.is_file() {
             ProcessSpec::load_from_path(&spec_path)?
@@ -195,24 +262,37 @@ impl StateStore {
             ProcessSpec::embedded_default()?
         };
 
-        let obb_dir = workspace_root.join(".obb");
-        let ledger_dir = workspace_root.join("ledger");
-        fs::create_dir_all(&obb_dir)
-            .with_context(|| format!("failed to create {}", obb_dir.display()))?;
-        fs::create_dir_all(&ledger_dir)
-            .with_context(|| format!("failed to create {}", ledger_dir.display()))?;
+        let state_dir = match explicit_state_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => resolve_default_state_dir(workspace_root),
+        };
+        fs::create_dir_all(&state_dir)
+            .with_context(|| format!("failed to create state directory {}", state_dir.display()))?;
 
-        let db_path = obb_dir.join("state.db");
-        let ledger_path = ledger_dir.join("events.jsonl");
+        let db_path = state_dir.join("state.db");
+        let ledger_path = state_dir.join("events.jsonl");
 
         let store = Self {
             workspace_root: workspace_root.to_path_buf(),
+            state_dir,
             db_path,
             ledger_path,
             spec,
         };
         store.init_schema()?;
         Ok(store)
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn ledger_path(&self) -> &Path {
+        &self.ledger_path
     }
 
     fn conn(&self) -> Result<Connection> {
@@ -344,6 +424,66 @@ impl StateStore {
         Ok(events.len())
     }
 
+    /// Read only the tail entry of `events.jsonl` (seeking near EOF) to obtain `(last_seq, last_event_hash)`
+    /// without re-reading the entire JSONL ledger on every append.
+    fn read_ledger_tail_meta(&self) -> Result<(usize, String)> {
+        if !self.ledger_path.exists() {
+            return Ok((0, "0".repeat(64)));
+        }
+        let mut f = fs::File::open(&self.ledger_path).with_context(|| {
+            format!(
+                "failed to open JSONL ledger at {}",
+                self.ledger_path.display()
+            )
+        })?;
+        let file_len = f.metadata()?.len();
+        if file_len == 0 {
+            return Ok((0, "0".repeat(64)));
+        }
+
+        let mut window: u64 = 65_536;
+        loop {
+            let seek_pos = file_len.saturating_sub(window);
+            f.seek(SeekFrom::Start(seek_pos))?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            let text = String::from_utf8(buf)
+                .context("JSONL ledger tail contains invalid UTF-8")?;
+            let lines: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            if lines.is_empty() {
+                if seek_pos == 0 {
+                    return Ok((0, "0".repeat(64)));
+                }
+            } else if seek_pos == 0 || text.contains('\n') && lines.len() >= 2 || text.starts_with('{') {
+                // Note: if `seek_pos > 0` and only 1 partial line was read without a preceding newline, widen window
+                let last_line = *lines.last().unwrap();
+                if seek_pos == 0 || lines.len() >= 2 || text.starts_with('\n') {
+                    let ev: LedgerEvent = serde_json::from_str(last_line)
+                        .context("corrupt tail JSONL ledger entry")?;
+                    return Ok((ev.seq, ev.event_hash));
+                }
+            }
+            if seek_pos == 0 {
+                let last_line = text
+                    .lines()
+                    .map(str::trim)
+                    .rfind(|l| !l.is_empty())
+                    .unwrap_or("");
+                if last_line.is_empty() {
+                    return Ok((0, "0".repeat(64)));
+                }
+                let ev: LedgerEvent =
+                    serde_json::from_str(last_line).context("corrupt tail JSONL ledger entry")?;
+                return Ok((ev.seq, ev.event_hash));
+            }
+            window = window.saturating_mul(4);
+        }
+    }
+
     pub fn append_ledger(
         &self,
         event_type: &str,
@@ -351,12 +491,8 @@ impl StateStore {
         summary: &str,
         payload: serde_json::Value,
     ) -> Result<LedgerEvent> {
-        let existing = self.read_ledger()?;
-        let seq = existing.len() + 1;
-        let prev_hash = existing
-            .last()
-            .map(|e| e.event_hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
+        let (last_seq, prev_hash) = self.read_ledger_tail_meta()?;
+        let seq = last_seq + 1;
         let timestamp = Utc::now().to_rfc3339();
         let canonical = format!(
             "{}|{}|{}|{}|{}|{}|{}",
@@ -380,12 +516,50 @@ impl StateStore {
             event_hash,
         };
 
+        if let Some(parent) = self.ledger_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create ledger parent directory {}", parent.display())
+            })?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.ledger_path)?;
-        writeln!(file, "{}", serde_json::to_string(&ev)?)?;
+            .open(&self.ledger_path)
+            .with_context(|| {
+                format!(
+                    "failed to open JSONL ledger for append at {}",
+                    self.ledger_path.display()
+                )
+            })?;
+        writeln!(file, "{}", serde_json::to_string(&ev)?).with_context(|| {
+            format!(
+                "failed to write JSONL ledger event to {}",
+                self.ledger_path.display()
+            )
+        })?;
+        file.flush().with_context(|| {
+            format!(
+                "failed to flush JSONL ledger at {}",
+                self.ledger_path.display()
+            )
+        })?;
         Ok(ev)
+    }
+
+    fn append_ledger_or_refuse(
+        &self,
+        event_type: &str,
+        entity_id: &str,
+        summary: &str,
+        payload: serde_json::Value,
+    ) -> std::result::Result<LedgerEvent, StateRefusal> {
+        self.append_ledger(event_type, entity_id, summary, payload)
+            .map_err(|e| StateRefusal::LedgerAppendFailed {
+                event_type: event_type.to_string(),
+                entity_id: entity_id.to_string(),
+                path: self.ledger_path.display().to_string(),
+                reason: format!("{e:#}"),
+            })
     }
 
     pub fn record_lob_succession(&self, rec: &SuccessionRecord) -> Result<LedgerEvent> {
@@ -424,8 +598,9 @@ impl StateStore {
     ) -> Result<CampaignRow> {
         let now = Utc::now().to_rfc3339();
         let initial = self.spec.machines.campaign.initial.clone();
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO campaigns (id, title, state, aim_statement, target_repo, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, title, initial, aim_statement, target_repo, now],
@@ -444,6 +619,7 @@ impl StateStore {
             &format!("Campaign `{title}` initialized in `{initial}`"),
             serde_json::to_value(&row)?,
         )?;
+        tx.commit()?;
         Ok(row)
     }
 
@@ -454,15 +630,20 @@ impl StateStore {
         guard_passed: bool,
         evidence: &str,
     ) -> std::result::Result<CampaignRow, StateRefusal> {
-        let conn = self.conn().expect("sqlite connection");
-        let cur: Option<(String, String, String, String)> = conn
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        let cur: Option<(String, String, String, String)> = tx
             .query_row(
                 "SELECT title, state, aim_statement, target_repo FROM campaigns WHERE id = ?1",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
-            .expect("query campaign");
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
 
         let Some((title, from_state, aim_statement, target_repo)) = cur else {
             return Err(StateRefusal::IllegalTransition {
@@ -492,11 +673,11 @@ impl StateStore {
         }
 
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "UPDATE campaigns SET state = ?1, updated_at = ?2 WHERE id = ?3",
             params![to_state, now, id],
         )
-        .expect("update campaign");
+        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
 
         let updated = CampaignRow {
             id: id.to_string(),
@@ -506,12 +687,14 @@ impl StateStore {
             target_repo,
             updated_at: now,
         };
-        let _ = self.append_ledger(
+        self.append_ledger_or_refuse(
             "campaign.transition",
             id,
             &format!("Campaign `{id}`: `{from_state}` -> `{to_state}` ({evidence})"),
             serde_json::json!({ "from": from_state, "to": to_state, "evidence": evidence }),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(updated)
     }
 
@@ -525,8 +708,9 @@ impl StateStore {
     ) -> Result<QuestRow> {
         let now = Utc::now().to_rfc3339();
         let initial = self.spec.machines.quest.initial.clone();
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO quests
              (id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime, tooth_witness, updated_at)
              VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6, NULL, ?7)",
@@ -550,6 +734,7 @@ impl StateStore {
             &format!("Quest `{id}` ({title}) created in `{initial}` [regime={target_regime}]"),
             serde_json::to_value(&row)?,
         )?;
+        tx.commit()?;
         Ok(row)
     }
 
@@ -562,8 +747,13 @@ impl StateStore {
         tooth_witness: Option<&str>,
         guard_passed: bool,
     ) -> std::result::Result<QuestRow, StateRefusal> {
-        let conn = self.conn().expect("sqlite connection");
-        let cur: Option<QuestRow> = conn
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        let cur: Option<QuestRow> = tx
             .query_row(
                 "SELECT id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime, tooth_witness, updated_at
                  FROM quests WHERE id = ?1",
@@ -584,7 +774,7 @@ impl StateStore {
                 },
             )
             .optional()
-            .expect("query quest");
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
 
         let Some(q) = cur else {
             return Err(StateRefusal::IllegalTransition {
@@ -613,11 +803,11 @@ impl StateStore {
             } else {
                 Some(q.state.clone())
             };
-            conn.execute(
+            tx.execute(
                 "UPDATE quests SET state = ?1, is_sink = 1, prior_state = ?2, updated_at = ?3 WHERE id = ?4",
                 params![to_state, prior, now, id],
             )
-            .expect("enter sink");
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             let out = QuestRow {
                 state: to_state.to_string(),
                 is_sink: true,
@@ -625,12 +815,14 @@ impl StateStore {
                 updated_at: now,
                 ..q
             };
-            let _ = self.append_ledger(
+            self.append_ledger_or_refuse(
                 "quest.sink_entered",
                 id,
                 &format!("Quest `{id}` entered sink `{to_state}`"),
                 serde_json::to_value(&out).unwrap_or_default(),
-            );
+            )?;
+            tx.commit()
+                .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             return Ok(out);
         }
 
@@ -662,11 +854,11 @@ impl StateStore {
                     to: to_state.into(),
                 });
             }
-            conn.execute(
+            tx.execute(
                 "UPDATE quests SET state = ?1, is_sink = 0, prior_state = NULL, updated_at = ?2 WHERE id = ?3",
                 params![to_state, now, id],
             )
-            .expect("exit sink");
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             let out = QuestRow {
                 state: to_state.to_string(),
                 is_sink: false,
@@ -674,12 +866,14 @@ impl StateStore {
                 updated_at: now,
                 ..q
             };
-            let _ = self.append_ledger(
+            self.append_ledger_or_refuse(
                 "quest.sink_exited",
                 id,
                 &format!("Quest `{id}` exited sink to `{to_state}` via `{act}` by `{actor}`"),
                 serde_json::json!({ "to": to_state, "actor": actor, "remedial_action": act }),
-            );
+            )?;
+            tx.commit()
+                .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             return Ok(out);
         }
 
@@ -716,11 +910,11 @@ impl StateStore {
         let merged_tooth = tooth_witness
             .map(str::to_string)
             .or_else(|| q.tooth_witness.clone());
-        conn.execute(
+        tx.execute(
             "UPDATE quests SET state = ?1, tooth_witness = ?2, updated_at = ?3 WHERE id = ?4",
             params![to_state, merged_tooth, now, id],
         )
-        .expect("update quest");
+        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
 
         let out = QuestRow {
             state: to_state.to_string(),
@@ -728,12 +922,14 @@ impl StateStore {
             updated_at: now,
             ..q
         };
-        let _ = self.append_ledger(
+        self.append_ledger_or_refuse(
             "quest.transition",
             id,
             &format!("Quest `{id}` moved to `{to_state}`"),
             serde_json::to_value(&out).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(out)
     }
 
@@ -754,14 +950,19 @@ impl StateStore {
             });
         }
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn().expect("sqlite connection");
-        conn.execute(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        tx.execute(
             "INSERT INTO ember_queue (kind, subject_id, prompt, resolved, resolution, created_at)
              VALUES (?1, ?2, ?3, 0, NULL, ?4)",
             params![kind, subject_id, prompt, now],
         )
-        .expect("insert ember event");
-        let id = conn.last_insert_rowid();
+        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        let id = tx.last_insert_rowid();
         let row = EmberEventRow {
             id,
             kind: kind.to_string(),
@@ -771,12 +972,14 @@ impl StateStore {
             resolution: None,
             created_at: now,
         };
-        let _ = self.append_ledger(
+        self.append_ledger_or_refuse(
             &format!("ember.{kind}"),
             subject_id,
             prompt,
             serde_json::to_value(&row).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(row)
     }
 
@@ -795,14 +998,19 @@ impl StateStore {
         self.enforce_host_headroom(host)?;
         let now = Utc::now().to_rfc3339();
         let initial = self.spec.machines.segment.initial.clone(); // "Fresh"
-        let conn = self.conn().expect("sqlite connection");
-        conn.execute(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        tx.execute(
             "INSERT OR REPLACE INTO segments
              (id, quest_id, parent_id, state, model_tier, host, token_count, transcript_mode, distill_hash, notes, updated_at)
              VALUES (?1, ?2, NULL, ?3, ?4, ?5, 0, 'full', NULL, ?6, ?7)",
             params![id, quest_id, initial, model_tier, host, notes, now],
         )
-        .expect("insert segment");
+        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         let row = SegmentRow {
             id: id.to_string(),
             quest_id: quest_id.to_string(),
@@ -816,12 +1024,14 @@ impl StateStore {
             notes: notes.to_string(),
             updated_at: now,
         };
-        let _ = self.append_ledger(
+        self.append_ledger_or_refuse(
             "segment.new",
             id,
             &format!("Segment `{id}` created on `{host}` ({model_tier})"),
             serde_json::to_value(&row).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(row)
     }
 
@@ -868,13 +1078,21 @@ impl StateStore {
             seg.notes = notes.to_string();
         }
         seg.updated_at = Utc::now().to_rfc3339();
-        self.save_segment(&seg);
-        let _ = self.append_ledger(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &seg)?;
+        self.append_ledger_or_refuse(
             "segment.continue",
             id,
             &format!("Segment `{id}` continued ({} tokens, state `{}`)", seg.token_count, seg.state),
             serde_json::to_value(&seg).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(seg)
     }
 
@@ -904,13 +1122,21 @@ impl StateStore {
         seg.distill_hash = Some(digest.clone());
         seg.transcript_mode = "compacted".to_string();
         seg.updated_at = Utc::now().to_rfc3339();
-        self.save_segment(&seg);
-        let _ = self.append_ledger(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &seg)?;
+        self.append_ledger_or_refuse(
             "segment.distill",
             id,
             &format!("Segment `{id}` distilled (sha256={})", &digest[..12]),
             serde_json::to_value(&seg).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(seg)
     }
 
@@ -971,7 +1197,6 @@ impl StateStore {
 
         parent.state = "Forked".to_string();
         parent.updated_at = Utc::now().to_rfc3339();
-        self.save_segment(&parent);
 
         let inherited_tokens = if transcript_mode == "compacted" {
             (parent.token_count / 10).min(8_000)
@@ -992,15 +1217,24 @@ impl StateStore {
             notes: format!("forked ({handoff_direction}) from {}", parent.id),
             updated_at: now,
         };
-        self.insert_segment(&child);
-        let _ = self.append_ledger(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &parent)?;
+        Self::upsert_segment_in_tx(&tx, &child)?;
+        self.append_ledger_or_refuse(
             "segment.fork",
             child_id,
             &format!(
                 "Segment `{child_id}` forked from `{parent_id}` ({handoff_direction}, mode={transcript_mode})"
             ),
             serde_json::to_value(&child).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(child)
     }
 
@@ -1018,13 +1252,21 @@ impl StateStore {
         seg.state = "Retired".to_string();
         seg.notes = format!("merged into {into_id} and superseded");
         seg.updated_at = Utc::now().to_rfc3339();
-        self.save_segment(&seg);
-        let _ = self.append_ledger(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &seg)?;
+        self.append_ledger_or_refuse(
             "segment.merge",
             id,
             &format!("Segment `{id}` merged into `{into_id}`"),
             serde_json::to_value(&seg).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(seg)
     }
 
@@ -1034,13 +1276,21 @@ impl StateStore {
         seg.transcript_mode = "forgotten-prefix".to_string();
         seg.notes = format!("retired/forgotten: {reason}");
         seg.updated_at = Utc::now().to_rfc3339();
-        self.save_segment(&seg);
-        let _ = self.append_ledger(
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &seg)?;
+        self.append_ledger_or_refuse(
             "segment.forget",
             id,
             &format!("Segment `{id}` retired (`forget`: {reason})"),
             serde_json::to_value(&seg).unwrap_or_default(),
-        );
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(seg)
     }
 
@@ -1051,19 +1301,39 @@ impl StateStore {
         session_path: &str,
         host: &str,
     ) -> std::result::Result<SegmentRow, StateRefusal> {
+        self.enforce_host_headroom(host)?;
         let approx_tokens = fs::metadata(session_path)
             .map(|m| m.len() / 4)
             .unwrap_or(4_000);
-        let mut row = self.seg_new(
+        let now = Utc::now().to_rfc3339();
+        let row = SegmentRow {
+            id: id.to_string(),
+            quest_id: quest_id.to_string(),
+            parent_id: None,
+            state: "Working".to_string(),
+            model_tier: "adopted-session".to_string(),
+            host: host.to_string(),
+            token_count: approx_tokens,
+            transcript_mode: "full".to_string(),
+            distill_hash: None,
+            notes: format!("adopted from {session_path}"),
+            updated_at: now,
+        };
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Self::upsert_segment_in_tx(&tx, &row)?;
+        self.append_ledger_or_refuse(
+            "segment.adopt",
             id,
-            quest_id,
-            "adopted-session",
-            host,
-            &format!("adopted from {session_path}"),
+            &format!("Segment `{id}` adopted from `{session_path}` on `{host}`"),
+            serde_json::to_value(&row).unwrap_or_default(),
         )?;
-        row.state = "Working".to_string();
-        row.token_count = approx_tokens;
-        self.save_segment(&row);
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         Ok(row)
     }
 
@@ -1110,7 +1380,9 @@ impl StateStore {
     }
 
     fn get_segment(&self, id: &str) -> std::result::Result<SegmentRow, StateRefusal> {
-        let conn = self.conn().expect("sqlite connection");
+        let conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
         let row = conn
             .query_row(
                 "SELECT id, quest_id, parent_id, state, model_tier, host, token_count, transcript_mode, distill_hash, notes, updated_at
@@ -1133,7 +1405,7 @@ impl StateStore {
                 },
             )
             .optional()
-            .expect("query segment");
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
         row.ok_or_else(|| StateRefusal::IllegalTransition {
             machine: "segment".into(),
             id: id.into(),
@@ -1142,9 +1414,11 @@ impl StateStore {
         })
     }
 
-    fn insert_segment(&self, s: &SegmentRow) {
-        let conn = self.conn().expect("sqlite connection");
-        conn.execute(
+    fn upsert_segment_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        s: &SegmentRow,
+    ) -> std::result::Result<(), StateRefusal> {
+        tx.execute(
             "INSERT OR REPLACE INTO segments
              (id, quest_id, parent_id, state, model_tier, host, token_count, transcript_mode, distill_hash, notes, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -1162,11 +1436,8 @@ impl StateStore {
                 s.updated_at
             ],
         )
-        .expect("insert segment");
-    }
-
-    fn save_segment(&self, s: &SegmentRow) {
-        self.insert_segment(s);
+        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -1535,6 +1806,7 @@ impl StateStore {
 
         Ok(StateSnapshot {
             workspace_root: self.workspace_root.to_string_lossy().to_string(),
+            state_dir: self.state_dir.to_string_lossy().to_string(),
             scheduler_paused,
             pause_reasons,
             campaigns,
@@ -1550,101 +1822,123 @@ impl StateStore {
     /// (`DESIGN.md` §6 Milestone 1: "Write a static segment tree for obend's current situation by hand; render it").
     pub fn seed_obend_campaign(&self, obend_repo: &Path) -> Result<StateSnapshot> {
         let _ = self.probe_machines(false)?;
-        let _ = self.create_campaign(
+        self.create_campaign(
             "C1-obend-reground",
             "Obend Epistemic Regrounding & Process Harness",
             "Every load-bearing Obend claim has a tooth, an independent spec, and zero cross-language mirrors.",
             &obend_repo.to_string_lossy(),
         )?;
-        let _ = self.transition_campaign("C1-obend-reground", "Grounded", true, "G1 whole-read of obend completed");
-        let _ = self.transition_campaign("C1-obend-reground", "Running", true, "G2 DESIGN.md + G4 g0-obebuilder active");
+        self.transition_campaign("C1-obend-reground", "Grounded", true, "G1 whole-read of obend completed")
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_campaign("C1-obend-reground", "Running", true, "G2 DESIGN.md + G4 g0-obebuilder active")
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // W1-A: Branch convergence
-        let _ = self.create_quest(
+        self.create_quest(
             "W1-A",
             "C1-obend-reground",
             "Branch Convergence & Stash Elimination in obend",
             "lane-w1a",
             "decided",
         )?;
-        let _ = self.transition_quest("W1-A", "Scoped", "lane-w1a", None, None, true);
+        self.transition_quest("W1-A", "Scoped", "lane-w1a", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // W1-B: obebuilder harness (this lane!)
-        let _ = self.create_quest(
+        self.create_quest(
             "W1-B",
             "C1-obend-reground",
             "Build `obb` Metaharness (`lint`, `judge`, `state`, `serve`)",
             "lane-w1b",
             "decided",
         )?;
-        let _ = self.transition_quest("W1-B", "Scoped", "lane-w1b", None, None, true);
-        let _ = self.transition_quest("W1-B", "Built", "lane-w1b", None, None, true);
-        let _ = self.transition_quest("W1-B", "Wired", "lane-w1b", None, None, true);
-        let _ = self.transition_quest(
+        self.transition_quest("W1-B", "Scoped", "lane-w1b", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-B", "Built", "lane-w1b", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-B", "Wired", "lane-w1b", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest(
             "W1-B",
             "Toothed",
             "lane-w1b",
             None,
             Some("crates/obb-cli/tests/planted_faults.rs"),
             true,
-        );
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         // W1-C: DESIGN.md hallucinated constructor cleanup (currently in `Label` sink from `Wired` in obend)
-        let _ = self.create_quest(
+        self.create_quest(
             "W1-C",
             "C1-obend-reground",
             "Synchronize `DESIGN.md` Term Former & Quantity Tables with `Obend/Core/`",
             "lane-docs",
             "certified",
         )?;
-        let _ = self.transition_quest("W1-C", "Scoped", "lane-docs", None, None, true);
-        let _ = self.transition_quest("W1-C", "Built", "lane-docs", None, None, true);
-        let _ = self.transition_quest("W1-C", "Wired", "lane-docs", None, None, true);
-        let _ = self.transition_quest("W1-C", "Label", "lane-docs", None, None, true);
+        self.transition_quest("W1-C", "Scoped", "lane-docs", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-C", "Built", "lane-docs", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-C", "Wired", "lane-docs", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-C", "Label", "lane-docs", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // W1-D: SiliconElab & Hybrid Judge theatrical proofs (currently in `Theater` sink from `Built` in obend)
-        let _ = self.create_quest(
+        self.create_quest(
             "W1-D",
             "C1-obend-reground",
             "Eliminate Discarded `z1` Tactics & Tautological `Judge.Meaning`",
             "lane-lean",
             "decided",
         )?;
-        let _ = self.transition_quest("W1-D", "Scoped", "lane-lean", None, None, true);
-        let _ = self.transition_quest("W1-D", "Built", "lane-lean", None, None, true);
-        let _ = self.transition_quest("W1-D", "Theater", "lane-lean", None, None, true);
+        self.transition_quest("W1-D", "Scoped", "lane-lean", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-D", "Built", "lane-lean", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-D", "Theater", "lane-lean", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // W1-E: Rust/Python E2E semantic mirrors (currently in `Mirror` sink from `Built` in obend)
-        let _ = self.create_quest(
+        self.create_quest(
             "W1-E",
             "C1-obend-reground",
             "Replace Python E2E Self-Mocks & Rust Semantic Mirrors with `libobend` FFI",
             "lane-seam",
             "decided",
         )?;
-        let _ = self.transition_quest("W1-E", "Scoped", "lane-seam", None, None, true);
-        let _ = self.transition_quest("W1-E", "Built", "lane-seam", None, None, true);
-        let _ = self.transition_quest("W1-E", "Mirror", "lane-seam", None, None, true);
+        self.transition_quest("W1-E", "Scoped", "lane-seam", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-E", "Built", "lane-seam", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.transition_quest("W1-E", "Mirror", "lane-seam", None, None, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // Segments
-        let _ = self.seg_new("seg-root-audit", "W1-B", "pro", "local", "Whole-read audit of obend corpus");
-        let _ = self.seg_continue("seg-root-audit", 28_000, "Indexed SiliconElab, Hybrid, DESIGN.md, E2E mocks");
-        let _ = self.seg_distill("seg-root-audit", "Distilled 5 defect families into obb-lint & judge.json");
-        let _ = self.seg_fork(
+        self.seg_new("seg-root-audit", "W1-B", "pro", "local", "Whole-read audit of obend corpus")
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.seg_continue("seg-root-audit", 28_000, "Indexed SiliconElab, Hybrid, DESIGN.md, E2E mocks")
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.seg_distill("seg-root-audit", "Distilled 5 defect families into obb-lint & judge.json")
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.seg_fork(
             "seg-root-audit",
             "seg-w1b-impl",
             "pro",
             "local",
             "escalate",
             "compacted",
-        );
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         // One legitimate taste question queued for ember
-        let _ = self.enqueue_ember_event(
+        self.enqueue_ember_event(
             "taste",
             "W1-C",
             "Should `DESIGN.md` §1.1 list only current `Obend/Core/Term.lean` constructors, or generate the table mechanically via `lake exe docs-table`?",
-        );
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         self.snapshot()
     }

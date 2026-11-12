@@ -751,6 +751,7 @@ fn broker_mock_ssh_probes_zfs_arc_runaways_routes_targets_and_batches_seeded_lak
         dry_run: false,
         exec: true,
         repo_root: Some(workspace_root()),
+        target_commit: None,
         remote_seed_root: None,
     };
 
@@ -793,13 +794,17 @@ fn broker_mock_ssh_probes_zfs_arc_runaways_routes_targets_and_batches_seeded_lak
         bb2_batch.batched_lake_command,
         "lake build Obend.Hardware.Fabulous.Fabric emit-sv Obend.Vault.Replay Obend.Leaf.Emit"
     );
-    assert!(bb2_batch.remote_recipe.contains("cp -al"));
+    assert!(bb2_batch.remote_recipe.contains("cp -R --reflink=auto"));
+    assert!(!bb2_batch.remote_recipe.contains("cp -al"));
+    assert!(bb2_batch.remote_recipe.contains("git -C \"$BASE_REPO\" fetch"));
+    assert!(bb2_batch.remote_recipe.contains("checkout --detach --force"));
     assert!(
         bb2_batch
             .remote_recipe
-            .contains("SWARM_MEM_MAX=\"14G\" swarm-build timeout --kill-after=10s 450s")
+            .contains("SWARM_MEM_MAX=\"14G\" exec swarm-build timeout --kill-after=10s 450s")
     );
     assert!(bb2_batch.remote_recipe.contains("ulimit -v"));
+    assert!(bb2_batch.remote_recipe.contains("kill -TERM -- \"-$BUILD_PGID\""));
     assert!(bb2_batch.remote_recipe.contains("pkill -TERM -P $$"));
     assert_eq!(bb2_batch.execution.as_ref().unwrap().exit_code, 0);
 

@@ -21,6 +21,7 @@ use tokio_stream::wrappers::IntervalStream;
 #[derive(Clone)]
 pub struct ServeConfig {
     pub workspace_root: PathBuf,
+    pub state_dir: Option<PathBuf>,
     pub target_repo: PathBuf,
     pub judge_path: PathBuf,
     pub cached_lint: Arc<RwLock<Option<LintReport>>>,
@@ -35,10 +36,16 @@ impl ServeConfig {
             .and_then(|s| serde_json::from_str::<LintReport>(&s).ok());
         Self {
             workspace_root,
+            state_dir: None,
             target_repo,
             judge_path,
             cached_lint: Arc::new(RwLock::new(initial_lint)),
         }
+    }
+
+    pub fn with_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
+        self.state_dir = state_dir;
+        self
     }
 }
 
@@ -59,7 +66,18 @@ pub async fn run_server(
     target_repo: &Path,
     judge_path: &Path,
 ) -> Result<()> {
-    let store = StateStore::open(workspace_root)?;
+    run_server_with_state_dir(host, port, workspace_root, None, target_repo, judge_path).await
+}
+
+pub async fn run_server_with_state_dir(
+    host: &str,
+    port: u16,
+    workspace_root: &Path,
+    state_dir: Option<&Path>,
+    target_repo: &Path,
+    judge_path: &Path,
+) -> Result<()> {
+    let store = StateStore::open_with_state_dir(workspace_root, state_dir)?;
     let snap = store.snapshot()?;
     if snap.campaigns.is_empty() {
         let _ = store.seed_obend_campaign(target_repo)?;
@@ -69,7 +87,8 @@ pub async fn run_server(
         workspace_root.to_path_buf(),
         target_repo.to_path_buf(),
         judge_path.to_path_buf(),
-    );
+    )
+    .with_state_dir(state_dir.map(Path::to_path_buf));
     let app = build_router(cfg);
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -81,7 +100,9 @@ pub async fn run_server(
 }
 
 async fn api_status(State(cfg): State<ServeConfig>) -> impl IntoResponse {
-    match StateStore::open(&cfg.workspace_root).and_then(|s| s.snapshot()) {
+    match StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
+        .and_then(|s| s.snapshot())
+    {
         Ok(snap) => Json(serde_json::to_value(snap).unwrap_or_default()),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
@@ -120,7 +141,7 @@ async fn sse_events(
     State(cfg): State<ServeConfig>,
 ) -> Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>> {
     let stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(5))).map(move |_| {
-        let payload = StateStore::open(&cfg.workspace_root)
+        let payload = StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
             .and_then(|s| s.snapshot())
             .map(|snap| serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string());

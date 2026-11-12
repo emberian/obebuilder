@@ -826,8 +826,9 @@ fn parse_command_slice(
     let mut pos = 1usize;
     // Skip optional `(priority := ...)` on `instance`
     if kind == DeclKind::Instance
-        && pos < cmd.len()
+        && pos + 1 < cmd.len()
         && matches!(&cmd[pos].kind, LeanTokenKind::Symbol(s) if s == "(")
+        && matches!(&cmd[pos + 1].kind, LeanTokenKind::Ident(s) if s == "priority")
     {
         let mut d = 1usize;
         pos += 1;
