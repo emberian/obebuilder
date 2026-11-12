@@ -1,0 +1,751 @@
+//! `obb pipeline` — Two-Stage `[HypothesisLedger]` Interface-Lock & Swarm Proof-Fill Verifier.
+//!
+//! Enforces disciplined parallel `/swarm` execution without `sorry` or `axiom` smuggling:
+//! - `STAGE_A_LOCKED`: Signatures and Apex composition theorems compile cleanly with explicit
+//!   `[HypothesisLedger ...]` / `@[obb_obligation]` typeclass parameters (`0 sorry`, `0 axiom`) —
+//!   safe to fan out producer and consumer `/swarm` workers simultaneously.
+//! - `STAGE_B_SEALED`: Every `HypothesisLedger` / `@[obb_obligation]` class has a concrete,
+//!   non-vacuous, acyclic discharged `instance` (`0 sorry`, `0 axiom`) — ready for `Landed -> Claimed`.
+//! - `FAILED`: Immediate refusal if any worker smuggled `sorry` or `axiom`, left a cyclic instance
+//!   loop (`[LedgerA] -> LedgerB -> LedgerA`), or instantiated an obligation over an uninhabited
+//!   (`Empty` / `False` / 0-constructor) carrier witness.
+
+use anyhow::Result;
+use chrono::Utc;
+use obb_lint::lean_index::{BinderParam, DeclKind, LeanIndex, ParsedLeanDecl, build_lean_index};
+use obb_lint::lean_lexer::{LeanToken, LeanTokenKind};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PipelineStage {
+    #[serde(rename = "STAGE_A_LOCKED")]
+    StageALocked,
+    #[serde(rename = "STAGE_B_SEALED")]
+    StageBSealed,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+impl PipelineStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StageALocked => "STAGE_A_LOCKED",
+            Self::StageBSealed => "STAGE_B_SEALED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+impl fmt::Display for PipelineStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineViolation {
+    pub kind: String,
+    pub path: String,
+    pub line: usize,
+    pub symbol: String,
+    pub message: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerSite {
+    pub symbol: String,
+    pub path: String,
+    pub line: usize,
+    pub ledger_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DischargingInstance {
+    pub instance_name: String,
+    pub path: String,
+    pub line: usize,
+    pub target_class: String,
+    pub target_args: Vec<String>,
+    pub depends_on_ledgers: Vec<String>,
+    pub witness_inhabited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerObligationStatus {
+    pub class_name: String,
+    pub fq_name: String,
+    pub path: String,
+    pub line: usize,
+    pub field_count: usize,
+    pub consumer_count: usize,
+    pub discharging_instances: Vec<DischargingInstance>,
+    pub discharged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineReport {
+    pub repo_root: String,
+    pub checked_at: String,
+    pub stage: PipelineStage,
+    pub passed: bool,
+    pub ready_for_parallel_swarm: bool,
+    pub ready_for_claimed: bool,
+    pub smuggled_sorry_count: usize,
+    pub smuggled_axiom_count: usize,
+    pub total_obligations: usize,
+    pub sealed_obligations: usize,
+    pub open_stage_a_obligations: usize,
+    pub consumer_sites: Vec<ConsumerSite>,
+    pub obligations: Vec<LedgerObligationStatus>,
+    pub violations: Vec<PipelineViolation>,
+}
+
+fn is_test_only_path(rel_path: &str) -> bool {
+    rel_path.contains("/tests/")
+        || rel_path.starts_with("tests/")
+        || rel_path.starts_with("lean/tests/")
+        || rel_path.ends_with("Test.lean")
+        || rel_path.ends_with("Tests.lean")
+}
+
+fn is_planted_sorry_fixture_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("planted_sorry") || lower.contains("plantedsorry")
+}
+
+fn is_ledger_class_name(name: &str) -> bool {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    short == "HypothesisLedger" || short.contains("HypothesisLedger")
+}
+
+fn tokens_have_unquoted_sorry(tokens: &[LeanToken]) -> Option<usize> {
+    let mut quote_depth = 0usize;
+    for tok in tokens {
+        match &tok.kind {
+            LeanTokenKind::SyntaxQuoteOpen => {
+                quote_depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if quote_depth > 0 && matches!(s.as_str(), "(" | "[" | "{") => {
+                quote_depth += 1;
+            }
+            LeanTokenKind::Symbol(s) if quote_depth > 0 && matches!(s.as_str(), ")" | "]" | "}") => {
+                quote_depth -= 1;
+            }
+            LeanTokenKind::Ident(id) if quote_depth == 0 && (id == "sorry" || id == "sorryAx") => {
+                return Some(tok.line);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_sorry_in_decl(decl: &ParsedLeanDecl) -> Option<usize> {
+    if let Some(l) = tokens_have_unquoted_sorry(&decl.type_tokens) {
+        return Some(l);
+    }
+    if let Some(l) = tokens_have_unquoted_sorry(&decl.body_tokens) {
+        return Some(l);
+    }
+    for wf in &decl.where_fields {
+        if let Some(l) = tokens_have_unquoted_sorry(&wf.rhs_tokens) {
+            return Some(l);
+        }
+    }
+    for sf in &decl.struct_fields {
+        if let Some(l) = tokens_have_unquoted_sorry(&sf.type_tokens) {
+            return Some(l);
+        }
+    }
+    None
+}
+
+/// Extract the head class name and argument identifiers from an instance or `[...]` binder type.
+fn parse_head_class_and_args(tokens: &[LeanToken]) -> Option<(String, Vec<String>)> {
+    // Skip leading `∀ ... ,` or `(x : T) →` if polymorphic instance type
+    let mut start = 0usize;
+    let mut depth = 0isize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        match &tok.kind {
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
+            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            LeanTokenKind::Symbol(s) if (s == "→" || s == "->" || s == ",") && depth == 0 => {
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    let tail = &tokens[start..];
+    let mut head_class: Option<String> = None;
+    let mut args = Vec::new();
+    for tok in tail {
+        if let LeanTokenKind::Ident(id) = &tok.kind {
+            if matches!(id.as_str(), "∀" | "forall" | "outParam" | "semiOutParam") {
+                continue;
+            }
+            if head_class.is_none() {
+                head_class = Some(id.clone());
+            } else {
+                args.push(id.clone());
+            }
+        }
+    }
+    head_class.map(|c| (c, args))
+}
+
+pub fn check_pipeline(repo_root: &Path) -> Result<PipelineReport> {
+    let canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let index = build_lean_index(&canon);
+    Ok(check_pipeline_with_index(&canon.to_string_lossy(), &index))
+}
+
+pub fn check_pipeline_with_index(repo_root: &str, index: &LeanIndex) -> PipelineReport {
+    let mut violations = Vec::new();
+    let mut smuggled_sorry_count = 0usize;
+    let mut smuggled_axiom_count = 0usize;
+
+    // Collect empty (0-constructor) inductives in the index to detect uninhabited carrier witnesses
+    let mut zero_ctor_inductives: HashSet<String> = HashSet::from([
+        "False".to_string(),
+        "Empty".to_string(),
+        "PEmpty".to_string(),
+    ]);
+    for file in &index.files {
+        if is_test_only_path(&file.rel_path) {
+            continue;
+        }
+        for decl in &file.declarations {
+            if decl.kind == DeclKind::Inductive && decl.constructors.is_empty() {
+                zero_ctor_inductives.insert(decl.name.clone());
+                zero_ctor_inductives.insert(decl.fq_name.clone());
+            }
+        }
+    }
+
+    // Pass 1: Enforce zero smuggled `sorry` / `axiom`, and discover all `HypothesisLedger` / `@[obb_obligation]` classes
+    #[derive(Clone)]
+    struct DiscoveredClass {
+        short_name: String,
+        fq_name: String,
+        path: String,
+        line: usize,
+        field_count: usize,
+        has_extends: bool,
+    }
+
+    let mut ledger_classes: BTreeMap<String, DiscoveredClass> = BTreeMap::new();
+    let mut short_to_key: HashMap<String, String> = HashMap::new();
+
+    for file in &index.files {
+        if is_test_only_path(&file.rel_path) {
+            continue;
+        }
+        for decl in &file.declarations {
+            if decl.fixture_kept {
+                continue;
+            }
+
+            if decl.kind == DeclKind::Axiom {
+                smuggled_axiom_count += 1;
+                violations.push(PipelineViolation {
+                    kind: "smuggled_axiom".to_string(),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    symbol: decl.fq_name.clone(),
+                    message: format!(
+                        "Declared `axiom {}` smuggles an unverified global assumption outside `[HypothesisLedger]`",
+                        decl.fq_name
+                    ),
+                    remediation: "Delete `axiom` and express cross-shard interface assumptions as an explicit `class HypothesisLedger` typeclass parameter.".to_string(),
+                });
+            } else if !is_planted_sorry_fixture_name(&decl.name) {
+                if let Some(sline) = find_sorry_in_decl(decl) {
+                    smuggled_sorry_count += 1;
+                    violations.push(PipelineViolation {
+                        kind: "smuggled_sorry".to_string(),
+                        path: file.rel_path.clone(),
+                        line: sline,
+                        symbol: decl.fq_name.clone(),
+                        message: format!(
+                            "Declaration `{}` smuggles `sorry`/`sorryAx` instead of an explicit `[HypothesisLedger]` interface obligation",
+                            decl.fq_name
+                        ),
+                        remediation: "Remove `sorry`; parameterize Stage-A consumer theorems over `[HypothesisLedger ...]` and discharge the instance in Stage B.".to_string(),
+                    });
+                }
+            }
+
+            let has_obl_attr = decl.attributes.iter().any(|a| a == "obb_obligation");
+            if decl.kind == DeclKind::Class && (is_ledger_class_name(&decl.name) || has_obl_attr) {
+                let has_extends = decl
+                    .type_tokens
+                    .iter()
+                    .any(|t| matches!(&t.kind, LeanTokenKind::Ident(s) if s == "extends"));
+                let entry = DiscoveredClass {
+                    short_name: decl.name.clone(),
+                    fq_name: decl.fq_name.clone(),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    field_count: decl.struct_fields.len(),
+                    has_extends,
+                };
+                if entry.field_count == 0 && !entry.has_extends {
+                    violations.push(PipelineViolation {
+                        kind: "vacuous_empty_ledger_class".to_string(),
+                        path: file.rel_path.clone(),
+                        line: decl.line,
+                        symbol: decl.fq_name.clone(),
+                        message: format!(
+                            "Obligation class `{}` declares 0 fields and extends nothing, making any Stage-B instance vacuously trivial",
+                            decl.fq_name
+                        ),
+                        remediation: "Add explicit proposition/witness fields to the `HypothesisLedger` class before locking Stage A.".to_string(),
+                    });
+                }
+                short_to_key.insert(decl.name.clone(), decl.fq_name.clone());
+                short_to_key.insert(decl.fq_name.clone(), decl.fq_name.clone());
+                ledger_classes.insert(decl.fq_name.clone(), entry);
+            } else if has_obl_attr
+                && matches!(decl.kind, DeclKind::Theorem | DeclKind::Def | DeclKind::Structure)
+            {
+                // Non-class `@[obb_obligation]` stub: track as an obligation entry
+                let entry = DiscoveredClass {
+                    short_name: decl.name.clone(),
+                    fq_name: decl.fq_name.clone(),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    field_count: decl.struct_fields.len().max(1),
+                    has_extends: false,
+                };
+                short_to_key.insert(decl.name.clone(), decl.fq_name.clone());
+                short_to_key.insert(decl.fq_name.clone(), decl.fq_name.clone());
+                ledger_classes.insert(decl.fq_name.clone(), entry);
+            }
+        }
+    }
+
+    let resolve_ledger_key = |ident: &str| -> Option<String> {
+        if let Some(k) = short_to_key.get(ident) {
+            return Some(k.clone());
+        }
+        let short = ident.rsplit('.').next().unwrap_or(ident);
+        short_to_key.get(short).cloned()
+    };
+
+    // Pass 2: Scan consumer `[HypothesisLedger ...]` binders, `variable [...]`, and discharging `instance`s
+    let mut consumer_sites = Vec::new();
+    let mut consumer_counts: HashMap<String, usize> = HashMap::new();
+    let mut instances_by_class: HashMap<String, Vec<DischargingInstance>> = HashMap::new();
+    // Directed edges `class_key -> dep_class_key` across discharging instances
+    let mut class_dep_edges: HashMap<String, BTreeSet<String>> = HashMap::new();
+    // Track named ledger instances to catch mutual instance-body recursion (`instA` calls `instB` and `instB` calls `instA`)
+    let mut inst_records: Vec<(String, String, String, usize, Vec<String>)> = Vec::new(); // (inst_name, fq_name, path, line, body_idents)
+
+    let check_binder_for_consumer = |b: &BinderParam,
+                                     owner_sym: &str,
+                                     rel_path: &str,
+                                     consumer_sites: &mut Vec<ConsumerSite>,
+                                     consumer_counts: &mut HashMap<String, usize>,
+                                     violations: &mut Vec<PipelineViolation>| {
+        if !b.is_instance_bracket {
+            return;
+        }
+        if let Some((head, _args)) = parse_head_class_and_args(&b.type_tokens) {
+            if let Some(key) = resolve_ledger_key(&head) {
+                *consumer_counts.entry(key.clone()).or_insert(0) += 1;
+                consumer_sites.push(ConsumerSite {
+                    symbol: owner_sym.to_string(),
+                    path: rel_path.to_string(),
+                    line: b.line,
+                    ledger_class: key,
+                });
+            } else if is_ledger_class_name(&head) {
+                violations.push(PipelineViolation {
+                    kind: "undeclared_ledger_class".to_string(),
+                    path: rel_path.to_string(),
+                    line: b.line,
+                    symbol: owner_sym.to_string(),
+                    message: format!(
+                        "`{}` assumes `[{} ...]` but no `class {}` is declared in the repository",
+                        owner_sym, head, head
+                    ),
+                    remediation: "Declare `class HypothesisLedger ...` explicitly in the shared interface module.".to_string(),
+                });
+            }
+        }
+    };
+
+    for file in &index.files {
+        if is_test_only_path(&file.rel_path) {
+            continue;
+        }
+
+        for sv in &file.section_variables {
+            check_binder_for_consumer(
+                sv,
+                "<section-variable>",
+                &file.rel_path,
+                &mut consumer_sites,
+                &mut consumer_counts,
+                &mut violations,
+            );
+        }
+
+        for decl in &file.declarations {
+            if decl.kind != DeclKind::Instance {
+                for b in &decl.binders {
+                    check_binder_for_consumer(
+                        b,
+                        &decl.fq_name,
+                        &file.rel_path,
+                        &mut consumer_sites,
+                        &mut consumer_counts,
+                        &mut violations,
+                    );
+                }
+                continue;
+            }
+
+            // Inspect `DeclKind::Instance`: does it target a `HypothesisLedger` / `@[obb_obligation]` class?
+            let Some((target_head, target_args)) = parse_head_class_and_args(&decl.type_tokens)
+            else {
+                continue;
+            };
+            let Some(target_key) = resolve_ledger_key(&target_head) else {
+                continue;
+            };
+
+            // Check instance binders for:
+            // (a) forwarding dependencies `[OtherLedger ...]`
+            // (b) vacuous uninhabited premises `(h : False)` / `(x : EmptyCarrier)`
+            let mut dep_ledgers = BTreeSet::new();
+            let mut witness_inhabited = true;
+
+            for b in &decl.binders {
+                if b.is_instance_bracket {
+                    if let Some((b_head, _)) = parse_head_class_and_args(&b.type_tokens) {
+                        if let Some(dep_key) = resolve_ledger_key(&b_head) {
+                            dep_ledgers.insert(dep_key);
+                        }
+                    }
+                } else {
+                    for tok in &b.type_tokens {
+                        if let LeanTokenKind::Ident(tid) = &tok.kind {
+                            let short_t = tid.rsplit('.').next().unwrap_or(tid.as_str());
+                            if zero_ctor_inductives.contains(tid)
+                                || zero_ctor_inductives.contains(short_t)
+                            {
+                                witness_inhabited = false;
+                                violations.push(PipelineViolation {
+                                    kind: "vacuous_instance_witness".to_string(),
+                                    path: file.rel_path.clone(),
+                                    line: decl.line,
+                                    symbol: decl.fq_name.clone(),
+                                    message: format!(
+                                        "Instance `{}` for `{}` depends on uninhabited binder premise `{tid}`, discharging the obligation vacuously",
+                                        decl.fq_name, target_key
+                                    ),
+                                    remediation: "Remove uninhabited binder premises (`False`/`Empty`/0-constructor inductives) and construct a real inhabited model.".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check if any type argument to the class (`instance : ZkVmHypothesisLedger VoidCarrier`) is uninhabited
+            for arg in &target_args {
+                let short_a = arg.rsplit('.').next().unwrap_or(arg.as_str());
+                if zero_ctor_inductives.contains(arg) || zero_ctor_inductives.contains(short_a) {
+                    witness_inhabited = false;
+                    violations.push(PipelineViolation {
+                        kind: "vacuous_instance_witness".to_string(),
+                        path: file.rel_path.clone(),
+                        line: decl.line,
+                        symbol: decl.fq_name.clone(),
+                        message: format!(
+                            "Instance `{}` instantiates `{}` on uninhabited 0-constructor type `{arg}`",
+                            decl.fq_name, target_key
+                        ),
+                        remediation: "Instantiate `HypothesisLedger` on the real inhabited production carrier type.".to_string(),
+                    });
+                }
+            }
+
+            // Ensure body/where is non-empty and free of `sorry`
+            if decl.body_tokens.is_empty() && decl.where_fields.is_empty() {
+                witness_inhabited = false;
+                violations.push(PipelineViolation {
+                    kind: "vacuous_instance_witness".to_string(),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    symbol: decl.fq_name.clone(),
+                    message: format!(
+                        "Instance `{}` for `{}` supplies no `where` fields or proof term",
+                        decl.fq_name, target_key
+                    ),
+                    remediation: "Provide concrete proof terms for all obligation fields in `where` or `:=`.".to_string(),
+                });
+            }
+
+            let mut body_idents = Vec::new();
+            for tok in decl
+                .body_tokens
+                .iter()
+                .chain(decl.where_fields.iter().flat_map(|w| w.rhs_tokens.iter()))
+            {
+                if let LeanTokenKind::Ident(id) = &tok.kind {
+                    body_idents.push(id.clone());
+                }
+            }
+
+            for dep in &dep_ledgers {
+                class_dep_edges
+                    .entry(target_key.clone())
+                    .or_default()
+                    .insert(dep.clone());
+            }
+
+            inst_records.push((
+                decl.name.clone(),
+                decl.fq_name.clone(),
+                file.rel_path.clone(),
+                decl.line,
+                body_idents,
+            ));
+
+            instances_by_class
+                .entry(target_key.clone())
+                .or_default()
+                .push(DischargingInstance {
+                    instance_name: decl.fq_name.clone(),
+                    path: file.rel_path.clone(),
+                    line: decl.line,
+                    target_class: target_key,
+                    target_args,
+                    depends_on_ledgers: dep_ledgers.into_iter().collect(),
+                    witness_inhabited,
+                });
+        }
+    }
+
+    // Pass 3a: Detect cyclic class-to-class `[LedgerB] -> LedgerA` instance dependencies
+    {
+        let mut color: HashMap<&str, u8> = HashMap::new(); // 0=unvisited, 1=visiting, 2=done
+        let mut stack_path: Vec<&str> = Vec::new();
+        fn dfs_class_cycle<'a>(
+            u: &'a str,
+            edges: &'a HashMap<String, BTreeSet<String>>,
+            color: &mut HashMap<&'a str, u8>,
+            stack_path: &mut Vec<&'a str>,
+            cycles: &mut Vec<Vec<String>>,
+        ) {
+            color.insert(u, 1);
+            stack_path.push(u);
+            if let Some(nbrs) = edges.get(u) {
+                for v in nbrs {
+                    let v_str = v.as_str();
+                    match color.get(v_str).copied().unwrap_or(0) {
+                        0 => dfs_class_cycle(v_str, edges, color, stack_path, cycles),
+                        1 => {
+                            let pos = stack_path.iter().position(|&x| x == v_str).unwrap_or(0);
+                            let mut cyc: Vec<String> =
+                                stack_path[pos..].iter().map(|s| (*s).to_string()).collect();
+                            cyc.push(v_str.to_string());
+                            cycles.push(cyc);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            stack_path.pop();
+            color.insert(u, 2);
+        }
+
+        let mut cycles = Vec::new();
+        for k in ledger_classes.keys() {
+            if color.get(k.as_str()).copied().unwrap_or(0) == 0 {
+                dfs_class_cycle(
+                    k.as_str(),
+                    &class_dep_edges,
+                    &mut color,
+                    &mut stack_path,
+                    &mut cycles,
+                );
+            }
+        }
+        for cyc in cycles {
+            let head = &cyc[0];
+            let (path, line) = ledger_classes
+                .get(head)
+                .map(|c| (c.path.clone(), c.line))
+                .unwrap_or_else(|| (String::new(), 1));
+            violations.push(PipelineViolation {
+                kind: "cyclic_instance_dependency".to_string(),
+                path,
+                line,
+                symbol: head.clone(),
+                message: format!(
+                    "Cyclic `HypothesisLedger` instance dependency detected: {}",
+                    cyc.join(" -> ")
+                ),
+                remediation: "Break circular `[HypothesisLedger]` instance assumptions; discharge producer instances unconditionally from concrete module theorems.".to_string(),
+            });
+        }
+    }
+
+    // Pass 3b: Detect direct or mutual instance-body cycles (`instA` calls `instB` and `instB` calls `instA`, or `instA` calls `instA`)
+    if !inst_records.is_empty() {
+        let mut inst_idx_by_name: HashMap<&str, usize> = HashMap::new();
+        for (idx, (short, fq, _, _, _)) in inst_records.iter().enumerate() {
+            if !short.starts_with("inst@") {
+                inst_idx_by_name.insert(short.as_str(), idx);
+            }
+            inst_idx_by_name.insert(fq.as_str(), idx);
+        }
+        let m = inst_records.len();
+        let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); m];
+        for (u, (_, _, _, _, idents)) in inst_records.iter().enumerate() {
+            for id in idents {
+                if let Some(&v) = inst_idx_by_name.get(id.as_str()) {
+                    adj[u].insert(v);
+                } else {
+                    let s = id.rsplit('.').next().unwrap_or(id.as_str());
+                    if let Some(&v) = inst_idx_by_name.get(s) {
+                        adj[u].insert(v);
+                    }
+                }
+            }
+        }
+        let mut color = vec![0u8; m];
+        let mut reported_cycle = HashSet::new();
+        fn dfs_inst(
+            u: usize,
+            adj: &[BTreeSet<usize>],
+            color: &mut [u8],
+            found: &mut Vec<(usize, usize)>,
+        ) {
+            color[u] = 1;
+            for &v in &adj[u] {
+                if color[v] == 0 {
+                    dfs_inst(v, adj, color, found);
+                } else if color[v] == 1 {
+                    found.push((u, v));
+                }
+            }
+            color[u] = 2;
+        }
+        let mut back_edges = Vec::new();
+        for u in 0..m {
+            if color[u] == 0 {
+                dfs_inst(u, &adj, &mut color, &mut back_edges);
+            }
+        }
+        for (u, v) in back_edges {
+            if reported_cycle.insert((u.min(v), u.max(v))) {
+                let (_, fq_u, path_u, line_u, _) = &inst_records[u];
+                let (_, fq_v, _, _, _) = &inst_records[v];
+                violations.push(PipelineViolation {
+                    kind: "cyclic_instance_dependency".to_string(),
+                    path: path_u.clone(),
+                    line: *line_u,
+                    symbol: fq_u.clone(),
+                    message: format!(
+                        "Discharging `HypothesisLedger` instance `{fq_u}` forms a cyclic body reference with `{fq_v}`"
+                    ),
+                    remediation: "Discharge `HypothesisLedger` instances from non-cyclic constructive theorems.".to_string(),
+                });
+            }
+        }
+    }
+
+    // Pass 4: Fixed-point resolution of which `HypothesisLedger` classes are transitively discharged
+    let mut discharged_set: HashSet<String> = HashSet::new();
+    loop {
+        let mut progressed = false;
+        for class_key in ledger_classes.keys() {
+            if discharged_set.contains(class_key) {
+                continue;
+            }
+            if let Some(insts) = instances_by_class.get(class_key) {
+                let ok = insts.iter().any(|inst| {
+                    inst.witness_inhabited
+                        && inst
+                            .depends_on_ledgers
+                            .iter()
+                            .all(|dep| dep != class_key && discharged_set.contains(dep))
+                });
+                if ok {
+                    discharged_set.insert(class_key.clone());
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let mut obligations = Vec::with_capacity(ledger_classes.len());
+    let mut sealed_obligations = 0usize;
+    let mut open_stage_a_obligations = 0usize;
+
+    for (key, cls) in &ledger_classes {
+        let discharged = discharged_set.contains(key);
+        if discharged {
+            sealed_obligations += 1;
+        } else {
+            open_stage_a_obligations += 1;
+        }
+        obligations.push(LedgerObligationStatus {
+            class_name: cls.short_name.clone(),
+            fq_name: cls.fq_name.clone(),
+            path: cls.path.clone(),
+            line: cls.line,
+            field_count: cls.field_count,
+            consumer_count: *consumer_counts.get(key).unwrap_or(&0),
+            discharging_instances: instances_by_class.remove(key).unwrap_or_default(),
+            discharged,
+        });
+    }
+
+    let stage = if !violations.is_empty() {
+        PipelineStage::Failed
+    } else if open_stage_a_obligations > 0 {
+        PipelineStage::StageALocked
+    } else {
+        PipelineStage::StageBSealed
+    };
+
+    let passed = stage != PipelineStage::Failed;
+    let ready_for_parallel_swarm = passed;
+    let ready_for_claimed = stage == PipelineStage::StageBSealed;
+
+    PipelineReport {
+        repo_root: repo_root.to_string(),
+        checked_at: Utc::now().to_rfc3339(),
+        stage,
+        passed,
+        ready_for_parallel_swarm,
+        ready_for_claimed,
+        smuggled_sorry_count,
+        smuggled_axiom_count,
+        total_obligations: obligations.len(),
+        sealed_obligations,
+        open_stage_a_obligations,
+        consumer_sites,
+        obligations,
+        violations,
+    }
+}

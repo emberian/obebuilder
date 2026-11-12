@@ -2,12 +2,20 @@
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use obb_broker::{
+    BuildPlanOptions, HostChoice, SshExecutor, plan_build as broker_plan_build, probe_hosts,
+};
 use obb_cli::serve::run_server;
+use obb_judge::pipeline::{PipelineStage, check_pipeline};
 use obb_judge::{
     Gate, TrustBase, check_revert_clean, check_succeed, check_well_formed, evaluate_gate,
 };
+use obb_lint::apex::{
+    ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex,
+};
+use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
 use obb_lint::spec_check::run_spec_sensitivity_check;
-use obb_lint::{filter_report_by_rule, run_repo_lints};
+use obb_lint::{RepoLintOptions, filter_report_by_rule, run_repo_lints_with_options};
 use obb_quarry::{
     DEFAULT_QUARRY_MANIFEST_REL, QuarryManifest, QuarryState, inspect_quarry_target, status_quarry,
     sync_quarry,
@@ -51,12 +59,52 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
+        /// Escalate `lean/file-wide-expose` (`@[expose] public section` in >80-line files) from warning to error
+        #[arg(long)]
+        strict_expose: bool,
+
         /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
         #[arg(long)]
         modularity: bool,
 
         #[command(subcommand)]
         sub: Option<LintSubcommand>,
+    },
+
+    /// Sub-50ms Lean 4.35 `public import` Cone Analyzer, Blast-Radius Calculator & Disjoint Swarm Shard Planner (`LAW-M1`, `LAW-M2`, `LAW-M6`)
+    Cone {
+        /// Repository root to scan (strictly read-only)
+        #[arg(long, global = true, default_value = ".")]
+        repo: PathBuf,
+
+        /// Emit structured JSON report
+        #[arg(long, global = true)]
+        json: bool,
+
+        /// Fail when any module's outgoing `public import` DAG depth exceeds `<MAX_DEPTH>`
+        #[arg(long)]
+        max_depth: Option<usize>,
+
+        #[command(subcommand)]
+        sub: Option<ConeSubcommand>,
+    },
+
+    /// Whole-System Compositional Assurance & Anti-Leaf-Island Engine (`quarry/obend-apex.toml`)
+    Apex {
+        #[command(subcommand)]
+        sub: ApexSubcommand,
+    },
+
+    /// Two-Stage `[HypothesisLedger]` Interface-Lock & Swarm Proof-Fill Verifier (`STAGE_A_LOCKED` -> `STAGE_B_SEALED`)
+    Pipeline {
+        #[command(subcommand)]
+        sub: PipelineSubcommand,
+    },
+
+    /// Remote `hbox` + `bb2` `.olean` Hardlink Seed Pool, Health Prober & Bounded `lake build` Batcher
+    Broker {
+        #[command(subcommand)]
+        sub: BrokerSubcommand,
     },
 
     /// Donor History Namespace Manager (`refs/quarry/<donor>/*`) & 6-Gate Pre-Uptake Surgery Auditor
@@ -116,6 +164,140 @@ enum LintSubcommand {
         #[arg(long)]
         transport_bin: Option<PathBuf>,
 
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConeSubcommand {
+    /// Partition modules into K disjoint swarm write slices or validate proposed worker slices & `fan_in > 25` hub contention
+    Plan {
+        /// Number of parallel swarm worker shards when auto-partitioning
+        #[arg(long, default_value_t = 4)]
+        shards: usize,
+
+        /// Proposed parallel worker slice(s) `<shard_name>=<file1>,<file2>,...` to validate for disjointness & hub contention
+        #[arg(long = "propose")]
+        propose: Vec<String>,
+
+        /// Proposed Wave-0 barrier slice(s) `<shard_name>=<file1>,<file2>,...` allowed to edit `fan_in > 25` hubs before fanout
+        #[arg(long = "wave0")]
+        wave0: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApexSubcommand {
+    /// Report Apex theorem verification, per-subsystem compositional coverage %, and unwired leaf islands
+    Status {
+        /// Target repository root (strictly read-only)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Path to `obend-apex.toml` manifest (defaults to `<workspace>/quarry/obend-apex.toml`)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Enforce that all registered `[apex]` theorems exist with `0 sorry` / `0` custom axioms (and optional island cap)
+    Check {
+        /// Target repository root (strictly read-only)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Path to `obend-apex.toml` manifest (defaults to `<workspace>/quarry/obend-apex.toml`)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Require zero unwired leaf-island modules
+        #[arg(long)]
+        strict_islands: bool,
+
+        /// Fail if unwired leaf-island modules exceed `<MAX_ISLANDS>`
+        #[arg(long)]
+        max_islands: Option<usize>,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PipelineSubcommand {
+    /// Verify Stage-A `[HypothesisLedger]` interface lock or Stage-B concrete instance seal (`0 sorry`, `0 axiom`, acyclic, inhabited)
+    Check {
+        /// Target repository root (strictly read-only)
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Require `STAGE_B_SEALED` (fail if open Stage-A `[HypothesisLedger]` obligations remain)
+        #[arg(long)]
+        require_sealed: bool,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BrokerSubcommand {
+    /// Probe remote hosts (`bb2`, `hbox`) for load average, ZFS-ARC-aware free GiB, active `lean`/`lake` jobs & `>30m` runaways
+    Probe {
+        /// Comma-separated SSH host aliases to probe
+        #[arg(long, value_delimiter = ',', default_value = "bb2,hbox")]
+        hosts: Vec<String>,
+
+        /// Offline dry-run mode (emits probe telemetry script & synthetic baseline without spawning SSH)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Route & batch Lean/GPU/EDA targets into git-tree-seeded (`cp -al`), time/RSS-bounded remote `lake build` invocations
+    PlanBuild {
+        /// Build targets (module names like `Obend.Vault.Replay`, `.lean` paths, or executables like `rdna2-check`, `emit-sv`)
+        #[arg(required = true)]
+        targets: Vec<String>,
+
+        /// Host routing policy (`auto`, `bb2`, or `hbox`)
+        #[arg(long, default_value = "auto")]
+        host: String,
+
+        /// Hard wall-clock timeout per batched `lake build` invocation (wrapped in `timeout --kill-after=10s`)
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
+
+        /// Per-batch memory ceiling in GiB (`SWARM_MEM_MAX=<N>G swarm-build` or `ulimit -v`)
+        #[arg(long, default_value_t = 12)]
+        max_rss_gb: u64,
+
+        /// Optional local repository path used to derive the git-tree (`HEAD:lean`) `.olean` seed cache key
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Optional override for the remote `.olean` seed pool directory
+        #[arg(long)]
+        seed_root: Option<String>,
+
+        /// Offline dry-run mode (skips live SSH host probing and execution)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Execute the planned remote build recipe(s) over SSH
+        #[arg(long)]
+        exec: bool,
+
+        /// Emit structured JSON report
         #[arg(long)]
         json: bool,
     },
@@ -442,6 +624,7 @@ async fn run() -> Result<ExitCode> {
             json,
             rule,
             strict,
+            strict_expose,
             modularity,
             sub,
         } => {
@@ -479,7 +662,8 @@ async fn run() -> Result<ExitCode> {
                 });
             }
 
-            let mut report = run_repo_lints(&repo)?;
+            let mut report =
+                run_repo_lints_with_options(&repo, RepoLintOptions { strict_expose })?;
             if let Some(ref flt) = rule {
                 report = filter_report_by_rule(report, flt);
             }
@@ -496,6 +680,180 @@ async fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         }
+
+        Commands::Cone {
+            repo,
+            json,
+            max_depth,
+            sub,
+        } => {
+            let cone = scan_repo_cone(&repo, max_depth)?;
+            if let Some(ConeSubcommand::Plan {
+                shards,
+                propose,
+                wave0,
+            }) = sub
+            {
+                let mut proposed = Vec::new();
+                for spec in &wave0 {
+                    proposed.push(parse_proposed_shard_spec(spec, true)?);
+                }
+                for spec in &propose {
+                    proposed.push(parse_proposed_shard_spec(spec, false)?);
+                }
+                let plan = plan_cone_shards(&cone, shards, &proposed)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_human_cone_plan(&plan, cone.scan_ms);
+                }
+                return Ok(if plan.disjoint_write_slices {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                });
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cone)?);
+            } else {
+                print_human_cone_report(&cone);
+            }
+            if max_depth.is_some() && !cone.depth_violations.is_empty() {
+                Ok(ExitCode::from(2))
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
+        }
+
+        Commands::Apex { sub } => match sub {
+            ApexSubcommand::Status {
+                repo,
+                manifest,
+                json,
+            } => {
+                let mpath = resolve_apex_manifest_path(&cli.workspace, manifest)?;
+                let amanifest = ApexManifest::load_from_path(&mpath)?;
+                let rep = evaluate_apex(&repo, &amanifest, ApexCheckOptions::default())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_apex_report(&rep, "status");
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+
+            ApexSubcommand::Check {
+                repo,
+                manifest,
+                strict_islands,
+                max_islands,
+                json,
+            } => {
+                let mpath = resolve_apex_manifest_path(&cli.workspace, manifest)?;
+                let amanifest = ApexManifest::load_from_path(&mpath)?;
+                let rep = evaluate_apex(
+                    &repo,
+                    &amanifest,
+                    ApexCheckOptions {
+                        strict_islands,
+                        max_islands,
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_apex_report(&rep, "check");
+                }
+                Ok(if rep.check_passed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+        },
+
+        Commands::Pipeline { sub } => match sub {
+            PipelineSubcommand::Check {
+                repo,
+                require_sealed,
+                json,
+            } => {
+                let rep = check_pipeline(&repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_pipeline_report(&rep, require_sealed);
+                }
+                let ok = rep.passed
+                    && (!require_sealed || rep.stage == PipelineStage::StageBSealed);
+                Ok(if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                })
+            }
+        },
+
+        Commands::Broker { sub } => match sub {
+            BrokerSubcommand::Probe {
+                hosts,
+                dry_run,
+                json,
+            } => {
+                let cleaned: Vec<String> = hosts
+                    .into_iter()
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+                    .collect();
+                let rep = probe_hosts(&cleaned, &SshExecutor, dry_run);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_broker_probe(&rep);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+
+            BrokerSubcommand::PlanBuild {
+                targets,
+                host,
+                timeout_secs,
+                max_rss_gb,
+                repo,
+                seed_root,
+                dry_run,
+                exec,
+                json,
+            } => {
+                let host_choice = HostChoice::parse_str(&host)?;
+                let opts = BuildPlanOptions {
+                    host_choice,
+                    timeout_secs,
+                    max_rss_gb,
+                    dry_run,
+                    exec,
+                    repo_root: repo,
+                    remote_seed_root: seed_root,
+                };
+                let rep = broker_plan_build(&targets, &opts, &SshExecutor)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rep)?);
+                } else {
+                    print_human_broker_plan(&rep);
+                }
+                let any_failed = rep
+                    .batches
+                    .iter()
+                    .filter_map(|b| b.execution.as_ref())
+                    .any(|ex| ex.executed && ex.exit_code != 0);
+                Ok(if any_failed {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                })
+            }
+        },
 
         Commands::Quarry { sub } => match sub {
             QuarrySubcommand::Sync {
@@ -1050,6 +1408,50 @@ fn resolve_quarry_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> 
     )
 }
 
+fn resolve_apex_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    let ws_candidate = workspace.join(DEFAULT_APEX_MANIFEST_REL);
+    if ws_candidate.is_file() {
+        return Ok(ws_candidate);
+    }
+    let crate_root_candidate =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../").join(DEFAULT_APEX_MANIFEST_REL);
+    if crate_root_candidate.is_file() {
+        return Ok(crate_root_candidate);
+    }
+    bail!(
+        "apex manifest not found at {} (pass `--manifest <obend-apex.toml>`)",
+        ws_candidate.display()
+    )
+}
+
+fn parse_proposed_shard_spec(raw: &str, wave0_barrier: bool) -> Result<ProposedShard> {
+    let Some((name, files_csv)) = raw.split_once('=') else {
+        bail!(
+            "invalid shard slice `{raw}`; expected `<shard_name>=<file_or_module1>,<file_or_module2>,...`"
+        );
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("shard name in `{raw}` must be non-empty");
+    }
+    let files: Vec<String> = files_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        bail!("shard `{name}` in `{raw}` must list at least one module or `.lean` file");
+    }
+    Ok(ProposedShard {
+        name: name.to_string(),
+        files,
+        wave0_barrier,
+    })
+}
+
 fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: bool) {
     println!(
         "obb lint: repo={} files_scanned={} lean_decls={} lean_inductives={}",
@@ -1113,6 +1515,13 @@ fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: b
                 );
             }
         }
+        println!(
+            "\nModule-cone hygiene: max_public_cone_depth={} hubs(fan_in>25)={} file_wide_expose(>80L)={} public_meta_import_leaks={}",
+            m.max_public_cone_depth,
+            m.high_blast_radius_hubs.len(),
+            m.file_wide_expose_modules,
+            m.public_meta_import_leaks
+        );
     }
 
     if !rep.by_rule.is_empty() {
@@ -1351,6 +1760,343 @@ fn print_human_quarry_inspect(rep: &obb_quarry::QuarryInspectReport) {
                 "  ... ({} additional defects; pass `--json` for full list)",
                 rep.findings.len() - 60
             );
+        }
+    }
+}
+
+fn print_human_cone_report(rep: &obb_lint::cone::ConeReport) {
+    println!(
+        "obb cone: repo={} scan_ms={:.2}ms modules={} (`module`={}, legacy={})",
+        rep.repo_root,
+        rep.scan_ms,
+        rep.total_modules,
+        rep.module_system_files,
+        rep.legacy_non_module_files
+    );
+    println!(
+        "imports: public={} private={} meta={} | max_public_cone_depth={} | file_wide_expose(>80L)={} | public_meta_leaks={} | proof_cone_leaks={}",
+        rep.total_public_imports,
+        rep.total_private_imports,
+        rep.total_meta_imports,
+        rep.max_public_cone_depth,
+        rep.file_wide_expose_modules,
+        rep.public_meta_import_leaks.len(),
+        rep.proof_cone_leaks.len()
+    );
+    if !rep.critical_path.is_empty() {
+        println!(
+            "critical `public import` chain (depth {}): {}",
+            rep.max_public_cone_depth,
+            rep.critical_path.join(" -> ")
+        );
+    }
+    if !rep.high_blast_radius_hubs.is_empty() {
+        println!(
+            "\nHigh-blast-radius hubs (`fan_in > 25`, showing top {} of {} — require Wave-0 barrier):",
+            rep.high_blast_radius_hubs.len().min(20),
+            rep.high_blast_radius_hubs.len()
+        );
+        println!(
+            "  {:<42} {:>10} {:>12}  {}",
+            "Module", "PubFanIn", "BlastRadius", "Path"
+        );
+        for h in rep.high_blast_radius_hubs.iter().take(20) {
+            println!(
+                "  {:<42} {:>10} {:>12}  {}",
+                h.module, h.public_fan_in, h.blast_radius, h.path
+            );
+        }
+    }
+    if !rep.public_meta_import_leaks.is_empty() {
+        println!(
+            "\n`lean/public-meta-import-leak` findings ({}):",
+            rep.public_meta_import_leaks.len()
+        );
+        for lk in &rep.public_meta_import_leaks {
+            println!(
+                "  [ERROR] {}:{} ({}) -> `public meta import {}` outside Obend/{{Tactic,Elab}}",
+                lk.rel_path, lk.line, lk.module, lk.imported
+            );
+        }
+    }
+    if !rep.depth_violations.is_empty() {
+        println!(
+            "\n`--max-depth` violations ({}):",
+            rep.depth_violations.len()
+        );
+        for v in rep.depth_violations.iter().take(20) {
+            println!(
+                "  [FAIL] {} ({}) depth={} > max_allowed={}",
+                v.module, v.rel_path, v.depth, v.max_allowed
+            );
+        }
+    }
+}
+
+fn print_human_cone_plan(plan: &obb_lint::cone::ConePlanReport, scan_ms: f64) {
+    let verdict = if plan.disjoint_write_slices {
+        "DISJOINT"
+    } else {
+        "OVERLAP REFUSED"
+    };
+    println!(
+        "obb cone plan [{verdict}]: repo={} mode={} shards={} wave0_hubs(fan_in>{})={} scan_ms={:.2}ms",
+        plan.repo_root,
+        plan.mode,
+        plan.shards.len(),
+        plan.hub_threshold,
+        plan.wave0_barrier_hubs.len(),
+        scan_ms
+    );
+    if !plan.overlapping_assignments.is_empty() {
+        println!(
+            "\nOVERLAPPING WRITE SLICES ({} file(s) assigned to multiple workers):",
+            plan.overlapping_assignments.len()
+        );
+        for ov in &plan.overlapping_assignments {
+            println!("  [FAIL] {} -> owned by {:?}", ov.path, ov.shards);
+        }
+    }
+    if !plan.hub_warnings.is_empty() {
+        println!(
+            "\nHIGH-BLAST-RADIUS HUB CONTENTION WARNINGS ({}):",
+            plan.hub_warnings.len()
+        );
+        for w in &plan.hub_warnings {
+            println!("  [WARN] {}", w.message);
+        }
+    }
+    println!("\nPlanned worker shards:");
+    for s in &plan.shards {
+        println!(
+            "  - {:<12} modules={:<4} lines={:<7} max_blast={:<4} groups=[{}]",
+            s.name,
+            s.module_count,
+            s.total_lines,
+            s.max_blast_radius,
+            s.subsystem_groups.join(", ")
+        );
+    }
+}
+
+fn print_human_apex_report(rep: &obb_lint::apex::ApexReport, subcmd: &str) {
+    let verdict = if rep.check_passed { "PASS" } else { "FAIL" };
+    println!(
+        "obb apex {subcmd} [{verdict}]: repo={} apex_valid={}/{} planned_materialized={}/{}",
+        rep.repo_root,
+        rep.valid_apex_count,
+        rep.registered_apex_count,
+        rep.planned_materialized_count,
+        rep.planned_apex_count
+    );
+    println!(
+        "coverage: apex_cone={}/{} modules ({:.1}%) | wired(apex+exe)={}/{} ({:.1}%) | apex_decls={}/{} | unwired_leaf_islands={}",
+        rep.apex_covered_library_modules,
+        rep.total_library_modules,
+        rep.overall_apex_coverage_pct,
+        rep.wired_library_modules,
+        rep.total_library_modules,
+        rep.overall_wired_coverage_pct,
+        rep.apex_reachable_declarations,
+        rep.total_library_declarations,
+        rep.unwired_island_count
+    );
+
+    println!("\nApex Compositional Coverage by Subsystem:");
+    println!(
+        "  {:<14} {:>5} {:>7} {:>9} {:>8} {:>9} {:>8} {:>8}",
+        "Subsystem", "Apex#", "Modules", "ApexCone", "Apex%", "Wired", "Wired%", "Islands"
+    );
+    for s in &rep.subsystem_coverage {
+        println!(
+            "  {:<14} {:>5} {:>7} {:>9} {:>7.1}% {:>9} {:>7.1}% {:>8}",
+            s.subsystem,
+            s.registered_apex_theorems,
+            s.total_modules,
+            s.apex_covered_modules,
+            s.apex_coverage_pct,
+            s.wired_modules,
+            s.wired_coverage_pct,
+            s.unwired_islands
+        );
+    }
+
+    println!("\nRegistered `[apex]` Whole-System Theorems ({}):", rep.apex_theorems.len());
+    for a in &rep.apex_theorems {
+        let tag = if a.valid { "PASS" } else { "FAIL" };
+        println!(
+            "  [{tag}] {:<36} {:<10} {}::{} (cone={} mods, {} decls, sorry={}, axiom={})",
+            a.id,
+            a.subsystem,
+            a.module,
+            a.theorem,
+            a.cone_modules,
+            a.cone_declarations,
+            a.sorry_count,
+            a.custom_axiom_count
+        );
+        for off in &a.offenders {
+            println!("         offender: {off}");
+        }
+    }
+
+    if !rep.planned_apex.is_empty() {
+        println!("\nPlanned Wave 4–5 Vertical Spines (`[planned_apex]`):");
+        for p in &rep.planned_apex {
+            let st = if p.materialized { "MATERIALIZED" } else { "PENDING" };
+            println!(
+                "  [{st:<12}] [{}] {:<32} {}::{} ({})",
+                p.pillar, p.id, p.target_module, p.target_theorem, p.wave
+            );
+        }
+    }
+
+    if !rep.failure_reasons.is_empty() {
+        println!("\nApex Gate Refusals ({}):", rep.failure_reasons.len());
+        for r in &rep.failure_reasons {
+            println!("  [FAIL] {r}");
+        }
+    }
+
+    if !rep.unwired_leaf_islands.is_empty() {
+        println!(
+            "\nUnwired leaf-island modules in `lean/Obend/` (showing up to 30 of {}):",
+            rep.unwired_leaf_islands.len()
+        );
+        for isl in rep.unwired_leaf_islands.iter().take(30) {
+            println!(
+                "  [{:<10}] {:<44} ({:>4} lines, {:>2} thms) {}",
+                isl.subsystem, isl.module, isl.lines, isl.theorems, isl.rel_path
+            );
+        }
+        if rep.unwired_leaf_islands.len() > 30 {
+            println!(
+                "  ... ({} additional unwired leaf islands; pass `--json` for full list)",
+                rep.unwired_leaf_islands.len() - 30
+            );
+        }
+    }
+}
+
+fn print_human_pipeline_report(rep: &obb_judge::pipeline::PipelineReport, require_sealed: bool) {
+    println!(
+        "obb pipeline check [{}]: repo={} ready_for_parallel_swarm={} ready_for_claimed={}",
+        rep.stage, rep.repo_root, rep.ready_for_parallel_swarm, rep.ready_for_claimed
+    );
+    println!(
+        "obligations: total={} sealed={} open_stage_a={} consumer_sites={} | smuggled_sorry={} smuggled_axiom={}",
+        rep.total_obligations,
+        rep.sealed_obligations,
+        rep.open_stage_a_obligations,
+        rep.consumer_sites.len(),
+        rep.smuggled_sorry_count,
+        rep.smuggled_axiom_count
+    );
+    if !rep.obligations.is_empty() {
+        println!("\nHypothesisLedger / @[obb_obligation] classes:");
+        for ob in &rep.obligations {
+            let st = if ob.discharged { "SEALED" } else { "OPEN_STAGE_A" };
+            println!(
+                "  [{st:<12}] {} ({}:{}) fields={} consumers={} instances={}",
+                ob.fq_name,
+                ob.path,
+                ob.line,
+                ob.field_count,
+                ob.consumer_count,
+                ob.discharging_instances.len()
+            );
+        }
+    }
+    if !rep.violations.is_empty() {
+        println!("\nPipeline Violations ({}):", rep.violations.len());
+        for v in &rep.violations {
+            println!(
+                "  [FAIL][{}] {}:{} `{}`: {}\n    fix: {}",
+                v.kind, v.path, v.line, v.symbol, v.message, v.remediation
+            );
+        }
+    } else if require_sealed && rep.stage != PipelineStage::StageBSealed {
+        println!(
+            "\n[FAIL] `--require-sealed` is set, but {} Stage-A `[HypothesisLedger]` obligation(s) remain undischarged.",
+            rep.open_stage_a_obligations
+        );
+    }
+}
+
+fn print_human_broker_probe(rep: &obb_broker::BrokerProbeReport) {
+    println!(
+        "obb broker probe: dry_run={} recommended_general_host={}",
+        rep.dry_run,
+        rep.recommended_general_host.as_deref().unwrap_or("<none>")
+    );
+    for h in &rep.hosts {
+        println!(
+            "  {:<8} reachable={:<5} cores={:<2} load=({:.2},{:.2},{:.2}) free={:>6.1}/{:>6.1} GiB (zfs_arc={:>5.1} GiB) disk={:>6.1} GiB active_lean={} runaways(>30m)={} swarm_build={} score={:>5.1} ({})",
+            h.host,
+            h.reachable,
+            h.cpu_cores,
+            h.load_1m,
+            h.load_5m,
+            h.load_15m,
+            h.mem_free_gib,
+            h.mem_total_gib,
+            h.zfs_arc_reclaimable_gib,
+            h.disk_free_gib,
+            h.active_lean_lake_procs,
+            h.runaway_procs.len(),
+            h.has_swarm_build,
+            h.health_score,
+            h.note
+        );
+        for r in &h.runaway_procs {
+            println!(
+                "    [RUNAWAY] pid={} age={}s rss={}MiB {} `{}`",
+                r.pid, r.elapsed_secs, r.rss_mib, r.comm, r.args
+            );
+        }
+    }
+}
+
+fn print_human_broker_plan(rep: &obb_broker::BuildPlanReport) {
+    println!(
+        "obb broker plan-build: targets={} batches={} seed_key={} timeout={}s max_rss={}GiB",
+        rep.total_targets,
+        rep.total_batches,
+        &rep.seed_key[..rep.seed_key.len().min(16)],
+        rep.timeout_secs,
+        rep.max_rss_gb
+    );
+    for w in &rep.warnings {
+        println!("  [WARN] {w}");
+    }
+    println!("\nTarget routing:");
+    for r in &rep.routing {
+        println!(
+            "  {:<36} -> {:<6} [{}] ({})",
+            r.lake_target, r.assigned_host, r.workload_class, r.reason
+        );
+    }
+    for b in &rep.batches {
+        println!(
+            "\nBatch on `{}` ({} target(s), seed_pool={}):\n  cmd: {}",
+            b.host,
+            b.lake_targets.len(),
+            b.seed_pool_dir,
+            b.batched_lake_command
+        );
+        if let Some(ref ex) = b.execution {
+            println!(
+                "  execution: exit_code={} duration_ms={}",
+                ex.exit_code, ex.duration_ms
+            );
+            if !ex.stdout_tail.is_empty() {
+                println!("  stdout:\n{}", ex.stdout_tail);
+            }
+            if !ex.stderr_tail.is_empty() {
+                println!("  stderr:\n{}", ex.stderr_tail);
+            }
+        } else {
+            println!("  recipe:\n{}", b.remote_recipe.trim_end());
         }
     }
 }

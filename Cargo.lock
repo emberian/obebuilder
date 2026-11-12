@@ -624,6 +624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "obb-broker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "obb-cli"
 version = "0.1.0"
 dependencies = [
@@ -631,6 +641,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "obb-broker",
  "obb-core",
  "obb-judge",
  "obb-lint",
@@ -680,6 +691,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "walkdir",
 ]
 

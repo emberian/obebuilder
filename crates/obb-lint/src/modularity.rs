@@ -189,6 +189,8 @@ pub fn compute_modularity_report(index: &LeanIndex) -> ModularityReport {
     };
     let compositionality_index = round2((reuse_score + interface_score + hygiene_score).clamp(0.0, 100.0));
 
+    let cone = crate::cone::compute_cone_from_index("", index, None);
+
     ModularityReport {
         monolithic_line_threshold: MONOLITHIC_LINE_THRESHOLD,
         lean_files,
@@ -205,6 +207,11 @@ pub fn compute_modularity_report(index: &LeanIndex) -> ModularityReport {
         carrier_to_leaf_ratio,
         theorem_reuse_ratio,
         compositionality_index,
+        max_public_cone_depth: cone.max_public_cone_depth,
+        critical_path: cone.critical_path,
+        high_blast_radius_hubs: cone.high_blast_radius_hubs,
+        file_wide_expose_modules: cone.file_wide_expose_modules,
+        public_meta_import_leaks: cone.public_meta_import_leaks.len(),
         monolithic_modules,
         by_directory: dir_map.into_values().collect(),
     }

@@ -5,7 +5,30 @@ use crate::lean_lexer::{LeanToken, LeanTokenKind};
 use obb_core::{ArtifactKind, DirectoryCensus, Finding, Regime, Severity, Sink};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+pub const FILE_WIDE_EXPOSE_LINE_THRESHOLD: usize = 80;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LeanLintOptions {
+    /// Escalate `lean/file-wide-expose` from `Severity::Warning` (legacy default) to `Severity::Error`.
+    pub strict_expose: bool,
+}
+
+pub fn is_allowed_public_meta_import_path(rel_path: &str) -> bool {
+    let norm = rel_path.strip_prefix("lean/").unwrap_or(rel_path);
+    norm.starts_with("Obend/Tactic/")
+        || norm.starts_with("Obend/Elab/")
+        || rel_path.contains("/Obend/Tactic/")
+        || rel_path.contains("/Obend/Elab/")
+}
+
 pub fn run_lean_lints(index: &LeanIndex) -> (Vec<Finding>, Vec<DirectoryCensus>) {
+    run_lean_lints_with_options(index, LeanLintOptions::default())
+}
+
+pub fn run_lean_lints_with_options(
+    index: &LeanIndex,
+    options: LeanLintOptions,
+) -> (Vec<Finding>, Vec<DirectoryCensus>) {
     let mut findings = Vec::new();
     let mut dir_map: BTreeMap<String, DirectoryCensus> = BTreeMap::new();
 
@@ -21,6 +44,62 @@ pub fn run_lean_lints(index: &LeanIndex) -> (Vec<Finding>, Vec<DirectoryCensus>)
 
         let is_teeth_or_test = is_teeth_or_test_path(&file.rel_path);
         let is_test_only = is_test_only_path(&file.rel_path);
+
+        // LAW-M1: Ban top-level `@[expose] public section` in files > 80 lines
+        if !is_test_only
+            && file.line_count > FILE_WIDE_EXPOSE_LINE_THRESHOLD
+            && !file.expose_public_sections.is_empty()
+        {
+            for &(eline, ecol) in &file.expose_public_sections {
+                findings.push(Finding {
+                    rule_id: "lean/file-wide-expose".to_string(),
+                    severity: if options.strict_expose {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                    artifact_kind: ArtifactKind::P,
+                    max_regime: Regime::Decided,
+                    sink: Some(Sink::Slow),
+                    path: file.rel_path.clone(),
+                    line: eline,
+                    column: ecol,
+                    symbol: None,
+                    message: format!(
+                        "Module `{}` ({} lines > {}-line cap) places `@[expose] public section` at top level, exporting all definition bodies into `.olean` public headers and kernel WHNF",
+                        file.rel_path, file.line_count, FILE_WIDE_EXPOSE_LINE_THRESHOLD
+                    ),
+                    remediation: "Replace top-level `@[expose] public section` with Lean 4.35 `module` + `public section` so recursive bodies stay sealed in `.olean.private`, and attach selective `@[expose]` only on <= 10-line projections/types needed for definitional typechecking (use private `import all` inside `Proofs/`).".to_string(),
+                });
+            }
+        }
+
+        // LAW-M6: `public meta import Lean` leakage outside `Obend/Tactic/` or `Obend/Elab/`
+        if !is_test_only && !is_allowed_public_meta_import_path(&file.rel_path) {
+            for imp in &file.imports {
+                if imp.is_public
+                    && imp.is_meta
+                    && (imp.module == "Lean" || imp.module.starts_with("Lean."))
+                {
+                    findings.push(Finding {
+                        rule_id: "lean/public-meta-import-leak".to_string(),
+                        severity: Severity::Error,
+                        artifact_kind: ArtifactKind::P,
+                        max_regime: Regime::Decided,
+                        sink: Some(Sink::Slow),
+                        path: file.rel_path.clone(),
+                        line: imp.line,
+                        column: imp.col,
+                        symbol: Some(imp.module.clone()),
+                        message: format!(
+                            "Module `{}` declares `public meta import {}` outside `Obend/Tactic/` or `Obend/Elab/`, dragging `Lean.Elab` compiler internals into downstream `.olean` cones",
+                            file.rel_path, imp.module
+                        ),
+                        remediation: "Move `CommandElabM`/`TacticM` metaprograms under `lean/Obend/Tactic/` or `lean/Obend/Elab/`, or downgrade to private `meta import` so downstream importers do not transitively load `Lean`.".to_string(),
+                    });
+                }
+            }
+        }
 
         // Module-level monolithic file budget check (> 1,500 lines risks RSS blowup)
         if !is_test_only && file.line_count > crate::modularity::MONOLITHIC_LINE_THRESHOLD {

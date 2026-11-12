@@ -210,6 +210,15 @@ pub struct DirectoryModularity {
     pub carrier_to_leaf_ratio: f64,
 }
 
+/// High-blast-radius `.lean` hub whose public `.olean` header rebuilds many downstream modules.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConeHubSummary {
+    pub module: String,
+    pub path: String,
+    pub public_fan_in: usize,
+    pub blast_radius: usize,
+}
+
 /// Repository-wide Modularity & Compositionality Index (`obb lint --modularity`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModularityReport {
@@ -231,6 +240,16 @@ pub struct ModularityReport {
     pub theorem_reuse_ratio: f64,
     /// Composite 0..100 modularity score weighting theorem reuse, algebraic interfaces, and module size bounds.
     pub compositionality_index: f64,
+    #[serde(default)]
+    pub max_public_cone_depth: usize,
+    #[serde(default)]
+    pub critical_path: Vec<String>,
+    #[serde(default)]
+    pub high_blast_radius_hubs: Vec<ConeHubSummary>,
+    #[serde(default)]
+    pub file_wide_expose_modules: usize,
+    #[serde(default)]
+    pub public_meta_import_leaks: usize,
     pub monolithic_modules: Vec<MonolithicModule>,
     pub by_directory: Vec<DirectoryModularity>,
 }

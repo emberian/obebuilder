@@ -6,6 +6,7 @@ members = [
     "crates/obb-judge",
     "crates/obb-quarry",
     "crates/obb-state",
+    "crates/obb-broker",
     "crates/obb-cli",
 ]
 
@@ -37,3 +38,4 @@ obb-lint = { path = "crates/obb-lint" }
 obb-judge = { path = "crates/obb-judge" }
 obb-quarry = { path = "crates/obb-quarry" }
 obb-state = { path = "crates/obb-state" }
+obb-broker = { path = "crates/obb-broker" }

@@ -46,6 +46,16 @@ pub struct WhereField {
     pub col: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LeanImport {
+    pub module: String,
+    pub is_public: bool,
+    pub is_meta: bool,
+    pub is_all: bool,
+    pub line: usize,
+    pub col: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedLeanDecl {
     pub kind: DeclKind,
@@ -55,6 +65,7 @@ pub struct ParsedLeanDecl {
     pub line: usize,
     pub col: usize,
     pub fixture_kept: bool,
+    pub attributes: Vec<String>,
     pub binders: Vec<BinderParam>,
     pub type_tokens: Vec<LeanToken>,
     pub body_tokens: Vec<LeanToken>,
@@ -68,6 +79,10 @@ pub struct ParsedLeanFile {
     pub rel_path: String,
     pub directory_bucket: String,
     pub line_count: usize,
+    pub has_module_kw: bool,
+    pub imports: Vec<LeanImport>,
+    pub expose_public_sections: Vec<(usize, usize)>,
+    pub section_variables: Vec<BinderParam>,
     pub declarations: Vec<ParsedLeanDecl>,
     pub tooth_targets: Vec<(String, usize)>,
     pub assert_compiled_targets: Vec<(String, usize)>,
@@ -163,8 +178,36 @@ fn is_modifier_ident(s: &str) -> bool {
 }
 
 fn is_top_command_starter(tok: &LeanToken) -> bool {
-    if !tok.first_on_line || tok.col > 1 {
+    if !tok.first_on_line || tok.col > 3 {
         return false;
+    }
+    if tok.col > 1 {
+        return match &tok.kind {
+            LeanTokenKind::CommandHash(_) => true,
+            LeanTokenKind::Symbol(s) if s == "@[" => true,
+            LeanTokenKind::Ident(s) => {
+                is_modifier_ident(s)
+                    || matches!(
+                        s.as_str(),
+                        "theorem"
+                            | "lemma"
+                            | "def"
+                            | "abbrev"
+                            | "opaque"
+                            | "axiom"
+                            | "instance"
+                            | "example"
+                            | "inductive"
+                            | "structure"
+                            | "class"
+                            | "namespace"
+                            | "section"
+                            | "end"
+                            | "variable"
+                    )
+            }
+            _ => false,
+        };
     }
     match &tok.kind {
         LeanTokenKind::CommandHash(_) => true,
@@ -231,6 +274,10 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
     let tokens = tokenize_lean(src);
     let n = tokens.len();
     let mut ns_stack: Vec<(bool, Vec<String>)> = Vec::new(); // (is_namespace, components)
+    let mut has_module_kw = false;
+    let mut imports = Vec::new();
+    let mut expose_public_sections = Vec::new();
+    let mut section_variables = Vec::new();
     let mut declarations = Vec::new();
     let mut tooth_targets = Vec::new();
     let mut assert_compiled_targets = Vec::new();
@@ -412,9 +459,12 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
             }
         }
 
-        // Skip leading `@[...]` attributes and modifiers (`public`, `private`, `meta`, `noncomputable`, etc.)
+        // Collect leading `@[...]` attributes and modifiers (`public`, `private`, `meta`, `noncomputable`, etc.)
         let decl_start = i;
         let mut cursor = i;
+        let mut attrs: Vec<String> = Vec::new();
+        let mut mods: Vec<String> = Vec::new();
+        let mut attr_start_pos: Option<(usize, usize)> = None;
         while cursor < n {
             match &tokens[cursor].kind {
                 LeanTokenKind::DocComment(_) => {
@@ -425,18 +475,25 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                     cursor += 1;
                 }
                 LeanTokenKind::Symbol(s) if s == "@[" => {
+                    if attr_start_pos.is_none() {
+                        attr_start_pos = Some((tokens[cursor].line, tokens[cursor].col));
+                    }
                     cursor += 1;
                     let mut depth = 1usize;
                     while cursor < n && depth > 0 {
                         match &tokens[cursor].kind {
                             LeanTokenKind::Symbol(o) if o == "[" || o == "@[" => depth += 1,
                             LeanTokenKind::Symbol(c) if c == "]" => depth -= 1,
+                            LeanTokenKind::Ident(attr_id) if depth == 1 => {
+                                attrs.push(attr_id.clone());
+                            }
                             _ => {}
                         }
                         cursor += 1;
                     }
                 }
                 LeanTokenKind::Ident(m) if is_modifier_ident(m) => {
+                    mods.push(m.clone());
                     cursor += 1;
                 }
                 _ => break,
@@ -455,10 +512,128 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
             }
         };
 
-        // Handle `public section`
-        if kw == "section" && cursor > decl_start {
-            ns_stack.push((false, Vec::new()));
+        // Handle `module` header keyword
+        if kw == "module" && cursor == decl_start && tokens[cursor].col == 1 {
+            has_module_kw = true;
             i = cursor + 1;
+            continue;
+        }
+
+        // Handle `[public] [meta] import [all] <Module>...`
+        if kw == "import" {
+            let imp_line = tokens[decl_start].line;
+            let imp_col = tokens[decl_start].col;
+            let is_public = mods.iter().any(|m| m == "public");
+            let is_meta = mods.iter().any(|m| m == "meta");
+            let mut j = cursor + 1;
+            let mut is_all = false;
+            if j < n && tokens[j].line == tokens[cursor].line {
+                if matches!(&tokens[j].kind, LeanTokenKind::Ident(s) if s == "all") {
+                    is_all = true;
+                    j += 1;
+                }
+            }
+            while j < n {
+                if j > cursor + 1 && tokens[j].first_on_line {
+                    break;
+                }
+                if let LeanTokenKind::Ident(mod_name) = &tokens[j].kind {
+                    imports.push(LeanImport {
+                        module: mod_name.clone(),
+                        is_public,
+                        is_meta,
+                        is_all,
+                        line: imp_line,
+                        col: imp_col,
+                    });
+                }
+                j += 1;
+            }
+            pending_fixture_kept = false;
+            i = j;
+            continue;
+        }
+
+        // Handle `[attribute] [public] section [Name]`
+        if kw == "section" && cursor > decl_start {
+            let is_pub = mods.iter().any(|m| m == "public");
+            let has_expose = attrs.iter().any(|a| a == "expose");
+            if is_pub && has_expose && ns_stack.iter().all(|(is_ns, _)| *is_ns) {
+                let (eline, ecol) =
+                    attr_start_pos.unwrap_or((tokens[decl_start].line, tokens[decl_start].col));
+                expose_public_sections.push((eline, ecol));
+            }
+            let mut parts = Vec::new();
+            let mut next_i = cursor + 1;
+            if let Some(LeanToken {
+                kind: LeanTokenKind::Ident(sec),
+                line: sline,
+                ..
+            }) = tokens.get(cursor + 1)
+            {
+                if *sline == tokens[cursor].line {
+                    parts = sec.split('.').map(str::to_string).collect();
+                    next_i = cursor + 2;
+                }
+            }
+            ns_stack.push((false, parts));
+            pending_fixture_kept = false;
+            i = next_i;
+            continue;
+        }
+
+        // Handle `variable (...) [...] {...}` commands for section-scoped `[HypothesisLedger ...]`
+        if kw == "variable" {
+            let mut v_end = cursor + 1;
+            let mut bdepth = 0isize;
+            while v_end < n {
+                if bdepth == 0 && v_end > cursor + 1 && is_top_command_starter(&tokens[v_end]) {
+                    break;
+                }
+                match &tokens[v_end].kind {
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
+                        if bdepth == 0 {
+                            let open = s.as_str();
+                            let close = match open {
+                                "(" => ")",
+                                "[" => "]",
+                                _ => "}",
+                            };
+                            let gstart = v_end + 1;
+                            let mut d = 1usize;
+                            let mut k = v_end + 1;
+                            while k < n && d > 0 {
+                                match &tokens[k].kind {
+                                    LeanTokenKind::Symbol(o) if o == open => d += 1,
+                                    LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                                    _ => {}
+                                }
+                                k += 1;
+                            }
+                            let gend = k.saturating_sub(1);
+                            if gstart <= gend && gend <= n {
+                                extract_binder_group(
+                                    &tokens[gstart..gend],
+                                    open == "[",
+                                    &mut section_variables,
+                                );
+                            }
+                            v_end = k;
+                            continue;
+                        }
+                        bdepth += 1;
+                    }
+                    LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                        if bdepth > 0 {
+                            bdepth -= 1;
+                        }
+                    }
+                    _ => {}
+                }
+                v_end += 1;
+            }
+            pending_fixture_kept = false;
+            i = v_end;
             continue;
         }
 
@@ -522,6 +697,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
             cmd_line,
             cmd_col,
             pending_fixture_kept,
+            attrs,
         ) {
             declarations.push(parsed);
         }
@@ -533,6 +709,10 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
         rel_path: rel_path.to_string(),
         directory_bucket: directory_bucket_of(rel_path),
         line_count,
+        has_module_kw,
+        imports,
+        expose_public_sections,
+        section_variables,
         declarations,
         tooth_targets,
         assert_compiled_targets,
@@ -568,6 +748,7 @@ fn parse_command_slice(
     line: usize,
     col: usize,
     fixture_kept: bool,
+    attributes: Vec<String>,
 ) -> Option<ParsedLeanDecl> {
     if cmd.is_empty() {
         return None;
@@ -631,6 +812,7 @@ fn parse_command_slice(
             line,
             col,
             fixture_kept,
+            attributes,
             binders: Vec::new(),
             type_tokens: Vec::new(),
             body_tokens,
@@ -779,6 +961,7 @@ fn parse_command_slice(
             line,
             col,
             fixture_kept,
+            attributes,
             binders: Vec::new(),
             type_tokens: header_type_tokens,
             body_tokens: Vec::new(),
@@ -792,11 +975,47 @@ fn parse_command_slice(
     if kind == DeclKind::Structure || kind == DeclKind::Class {
         let mut fields = Vec::new();
         let mut struct_fields = Vec::new();
+        let mut struct_binders = Vec::new();
         let mut header_type_tokens = Vec::new();
         let mut depth = 0isize;
         let mut after_where = false;
         let mut header_colon_idx: Option<usize> = None;
+        let mut extends_idx: Option<usize> = None;
         let mut where_idx: Option<usize> = None;
+        // Extract header binders `(α : Type) [Foo α]` before `extends` / `:` / `where`
+        let mut b_idx = pos;
+        while b_idx < cmd.len() {
+            match &cmd[b_idx].kind {
+                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[") => {
+                    let open = s.as_str();
+                    let close = match open {
+                        "(" => ")",
+                        "{" => "}",
+                        _ => "]",
+                    };
+                    let gstart = b_idx + 1;
+                    let mut d = 1usize;
+                    b_idx += 1;
+                    while b_idx < cmd.len() && d > 0 {
+                        match &cmd[b_idx].kind {
+                            LeanTokenKind::Symbol(o) if o == open => d += 1,
+                            LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                            _ => {}
+                        }
+                        b_idx += 1;
+                    }
+                    let gend = b_idx.saturating_sub(1);
+                    if gstart <= gend && gend <= cmd.len() {
+                        extract_binder_group(
+                            &cmd[gstart..gend],
+                            open == "[",
+                            &mut struct_binders,
+                        );
+                    }
+                }
+                _ => break,
+            }
+        }
         for (idx, tok) in cmd.iter().enumerate().skip(pos) {
             match &tok.kind {
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
@@ -804,6 +1023,9 @@ fn parse_command_slice(
                     if depth > 0 {
                         depth -= 1;
                     }
+                }
+                LeanTokenKind::Ident(s) if s == "extends" && !after_where && depth == 0 && extends_idx.is_none() => {
+                    extends_idx = Some(idx);
                 }
                 LeanTokenKind::Symbol(s) if s == ":" && !after_where && depth == 0 && header_colon_idx.is_none() => {
                     header_colon_idx = Some(idx);
@@ -869,8 +1091,12 @@ fn parse_command_slice(
                 _ => {}
             }
         }
-        if let Some(hc) = header_colon_idx {
-            let end_hdr = where_idx.unwrap_or(cmd.len());
+        let end_hdr = where_idx.unwrap_or(cmd.len());
+        if let Some(ext) = extends_idx {
+            if ext <= end_hdr {
+                header_type_tokens = cmd[ext..end_hdr].to_vec();
+            }
+        } else if let Some(hc) = header_colon_idx {
             if hc + 1 <= end_hdr {
                 header_type_tokens = cmd[hc + 1..end_hdr].to_vec();
             }
@@ -883,7 +1109,8 @@ fn parse_command_slice(
             line,
             col,
             fixture_kept,
-            binders: Vec::new(),
+            attributes,
+            binders: struct_binders,
             type_tokens: header_type_tokens,
             body_tokens: Vec::new(),
             where_fields: Vec::new(),
@@ -1002,6 +1229,7 @@ fn parse_command_slice(
         line,
         col,
         fixture_kept,
+        attributes,
         binders,
         type_tokens,
         body_tokens,

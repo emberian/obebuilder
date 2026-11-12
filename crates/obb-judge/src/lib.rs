@@ -5,6 +5,8 @@
 //! (e.g. `tier1_module_sec_cap <= 60` -> `<= 600`), dropping a floor, dropping `revert@1`,
 //! or expanding the trust base without an explicit `LobCost` ledger entry is refused by name.
 
+pub mod pipeline;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use obb_lint::lean_index::{DeclKind, build_lean_index};

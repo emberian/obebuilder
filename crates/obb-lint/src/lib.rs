@@ -1,6 +1,8 @@
 //! `obb-lint`: Mechanical anti-slop, vacuity, cross-language mirror, and Markdown symbol/constructor
 //! verification engine (`DESIGN.md` §2.5–2.6, §6.1, `JUDGE.md`).
 
+pub mod apex;
+pub mod cone;
 pub mod lean_index;
 pub mod lean_lexer;
 pub mod lean_rules;
@@ -14,7 +16,7 @@ pub mod spec_check;
 use anyhow::Result;
 use chrono::Utc;
 use lean_index::build_lean_index;
-use lean_rules::run_lean_lints;
+use lean_rules::{LeanLintOptions, run_lean_lints_with_options};
 use markdown_rules::scan_markdown_files;
 use modularity::compute_modularity_report;
 use obb_core::{DirectoryCensus, Finding, LintReport, Severity};
@@ -24,9 +26,23 @@ use rust_rules::scan_rust_files;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepoLintOptions {
+    /// Escalate `lean/file-wide-expose` from `Severity::Warning` to `Severity::Error`.
+    pub strict_expose: bool,
+}
+
 /// Run all mechanical anti-slop, vacuity, seam-mirror, and doc-integrity checks over `repo_root`
 /// strictly read-only.
 pub fn run_repo_lints(repo_root: &Path) -> Result<LintReport> {
+    run_repo_lints_with_options(repo_root, RepoLintOptions::default())
+}
+
+/// Run all mechanical lints over `repo_root` with configurable rule strictness.
+pub fn run_repo_lints_with_options(
+    repo_root: &Path,
+    options: RepoLintOptions,
+) -> Result<LintReport> {
     let canon = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -37,7 +53,12 @@ pub fn run_repo_lints(repo_root: &Path) -> Result<LintReport> {
     let lean_inds = index.total_inductives();
 
     let modularity = compute_modularity_report(&index);
-    let (mut findings, mut dir_census) = run_lean_lints(&index);
+    let (mut findings, mut dir_census) = run_lean_lints_with_options(
+        &index,
+        LeanLintOptions {
+            strict_expose: options.strict_expose,
+        },
+    );
     let (obend_count, obend_findings) = scan_all_obend_files(&canon);
     let (py_count, py_findings) = scan_python_files(&canon);
     let (rs_count, rs_findings) = scan_rust_files(&canon);
