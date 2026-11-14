@@ -14,6 +14,7 @@ pub mod obend_rules;
 pub mod python_rules;
 pub mod rust_rules;
 pub mod spec_check;
+pub mod test_in_library;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -29,6 +30,55 @@ use rust_rules::scan_rust_files;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Canonical sorted list of static lexical/AST lint rule IDs evaluated by `run_repo_lints_with_options`.
+///
+/// Note: `lean/spec-insensitive-change` is intentionally NOT in this static list because it requires
+/// an external `lean-transport` census measurement rather than a pure static repo scan.
+pub const KNOWN_STATIC_LINT_RULE_IDS: &[&str] = &[
+    "cross-lang/domain-tag-drift",
+    "javascript/test-in-library",
+    "lean/closed-soundness-claim",
+    "lean/cosplay-naming",
+    "lean/discarded-tactic-binding",
+    "lean/excessive-decl-expose",
+    "lean/file-wide-expose",
+    "lean/hardcoded-wire-decoder",
+    "lean/judge-empty-fragment",
+    "lean/judge-fragment-restates-check",
+    "lean/monolithic-module",
+    "lean/narrow-digest-weld",
+    "lean/native-decide-in-proof",
+    "lean/obligation-projection-cosplay",
+    "lean/obligation-tautological-field",
+    "lean/pigeonhole-vacuous-premise",
+    "lean/public-meta-import-leak",
+    "lean/single-sequence-harness",
+    "lean/sorry-or-axiom",
+    "lean/tautological-judge-meaning",
+    "lean/test-in-library",
+    "lean/trivial-conclusion",
+    "lean/uninhabited-premise-risk",
+    "lean/unused-param",
+    "markdown/hallucinated-constructor",
+    "markdown/missing-cited-file",
+    "markdown/missing-lean-file",
+    "markdown/missing-lean-symbol",
+    "markdown/navel-prose",
+    "obend/claim-restates-method",
+    "obend/tautological-law",
+    "python/e2e-mock-bridge",
+    "python/e2e-self-mock",
+    "python/test-in-library",
+    "rust/mock-backend-in-src",
+    "rust/obend-semantic-mirror",
+    "rust/test-in-library",
+];
+
+/// Returns `true` iff `rule_id` is a real static rule evaluated by `run_repo_lints_with_options`.
+pub fn is_known_static_lint_rule_id(rule_id: &str) -> bool {
+    KNOWN_STATIC_LINT_RULE_IDS.binary_search(&rule_id).is_ok()
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RepoLintOptions {
     /// Escalate `lean/file-wide-expose` and `lean/excessive-decl-expose` from `Severity::Warning` to `Severity::Error`.
@@ -39,7 +89,7 @@ pub struct RepoLintOptions {
     pub strict_vacuity: bool,
     /// Escalate `cross-lang/domain-tag-drift` from `Severity::Warning` to `Severity::Error`.
     pub strict_wire: bool,
-    /// Enable `lean/test-in-library` (`Severity::Error` on `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules outside `lean/Obend/Teeth/`).
+    /// Reject executable test declarations in Rust, JS/TS, Python and Lean library sources.
     pub strict_tests: bool,
 }
 
@@ -85,6 +135,9 @@ pub fn run_repo_lints_with_options(
     findings.extend(rs_findings);
     findings.extend(cross_lang_findings);
     findings.extend(md_findings);
+    if options.strict_tests {
+        findings.extend(test_in_library::scan_test_in_library(&canon)?);
+    }
 
     // Deterministic ordering by `(path, line, column, rule_id)`
     findings.sort_by(|a, b| {

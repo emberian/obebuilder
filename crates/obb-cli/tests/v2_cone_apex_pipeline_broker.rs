@@ -4,9 +4,11 @@
 //! 3. `obb pipeline` Two-Stage `[HypothesisLedger]` Interface-Lock (`STAGE_A_LOCKED` -> `STAGE_B_SEALED`) & Smuggling Refusal
 //! 4. `obb broker` Remote `hbox` + `bb2` ZFS-ARC Health Prober, `.olean` Hardlink Seed Pool & Bounded `lake build` Batcher
 
+pub mod support;
+use support::MockSshExecutor;
+
 use obb_broker::{
-    BuildPlanOptions, HostChoice, MockSshExecutor, RemoteCmdOutput, TargetWorkloadClass,
-    plan_build, probe_hosts,
+    BuildPlanOptions, HostChoice, RemoteCmdOutput, TargetWorkloadClass, plan_build, probe_hosts,
 };
 use obb_core::{Severity, Sink};
 use obb_judge::pipeline::{PipelineStage, check_pipeline};
@@ -43,16 +45,24 @@ fn law_m1_file_wide_expose_flags_over_80_lines_and_escalates_under_strict_expose
     let root = tmp.path();
 
     // 1. Short file (<= 80 lines) with `@[expose] public section` -> ALLOWED (0 findings)
-    let mut short_src = String::from("module\n\n@[expose] public section\n\nnamespace Obend.Small\n");
+    let mut short_src =
+        String::from("module\n\n@[expose] public section\n\nnamespace Obend.Small\n");
     for i in 0..20 {
         short_src.push_str(&format!("def proj{i} (x : Nat) : Nat := x + {i}\n"));
     }
     short_src.push_str("end Obend.Small\n");
     assert!(short_src.lines().count() <= 80);
-    write_rel(root, "lean/Obend/Core/Small carrier.lean".replace(' ', "").as_str(), &short_src);
+    write_rel(
+        root,
+        "lean/Obend/Core/Small carrier.lean"
+            .replace(' ', "")
+            .as_str(),
+        &short_src,
+    );
 
     // 2. Large file (> 80 lines) with `@[expose] public section` -> FLAGGED (`lean/file-wide-expose`)
-    let mut big_bad = String::from("module\n\n@[expose] public section\n\nnamespace Obend.Core.Giant\n");
+    let mut big_bad =
+        String::from("module\n\n@[expose] public section\n\nnamespace Obend.Core.Giant\n");
     for i in 0..90 {
         big_bad.push_str(&format!("def heavyStep{i} (x : Nat) : Nat := x + {i}\n"));
     }
@@ -61,7 +71,9 @@ fn law_m1_file_wide_expose_flags_over_80_lines_and_escalates_under_strict_expose
     write_rel(root, "lean/Obend/Core/GiantExpose.lean", &big_bad);
 
     // 3. Large file (> 80 lines) using Lean 4.35 `public section` + selective `@[expose]` -> CLEAN
-    let mut big_clean = String::from("module\n\npublic section\n\nnamespace Obend.Core.Clean\n@[expose] def tinyProj (x : Nat) : Nat := x\n");
+    let mut big_clean = String::from(
+        "module\n\npublic section\n\nnamespace Obend.Core.Clean\n@[expose] def tinyProj (x : Nat) : Nat := x\n",
+    );
     for i in 0..90 {
         big_clean.push_str(&format!("def hiddenBody{i} (x : Nat) : Nat := x + {i}\n"));
     }
@@ -76,7 +88,11 @@ fn law_m1_file_wide_expose_flags_over_80_lines_and_escalates_under_strict_expose
         .iter()
         .filter(|f| f.rule_id == "lean/file-wide-expose")
         .collect();
-    assert_eq!(expose_findings.len(), 1, "expected exactly GiantExpose.lean to be flagged");
+    assert_eq!(
+        expose_findings.len(),
+        1,
+        "expected exactly GiantExpose.lean to be flagged"
+    );
     assert!(expose_findings[0].path.ends_with("GiantExpose.lean"));
     assert_eq!(expose_findings[0].severity, Severity::Warning);
     assert_eq!(expose_findings[0].sink, Some(Sink::Slow));
@@ -474,7 +490,10 @@ description = "Upcoming hardware spine"
         rep.total_library_modules, 4,
         "Core/Step + Vault/Replay + Hardware/DisconnectedIsland + Main"
     );
-    assert_eq!(rep.apex_covered_library_modules, 2, "Vault/Replay + Core/Step in Apex cone");
+    assert_eq!(
+        rep.apex_covered_library_modules, 2,
+        "Vault/Replay + Core/Step in Apex cone"
+    );
     assert_eq!(rep.wired_library_modules, 3, "Apex cone + Main entry point");
     assert_eq!(rep.unwired_island_count, 1);
     assert_eq!(
@@ -543,7 +562,12 @@ end Obend.Vault
 
     // CLI: `obb pipeline check` succeeds (0), `obb pipeline check --require-sealed` fails (2)
     let cli_a_ok = Command::new(obb_bin())
-        .args(["pipeline", "check", "--repo", stage_a.path().to_str().unwrap()])
+        .args([
+            "pipeline",
+            "check",
+            "--repo",
+            stage_a.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert_eq!(cli_a_ok.status.code(), Some(0));
@@ -693,8 +717,7 @@ fn broker_mock_ssh_probes_zfs_arc_runaways_routes_targets_and_batches_seeded_lak
          OBB_PROC|41230|2700|14680064|lean|lean --make Obend/Core/Proofs/Adequacy/Sound.lean\n\
          OBB_PROC|41999|120|1048576|lake|lake build Obend.Vault.Replay\n"
     );
-    let bb2_stdout =
-        "OBB_META|32|1.25 1.10 0.90|127926272 98566144|0|188743680|1\n".to_string();
+    let bb2_stdout = "OBB_META|32|1.25 1.10 0.90|127926272 98566144|0|188743680|1\n".to_string();
 
     let mock = MockSshExecutor::new()
         .with_host_output(
@@ -758,12 +781,20 @@ fn broker_mock_ssh_probes_zfs_arc_runaways_routes_targets_and_batches_seeded_lak
 
     let plan = plan_build(&targets, &opts, &mock).unwrap();
     assert_eq!(plan.total_targets, 6);
-    assert_eq!(plan.total_batches, 2, "must batch into 1 `bb2` batch + 1 `hbox` batch");
+    assert_eq!(
+        plan.total_batches, 2,
+        "must batch into 1 `bb2` batch + 1 `hbox` batch"
+    );
 
     let route_map: std::collections::HashMap<_, _> = plan
         .routing
         .iter()
-        .map(|r| (r.lake_target.as_str(), (r.assigned_host.as_str(), r.workload_class)))
+        .map(|r| {
+            (
+                r.lake_target.as_str(),
+                (r.assigned_host.as_str(), r.workload_class),
+            )
+        })
         .collect();
     assert_eq!(
         route_map["Obend.Hardware.Rdna2.Decode"],
@@ -797,15 +828,27 @@ fn broker_mock_ssh_probes_zfs_arc_runaways_routes_targets_and_batches_seeded_lak
     );
     assert!(bb2_batch.remote_recipe.contains("cp -R --reflink=auto"));
     assert!(!bb2_batch.remote_recipe.contains("cp -al"));
-    assert!(bb2_batch.remote_recipe.contains("git -C \"$BASE_REPO\" fetch"));
-    assert!(bb2_batch.remote_recipe.contains("checkout --detach --force"));
+    assert!(
+        bb2_batch
+            .remote_recipe
+            .contains("git -C \"$BASE_REPO\" fetch")
+    );
+    assert!(
+        bb2_batch
+            .remote_recipe
+            .contains("checkout --detach --force")
+    );
     assert!(
         bb2_batch
             .remote_recipe
             .contains("SWARM_MEM_MAX=\"14G\" exec swarm-build timeout --kill-after=10s 450s")
     );
     assert!(bb2_batch.remote_recipe.contains("ulimit -v"));
-    assert!(bb2_batch.remote_recipe.contains("kill -TERM -- \"-$BUILD_PGID\""));
+    assert!(
+        bb2_batch
+            .remote_recipe
+            .contains("kill -TERM -- \"-$BUILD_PGID\"")
+    );
     assert!(bb2_batch.remote_recipe.contains("pkill -TERM -P $$"));
     assert_eq!(bb2_batch.execution.as_ref().unwrap().exit_code, 0);
 

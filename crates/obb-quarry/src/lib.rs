@@ -231,7 +231,10 @@ fn capture_repo_safety_snapshot(repo_root: &Path) -> Result<RepoSafetySnapshot> 
             "refs/tags",
         ],
     )?;
-    let status_porcelain = run_git_ro(repo_root, &["status", "--porcelain", "--untracked-files=normal"])?;
+    let status_porcelain = run_git_ro(
+        repo_root,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
 
     Ok(RepoSafetySnapshot {
         head_symref_or_sha,
@@ -438,15 +441,14 @@ pub fn status_quarry(
     for (donor_name, spec) in &manifest.donors {
         let reachable = spec.path.exists();
         let mut synced_quarry_refs = BTreeMap::new();
-        if target_is_git {
-            if let Some(ref trepo) = resolved_target {
-                for br in &spec.branches {
-                    let qref = format!("refs/quarry/{donor_name}/{br}");
-                    if let Some(sha) =
-                        run_git_ro_opt(trepo, &["rev-parse", "--verify", &format!("{qref}^{{commit}}")])
-                    {
-                        synced_quarry_refs.insert(br.clone(), sha);
-                    }
+        if target_is_git && let Some(ref trepo) = resolved_target {
+            for br in &spec.branches {
+                let qref = format!("refs/quarry/{donor_name}/{br}");
+                if let Some(sha) = run_git_ro_opt(
+                    trepo,
+                    &["rev-parse", "--verify", &format!("{qref}^{{commit}}")],
+                ) {
+                    synced_quarry_refs.insert(br.clone(), sha);
                 }
             }
         }
@@ -485,7 +487,9 @@ pub fn status_quarry(
     let mut entries_out = Vec::new();
 
     for entry in &manifest.entries {
-        *by_state.entry(entry.state.as_str().to_string()).or_insert(0) += 1;
+        *by_state
+            .entry(entry.state.as_str().to_string())
+            .or_insert(0) += 1;
 
         let donor_spec = manifest.donors.get(&entry.donor);
         let source_exists = donor_spec.and_then(|d| {
@@ -496,7 +500,8 @@ pub fn status_quarry(
             }
         });
 
-        let checks_this_target = entry.target_repo == manifest.target_name || entry.target_repo == "obend";
+        let checks_this_target =
+            entry.target_repo == manifest.target_name || entry.target_repo == "obend";
         let destination_exists = match (&resolved_target, &entry.destination_path) {
             (Some(trepo), Some(dest)) if checks_this_target && trepo.exists() => {
                 Some(trepo.join(dest).exists())
@@ -625,7 +630,9 @@ pub struct QuarryInspectReport {
 /// Parse `<donor>:<path>` spec string.
 pub fn parse_donor_path_spec(spec: &str) -> Result<(String, String)> {
     let Some((donor, raw_path)) = spec.split_once(':') else {
-        bail!("invalid quarry target `{spec}`: expected `<donor>:<path>` (e.g. `breadstuffs:orb/Crypto.lean`)");
+        bail!(
+            "invalid quarry target `{spec}`: expected `<donor>:<path>` (e.g. `breadstuffs:orb/Crypto.lean`)"
+        );
     };
     let donor = donor.trim();
     let clean_path = raw_path.trim().trim_matches('/');
@@ -649,16 +656,18 @@ fn extract_from_quarry_git_ref(
     git_ref: &str,
     subpath: &str,
 ) -> Result<Option<(String, Vec<ExtractedFile>)>> {
-    let Some(commit_sha) =
-        run_git_ro_opt(target_repo, &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")])
-    else {
+    let Some(commit_sha) = run_git_ro_opt(
+        target_repo,
+        &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")],
+    ) else {
         return Ok(None);
     };
 
     // Check if `commit_sha:subpath` exists and whether it is a `blob` or `tree`
-    let Some(obj_type) =
-        run_git_ro_opt(target_repo, &["cat-file", "-t", &format!("{commit_sha}:{subpath}")])
-    else {
+    let Some(obj_type) = run_git_ro_opt(
+        target_repo,
+        &["cat-file", "-t", &format!("{commit_sha}:{subpath}")],
+    ) else {
         bail!(
             "path `{subpath}` does not exist inside synced quarry ref `{git_ref}` ({commit_sha})"
         );
@@ -711,7 +720,10 @@ fn extract_from_quarry_git_ref(
     )))
 }
 
-fn extract_from_filesystem_ro(donor_root: &Path, subpath: &str) -> Result<(String, Vec<ExtractedFile>)> {
+fn extract_from_filesystem_ro(
+    donor_root: &Path,
+    subpath: &str,
+) -> Result<(String, Vec<ExtractedFile>)> {
     let canon_root = donor_root
         .canonicalize()
         .with_context(|| format!("donor directory does not exist: {}", donor_root.display()))?;
@@ -736,7 +748,10 @@ fn extract_from_filesystem_ro(donor_root: &Path, subpath: &str) -> Result<(Strin
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                !matches!(name.as_ref(), ".git" | ".lake" | "target" | "node_modules" | "__pycache__")
+                !matches!(
+                    name.as_ref(),
+                    ".git" | ".lake" | "target" | "node_modules" | "__pycache__"
+                )
             })
             .flatten()
         {
@@ -768,18 +783,17 @@ fn staged_rel_path_for(donor_rel: &str) -> String {
             .or_else(|| donor_rel.strip_prefix("lean/"))
             .unwrap_or(donor_rel);
         format!("lean/Obend/{stripped}")
-    } else if donor_rel.ends_with(".rs") && !donor_rel.contains("/src/") && !donor_rel.starts_with("src/") {
+    } else if donor_rel.ends_with(".rs")
+        && !donor_rel.contains("/src/")
+        && !donor_rel.starts_with("src/")
+    {
         format!("crates/donor/src/{donor_rel}")
     } else {
         donor_rel.to_string()
     }
 }
 
-fn scan_donor_extra_surgery_hazards(
-    donor_rel: &str,
-    src: &str,
-    findings: &mut Vec<Finding>,
-) {
+fn scan_donor_extra_surgery_hazards(donor_rel: &str, src: &str, findings: &mut Vec<Finding>) {
     // 1. HOL4 `.sml` / OCaml `.ml` cheat / oracle / axiom checks (`svenvs` uptake gate)
     if donor_rel.ends_with(".sml") || donor_rel.ends_with(".ml") {
         let mut in_sml_comment = 0usize;
@@ -855,8 +869,12 @@ fn scan_donor_extra_surgery_hazards(
         }
 
         // (b) Diamond-Gruen-Crites-Stewart 2026/2424: Binary Reed-Solomon / Ligerito unique-decoding / capacity proximity claim above Johnson bound
-        if (lower_all.contains("ligerito") || lower_all.contains("binaryreedsolomon") || lower_all.contains("binary_rs"))
-            && (lower_all.contains("capacity") || lower_all.contains("beyond_johnson") || lower_all.contains("1 - rate"))
+        if (lower_all.contains("ligerito")
+            || lower_all.contains("binaryreedsolomon")
+            || lower_all.contains("binary_rs"))
+            && (lower_all.contains("capacity")
+                || lower_all.contains("beyond_johnson")
+                || lower_all.contains("1 - rate"))
         {
             findings.push(Finding {
                 rule_id: "crypto/binary-rs-beyond-johnson".to_string(),
@@ -900,11 +918,12 @@ pub fn inspect_quarry_target(
         extract_from_filesystem_ro(explicit_dir, &subpath)?
     } else {
         let mut from_git = None;
-        if let Some(trepo) = target_repo {
-            if trepo.is_dir() && run_git_ro_opt(trepo, &["rev-parse", "--git-dir"]).is_some() {
-                let qref = format!("refs/quarry/{donor}/{branch}");
-                from_git = extract_from_quarry_git_ref(trepo, &qref, &subpath)?;
-            }
+        if let Some(trepo) = target_repo
+            && trepo.is_dir()
+            && run_git_ro_opt(trepo, &["rev-parse", "--git-dir"]).is_some()
+        {
+            let qref = format!("refs/quarry/{donor}/{branch}");
+            from_git = extract_from_quarry_git_ref(trepo, &qref, &subpath)?;
         }
         if let Some(found) = from_git {
             found
@@ -965,7 +984,9 @@ pub fn inspect_quarry_target(
                     message: format!(
                         "`set_option maxHeartbeats {hb}` exceeds the 400,000 elaboration budget cap"
                     ),
-                    remediation: "Decompose proof into smaller lemmas instead of inflating `maxHeartbeats`.".to_string(),
+                    remediation:
+                        "Decompose proof into smaller lemmas instead of inflating `maxHeartbeats`."
+                            .to_string(),
                 });
             }
         }
@@ -997,13 +1018,12 @@ pub fn inspect_quarry_target(
             m.path = orig.clone();
         }
     }
-    if let Some(ref mut max_p) = lint_report.modularity.max_module_path {
-        if let Some(orig) = staged_to_donor
+    if let Some(ref mut max_p) = lint_report.modularity.max_module_path
+        && let Some(orig) = staged_to_donor
             .get(max_p)
             .or_else(|| staged_to_donor.get(&format!("lean/{max_p}")))
-        {
-            *max_p = orig.clone();
-        }
+    {
+        *max_p = orig.clone();
     }
 
     // Attach matching `quarry.toml` entries (overlap on `source_path`)
@@ -1150,7 +1170,7 @@ pub fn inspect_quarry_target(
 
     Ok(QuarryInspectReport {
         spec: spec.to_string(),
-        donor: donor,
+        donor,
         donor_subpath: subpath,
         resolution_source,
         inspected_at: Utc::now().to_rfc3339(),
@@ -1185,7 +1205,13 @@ fn run_git_ro_bytes(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .arg(repo_root)
         .args(args)
         .output()
-        .with_context(|| format!("failed to execute git {:?} in {}", args, repo_root.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to execute git {:?} in {}",
+                args,
+                repo_root.display()
+            )
+        })?;
     if !out.status.success() {
         bail!(
             "git {:?} failed in {}: {}",

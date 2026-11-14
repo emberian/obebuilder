@@ -109,12 +109,7 @@ class ZkStripeObligations (Carrier : Type) where
     // 1. Default `obb lint --json` (without `--strict-expose`):
     //    `obligation-tautological-field` = Error, `judge-empty-fragment` = Warning, `excessive-decl-expose` = Warning
     let out_default = Command::new(obb_bin())
-        .args([
-            "lint",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--json",
-        ])
+        .args(["lint", "--repo", repo.path().to_str().unwrap(), "--json"])
         .output()
         .expect("obb lint default");
     assert!(out_default.status.success());
@@ -137,7 +132,11 @@ class ZkStripeObligations (Carrier : Type) where
         .iter()
         .filter(|f| f["rule_id"] == "lean/judge-empty-fragment")
         .collect();
-    assert_eq!(judge_warns.len(), 2, "expected Fragment + refutes warnings: {judge_warns:#?}");
+    assert_eq!(
+        judge_warns.len(),
+        2,
+        "expected Fragment + refutes warnings: {judge_warns:#?}"
+    );
 
     let expose_warns: Vec<_> = findings
         .iter()
@@ -298,7 +297,9 @@ end Obend.Core
     assert_eq!(lint_json["errors"], 0);
 
     // 6. Tamper with `.claude/skills/obend-anti-cosplay/SKILL.md` -> `obb harness check` exits 2
-    let claude_skill = repo.path().join(".claude/skills/obend-anti-cosplay/SKILL.md");
+    let claude_skill = repo
+        .path()
+        .join(".claude/skills/obend-anti-cosplay/SKILL.md");
     let mut tampered = fs::read_to_string(&claude_skill).unwrap();
     tampered.push_str("\n<!-- drifted -->\n");
     fs::write(&claude_skill, tampered).unwrap();

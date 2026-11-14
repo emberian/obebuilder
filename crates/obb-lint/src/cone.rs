@@ -150,10 +150,10 @@ pub fn module_name_for_rel_path(rel_path: &str) -> String {
     if let Some(test_sub) = without_ext.strip_prefix("tests/") {
         return format!("Tests.{}", test_sub.replace('/', "."));
     }
-    if let Some(tool_sub) = without_ext.strip_prefix("tools/") {
-        if let Some((_dir, root_mod)) = tool_sub.rsplit_once('/') {
-            return format!("tools.{root_mod}");
-        }
+    if let Some(tool_sub) = without_ext.strip_prefix("tools/")
+        && let Some((_dir, root_mod)) = tool_sub.rsplit_once('/')
+    {
+        return format!("tools.{root_mod}");
     }
     without_ext.replace('/', ".")
 }
@@ -437,8 +437,7 @@ pub fn scan_repo_cone(repo_root: &Path, max_depth: Option<usize>) -> Result<Cone
     let workers = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
-        .min(8)
-        .max(1);
+        .clamp(1, 8);
 
     let raw_headers: Vec<RawModuleHeader> = if n_files <= 16 || workers == 1 {
         let mut out = Vec::with_capacity(n_files);
@@ -629,13 +628,13 @@ fn assemble_cone_report(
                 });
             }
 
-            if let Some(&v) = mod_to_idx.get(&imp.module) {
-                if u != v {
-                    any_rev[v].push(u);
-                    if effective_public {
-                        pub_out[u].push(v);
-                        pub_rev[v].push(u);
-                    }
+            if let Some(&v) = mod_to_idx.get(&imp.module)
+                && u != v
+            {
+                any_rev[v].push(u);
+                if effective_public {
+                    pub_out[u].push(v);
+                    pub_rev[v].push(u);
                 }
             }
         }
@@ -688,13 +687,7 @@ fn assemble_cone_report(
     let mut max_public_cone_depth = 0usize;
     let mut crit_start: Option<usize> = None;
     for u in 0..n {
-        let d = dfs_depth(
-            u,
-            &pub_out,
-            &mut state,
-            &mut depth_memo,
-            &mut next_on_crit,
-        );
+        let d = dfs_depth(u, &pub_out, &mut state, &mut depth_memo, &mut next_on_crit);
         if d > max_public_cone_depth || (crit_start.is_none() && n > 0) {
             max_public_cone_depth = d;
             crit_start = Some(u);
@@ -755,15 +748,15 @@ fn assemble_cone_report(
         }
 
         let public_cone_depth = depth_memo[v];
-        if let Some(limit) = max_depth {
-            if public_cone_depth > limit {
-                depth_violations.push(ConeDepthViolation {
-                    module: headers[v].module.clone(),
-                    rel_path: headers[v].rel_path.clone(),
-                    depth: public_cone_depth,
-                    max_allowed: limit,
-                });
-            }
+        if let Some(limit) = max_depth
+            && public_cone_depth > limit
+        {
+            depth_violations.push(ConeDepthViolation {
+                module: headers[v].module.clone(),
+                rel_path: headers[v].rel_path.clone(),
+                depth: public_cone_depth,
+                max_allowed: limit,
+            });
         }
 
         if blast_radius > HUB_FAN_IN_THRESHOLD || public_fan_in > HUB_FAN_IN_THRESHOLD {
@@ -800,7 +793,8 @@ fn assemble_cone_report(
     });
     depth_violations.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.module.cmp(&b.module)));
 
-    let total_ms = ((initial_ms + t_graph.elapsed().as_secs_f64() * 1000.0) * 100.0).round() / 100.0;
+    let total_ms =
+        ((initial_ms + t_graph.elapsed().as_secs_f64() * 1000.0) * 100.0).round() / 100.0;
 
     ConeReport {
         repo_root: repo_root.to_string(),

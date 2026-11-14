@@ -4,16 +4,18 @@
 use obb_cli::serve::{ServeConfig, build_router};
 use obb_judge::{
     Floor, Gate, Method, MethodBinding, Refusal, TrustBase, check_revert_clean, check_succeed,
-    check_well_formed, evaluate_gate,
+    check_well_formed, evaluate_gate, issue_judge_receipt,
 };
 use obb_lint::run_repo_lints;
 use obb_lint::spec_check::parse_transport_census_json;
-use obb_state::{MachineStatus, StateRefusal, StateStore};
+use obb_state::{
+    CampaignGuardEvidence, MachineStatus, QuestGuardEvidence, StateRefusal, StateStore,
+};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt;
 
 fn write_rel(root: &Path, rel: &str, content: &str) {
     let full = root.join(rel);
@@ -363,17 +365,17 @@ fn judge_genealogy_refuses_every_g4_regression_and_records_lob_cost() {
     let mut loosened = baseline.clone();
     loosened.name = "bad-loosened-cap".into();
     for fl in &mut loosened.floors {
-        if let Floor::Cap { cell, max } = fl {
-            if cell == "tier1_module_sec_cap" {
-                *max = 600;
-            }
+        if let Floor::Cap { cell, max } = fl
+            && cell == "tier1_module_sec_cap"
+        {
+            *max = 600;
         }
     }
     for m in &mut loosened.methods {
-        if let Floor::Cap { cell, max } = &mut m.floor {
-            if cell == "tier1_module_sec_cap" {
-                *max = 600;
-            }
+        if let Floor::Cap { cell, max } = &mut m.floor
+            && cell == "tier1_module_sec_cap"
+        {
+            *max = 600;
         }
     }
     let err = check_succeed(&baseline, &loosened, &[]).unwrap_err();
@@ -428,20 +430,20 @@ fn judge_genealogy_refuses_every_g4_regression_and_records_lob_cost() {
 
     // Valid succession WITH explicit `--lob external:lean-transport` + tightened cap `60 -> 45`
     for fl in &mut stronger.floors {
-        if let Floor::Cap { cell, max } = fl {
-            if cell == "tier1_module_sec_cap" {
-                *max = 45;
-            }
+        if let Floor::Cap { cell, max } = fl
+            && cell == "tier1_module_sec_cap"
+        {
+            *max = 45;
         }
     }
     for m in &mut stronger.methods {
-        if let Floor::Cap { cell, max } = &mut m.floor {
-            if cell == "tier1_module_sec_cap" {
-                *max = 45;
-            }
+        if let Floor::Cap { cell, max } = &mut m.floor
+            && cell == "tier1_module_sec_cap"
+        {
+            *max = 45;
         }
     }
-    let rec = check_succeed(&baseline, &stronger, &[new_tb.clone()])
+    let rec = check_succeed(&baseline, &stronger, std::slice::from_ref(&new_tb))
         .expect("labelled non-regressing succession must succeed");
     assert_eq!(rec.lob_cost, vec![new_tb]);
     assert_eq!(rec.added_floors, vec!["spec_insensitive_decls <= 0"]);
@@ -466,6 +468,8 @@ fn check_revert_detects_clean_and_conflicting_commits_without_touching_repo() {
         let out = Command::new("git")
             .current_dir(repo)
             .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "obb-test")
             .env("GIT_AUTHOR_EMAIL", "obb@example.com")
             .env("GIT_COMMITTER_NAME", "obb-test")
@@ -530,54 +534,211 @@ fn check_revert_detects_clean_and_conflicting_commits_without_touching_repo() {
 async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
     let ws = tempfile::tempdir().unwrap();
     let root = ws.path();
+    let state_tmp = tempfile::tempdir().unwrap();
 
-    // Copy `judge.json` into temp workspace so `/api/judge` evaluates cleanly
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "obb-test")
+            .env("GIT_AUTHOR_EMAIL", "obb@example.com")
+            .env("GIT_COMMITTER_NAME", "obb-test")
+            .env("GIT_COMMITTER_EMAIL", "obb@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    git(&["init", "-b", "main"]);
     let repo_judge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../judge.json");
     fs::copy(&repo_judge, root.join("judge.json")).unwrap();
-    // Mark planted-fault witness path in temp workspace so `planted_fault_red <= 0` passes too
-    write_rel(root, "crates/obb-cli/tests/planted_faults.rs", "// witness\n");
 
-    let store = StateStore::open(root).unwrap();
+    // Dummy static file alone WITHOUT build-timings.json or executable teeth MUST fail closed in v7!
+    write_rel(
+        root,
+        "crates/obb-cli/tests/planted_faults.rs",
+        "// witness\n",
+    );
+    let mut gate = Gate::load_from_path(&root.join("judge.json")).unwrap();
+    gate.teeth.clear();
+    write_rel(
+        root,
+        "judge.json",
+        &serde_json::to_string_pretty(&gate).unwrap(),
+    );
+    write_rel(root, "lean/Obend/Library.lean", "def value : Nat := 1\n");
+    let unmeasured_eval = evaluate_gate(&gate, root).unwrap();
+    assert!(
+        !unmeasured_eval.all_passed,
+        "theatrical dummy witness + missing timing measurement must fail closed!"
+    );
+    fs::remove_dir_all(root.join("crates")).unwrap();
+
+    // Now install real build timing measurement + real executable `#tooth` fixture
+    write_rel(root, ".obb/build-timings.json", "{\"max_tier1_sec\": 3}\n");
+    write_rel(
+        root,
+        "src/clamp.py",
+        "def clamp_nonneg(x):\n    return x if x >= 0 else 0\n",
+    );
+    write_rel(
+        root,
+        "tests/verify_clamp.py",
+        "import sys\nsys.path.insert(0, 'src')\nfrom clamp import clamp_nonneg\nassert clamp_nonneg(-5) == 0, 'CLAMP_NEGATIVE_LEAK'\nassert clamp_nonneg(7) == 7\nprint('ran 2 checks: ok')\n",
+    );
+    write_rel(
+        root,
+        "teeth.json",
+        r#"{
+  "teeth": [
+    {
+      "id": "tooth-clamp-negative",
+      "check_cmd": "python3 tests/verify_clamp.py",
+      "mutation": {
+        "kind": "replace",
+        "file": "src/clamp.py",
+        "search": "return x if x >= 0 else 0",
+        "replace": "return x"
+      },
+      "expect_failure_substring": "CLAMP_NEGATIVE_LEAK"
+    }
+  ]
+}
+"#,
+    );
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial trunk"]);
+
+    let store = StateStore::open_with_state_dir(root, Some(state_tmp.path())).unwrap();
     store
-        .create_campaign("C1", "Test Campaign", "Aim", "/tmp")
+        .create_campaign("C1", "Test Campaign", "Aim", &root.to_string_lossy())
         .unwrap();
 
     // Illegal campaign jump `Aim -> Running` (skipping `Grounded`) must be refused
     let bad_camp = store
-        .transition_campaign("C1", "Running", true, "skip")
+        .transition_campaign(
+            "C1",
+            "Running",
+            CampaignGuardEvidence::Unconditional {
+                note: "skip".into(),
+            },
+        )
         .unwrap_err();
     assert!(matches!(bad_camp, StateRefusal::IllegalTransition { .. }));
 
-    store.transition_campaign("C1", "Alone", true, "no ambition yet").unwrap();
-    store.transition_campaign("C1", "Aim", true, "AMBITION.md written").unwrap();
     store
-        .transition_campaign("C1", "Grounded", true, "G1 whole-read")
+        .transition_campaign(
+            "C1",
+            "Alone",
+            CampaignGuardEvidence::Unconditional {
+                note: "no ambition yet".into(),
+            },
+        )
         .unwrap();
     store
-        .transition_campaign("C1", "Running", true, "G2 briefs")
+        .transition_campaign(
+            "C1",
+            "Aim",
+            CampaignGuardEvidence::Unconditional {
+                note: "AMBITION.md written".into(),
+            },
+        )
+        .unwrap();
+    store
+        .transition_campaign(
+            "C1",
+            "Grounded",
+            CampaignGuardEvidence::WholeRead {
+                foundation_files: vec!["judge.json".into(), "src/clamp.py".into()],
+                note: "G1 whole-read".into(),
+            },
+        )
+        .unwrap();
+    store
+        .transition_campaign(
+            "C1",
+            "Running",
+            CampaignGuardEvidence::Briefed {
+                judge_path: root.join("judge.json"),
+                note: "G2 briefs".into(),
+            },
+        )
         .unwrap();
 
-    // Quest lifecycle (`Grounded -> Scoped -> Built -> Wired -> Toothed -> Landed -> Claimed -> Recorded`) & sink exit rule
+    // Quest lifecycle (`Grounded -> Scoped -> Built -> Wired -> Toothed`) & sink exit rule
     store
         .create_quest("Q-1", "C1", "Prove soundness", "agent-alpha", "decided")
         .unwrap();
     // Jumping `Grounded -> Built` (skipping `Scoped`) must be refused
     assert!(matches!(
         store
-            .transition_quest("Q-1", "Built", "agent-alpha", None, None, true)
+            .transition_quest(
+                "Q-1",
+                "Built",
+                "agent-alpha",
+                None,
+                QuestGuardEvidence::RepoCheck {
+                    repo_root: root.to_path_buf(),
+                    artifacts: vec!["src/clamp.py".into()],
+                },
+            )
             .unwrap_err(),
         StateRefusal::IllegalTransition { .. }
     ));
 
     // Step `Grounded -> Scoped -> Built`, enter `Theater` sink (`Built -> Theater` in `sink_edges`), then try to exit via wrong agent -> refused!
     store
-        .transition_quest("Q-1", "Scoped", "agent-alpha", None, None, true)
+        .take_quest(
+            "Q-1",
+            "agent-alpha",
+            "Prove clamp soundness",
+            vec!["src".into(), "tests".into()],
+            2.0,
+            root,
+            "main",
+        )
+        .unwrap();
+
+    // Create candidate commit inside leased footprint
+    git(&["checkout", "-b", "quest/Q-1"]);
+    write_rel(
+        root,
+        "src/clamp.py",
+        "def clamp_nonneg(x):\n    return x if x >= 0 else 0\n\ndef clamp_unit(x):\n    return min(1, clamp_nonneg(x))\n",
+    );
+    git(&["add", "src/clamp.py"]);
+    git(&["commit", "-m", "add clamp_unit"]);
+
+    store
+        .transition_quest(
+            "Q-1",
+            "Built",
+            "agent-alpha",
+            None,
+            QuestGuardEvidence::RepoCheck {
+                repo_root: root.to_path_buf(),
+                artifacts: vec!["src/clamp.py".into()],
+            },
+        )
         .unwrap();
     store
-        .transition_quest("Q-1", "Built", "agent-alpha", None, None, true)
-        .unwrap();
-    store
-        .transition_quest("Q-1", "Theater", "agent-alpha", None, None, true)
+        .transition_quest(
+            "Q-1",
+            "Theater",
+            "agent-alpha",
+            None,
+            QuestGuardEvidence::EnterSink {
+                reason: "audit theater check".into(),
+            },
+        )
         .unwrap();
     assert!(matches!(
         store
@@ -585,9 +746,10 @@ async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
                 "Q-1",
                 "Built",
                 "wrong-agent",
-                Some("deleted tautology"),
                 None,
-                true
+                QuestGuardEvidence::ExitSink {
+                    remedial_action: "deleted tautology".into(),
+                },
             )
             .unwrap_err(),
         StateRefusal::SinkExitViolation { .. }
@@ -598,29 +760,55 @@ async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
             "Q-1",
             "Built",
             "agent-alpha",
-            Some("replaced tautological theorem with independent spec"),
             None,
-            true,
+            QuestGuardEvidence::ExitSink {
+                remedial_action: "replaced tautological theorem with independent spec".into(),
+            },
         )
         .unwrap();
     store
-        .transition_quest("Q-1", "Wired", "agent-alpha", None, None, true)
+        .transition_quest(
+            "Q-1",
+            "Wired",
+            "agent-alpha",
+            None,
+            QuestGuardEvidence::RepoCheck {
+                repo_root: root.to_path_buf(),
+                artifacts: vec!["src/clamp.py".into()],
+            },
+        )
         .unwrap();
-    // `Wired -> Toothed` WITHOUT `tooth_witness` must fail Q4!
+    // `Wired -> Toothed` WITHOUT a verified `JudgeReceipt` must fail Q4!
     assert!(matches!(
         store
-            .transition_quest("Q-1", "Toothed", "agent-alpha", None, None, true)
+            .transition_quest(
+                "Q-1",
+                "Toothed",
+                "agent-alpha",
+                None,
+                QuestGuardEvidence::RepoCheck {
+                    repo_root: root.to_path_buf(),
+                    artifacts: vec!["src/clamp.py".into()],
+                },
+            )
             .unwrap_err(),
         StateRefusal::GuardFailed { ref guard, .. } if guard == "Q4"
     ));
+
+    let receipt = issue_judge_receipt(&gate, root, "main").unwrap();
+    assert!(receipt.all_passed, "expected receipt to pass: {receipt:#?}");
+    assert!(receipt.teeth_report.all_bit);
     store
         .transition_quest(
             "Q-1",
             "Toothed",
             "agent-alpha",
-            None,
-            Some("tests/planted_faults.rs"),
-            true,
+            Some("tooth-clamp-negative"),
+            QuestGuardEvidence::Receipt {
+                receipt: Box::new(receipt),
+                repo_root: root.to_path_buf(),
+                trunk_branch: "main".into(),
+            },
         )
         .unwrap();
 
@@ -632,7 +820,11 @@ async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
         StateRefusal::InvalidEmberEvent { .. }
     ));
     store
-        .enqueue_ember_event("decision", "Q-1", "Accept external:cadical into judge basis?")
+        .enqueue_ember_event(
+            "decision",
+            "Q-1",
+            "Accept external:cadical into judge basis?",
+        )
         .unwrap();
 
     // Disk headroom floor (< 20 GB) blocks dispatch on `hbox`
@@ -698,34 +890,35 @@ async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
     // Verify ledger hash chain across all recorded transitions
     assert!(store.verify_ledger_chain().unwrap() >= 8);
 
-    // Evaluate judge on this clean workspace (non-git workspace skips git history window cleanly)
-    let gate = Gate::load_from_path(&root.join("judge.json")).unwrap();
+    // Evaluate judge on this clean workspace
     let eval = evaluate_gate(&gate, root).unwrap();
-    assert!(eval.all_passed, "clean workspace should pass judge floors: {eval:#?}");
+    assert!(
+        eval.all_passed,
+        "clean workspace should pass judge floors: {eval:#?}"
+    );
 
     // Test `obb serve` HTTP endpoints over a real localhost ephemeral TCP socket
-    let app = build_router(ServeConfig::new(
-        root.to_path_buf(),
-        root.to_path_buf(),
-        root.join("judge.json"),
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let srv = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
+    let app = build_router(
+        ServeConfig::new(
+            root.to_path_buf(),
+            root.to_path_buf(),
+            root.join("judge.json"),
+        )
+        .with_state_dir(Some(state_tmp.path().to_path_buf()))
+        .with_bearer_token("test-token"),
+    );
     for path in ["/", "/api/status", "/api/judge", "/api/lints"] {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).await.unwrap();
-        assert!(
-            resp.starts_with("HTTP/1.1 200 OK"),
-            "endpoint {path} did not return 200 OK: {}",
-            resp.lines().next().unwrap_or("")
-        );
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .header("Authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
     }
-    srv.abort();
 }

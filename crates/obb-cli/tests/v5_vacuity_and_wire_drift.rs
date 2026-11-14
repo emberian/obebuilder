@@ -5,7 +5,10 @@
 //! 4. `M3` gate compatibility (`--strict --strict-expose --strict-harnesses` exits `0` on warnings, while `--strict-vacuity` and `--strict-wire` exit `2`)
 //! 5. `obb-broker` resilient `hbox` / `bb2` `BASE_REPO` auto-detection and writable `SEED_POOL` fallback.
 
-use obb_broker::{BuildPlanOptions, HostChoice, MockSshExecutor, plan_build};
+pub mod support;
+use support::MockSshExecutor;
+
+use obb_broker::{BuildPlanOptions, HostChoice, plan_build};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -263,8 +266,7 @@ fn broker_hbox_recipe_falls_back_when_default_seed_pool_unwritable_and_autodetec
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        fake_home.join("obend/obb-seeds/latest").exists()
-            || Path::new("/othersys/lanes").exists(),
+        fake_home.join("obend/obb-seeds/latest").exists() || Path::new("/othersys/lanes").exists(),
         "writable fallback seed pool must be populated cleanly"
     );
 }
@@ -617,7 +619,11 @@ pub fn prod_after_inner_cfg_test(a: &[u8], b: &[u8]) -> [u8; 32] {
         .iter()
         .filter(|f| f["rule_id"] == "lean/judge-fragment-restates-check")
         .collect();
-    assert_eq!(frag_hits.len(), 0, "unexpected fragment hits: {frag_hits:#?}");
+    assert_eq!(
+        frag_hits.len(),
+        0,
+        "unexpected fragment hits: {frag_hits:#?}"
+    );
 
     // `arrow_premise_on_def` + `let_in_type_disjunction` should fire `lean/pigeonhole-vacuous-premise`
     // (NOT `¬ ¬ Collision`, `Not (ModuleSISHard ...)`, `CollisionPair.to_collision`, or `toyLengthHash_collides`)

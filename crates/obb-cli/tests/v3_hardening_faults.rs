@@ -10,13 +10,16 @@
 //! 4. `obb-state`: zero `.obb/state.db` or `ledger/` pollution in audited git worktrees, and atomic
 //!    SQLite rollback + surfaced `LedgerAppendFailed` refusal when JSONL append fails.
 
-use obb_broker::{BuildPlanOptions, HostChoice, MockSshExecutor, plan_build};
+pub mod support;
+use support::MockSshExecutor;
+
+use obb_broker::{BuildPlanOptions, HostChoice, plan_build};
 use obb_core::Severity;
 use obb_judge::pipeline::{
     PipelineCheckOptions, PipelineStage, check_pipeline, check_pipeline_with_options,
 };
 use obb_lint::run_repo_lints;
-use obb_state::{StateRefusal, StateStore};
+use obb_state::{CampaignGuardEvidence, StateRefusal, StateStore};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -607,7 +610,13 @@ fn state_store_never_pollutes_target_git_worktree_and_surfaces_jsonl_append_erro
     fs::create_dir_all(&ledger_file).unwrap();
 
     let err = store
-        .transition_campaign("C-atomic", "Alone", true, "should fail JSONL append")
+        .transition_campaign(
+            "C-atomic",
+            "Alone",
+            CampaignGuardEvidence::Unconditional {
+                note: "should fail JSONL append".into(),
+            },
+        )
         .expect_err("JSONL append failure must surface as Err, never swallowed!");
     assert!(
         matches!(err, StateRefusal::LedgerAppendFailed { .. }),

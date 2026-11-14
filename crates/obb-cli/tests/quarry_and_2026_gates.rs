@@ -7,9 +7,7 @@
 //!    - `obb lint --modularity` + `lean/monolithic-module` (>1,500-line cap)
 
 use obb_lint::run_repo_lints;
-use obb_quarry::{
-    QuarryManifest, QuarryState, inspect_quarry_target, status_quarry, sync_quarry,
-};
+use obb_quarry::{QuarryManifest, QuarryState, inspect_quarry_target, status_quarry, sync_quarry};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -137,7 +135,8 @@ end Obend.Core
 }
 
 #[test]
-fn rule_narrow_digest_weld_catches_all_1_limb_and_narrow_field_patterns_with_zero_false_positives() {
+fn rule_narrow_digest_weld_catches_all_1_limb_and_narrow_field_patterns_with_zero_false_positives()
+{
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
@@ -326,7 +325,9 @@ end Obend.Ledger
     for i in 0..1510 {
         big_src.push_str(&format!("-- padding line {i}\n"));
     }
-    big_src.push_str("theorem isolated_leaf_claim (n : Nat) : stepId n = n := rfl\nend Obend.Monolith\n");
+    big_src.push_str(
+        "theorem isolated_leaf_claim (n : Nat) : stepId n = n := rfl\nend Obend.Monolith\n",
+    );
     write_rel(root, "lean/Obend/Monolith/Giant.lean", &big_src);
 
     let report = run_repo_lints(root).unwrap();
@@ -334,7 +335,8 @@ end Obend.Ledger
         report
             .findings
             .iter()
-            .any(|f| f.rule_id == "lean/monolithic-module" && f.path == "lean/Obend/Monolith/Giant.lean"),
+            .any(|f| f.rule_id == "lean/monolithic-module"
+                && f.path == "lean/Obend/Monolith/Giant.lean"),
         "expected `lean/monolithic-module` warning on >1,500-line Giant.lean"
     );
 
@@ -344,10 +346,16 @@ end Obend.Ledger
     assert_eq!(m.classes, 1);
     assert_eq!(m.instances, 1);
     assert_eq!(m.total_theorems, 3);
-    assert_eq!(m.composed_theorems, 1, "helper_refl is reused by composed_conservation");
+    assert_eq!(
+        m.composed_theorems, 1,
+        "helper_refl is reused by composed_conservation"
+    );
     assert_eq!(m.isolated_leaf_theorems, 2);
     assert_eq!(m.monolithic_modules.len(), 1);
-    assert_eq!(m.monolithic_modules[0].path, "lean/Obend/Monolith/Giant.lean");
+    assert_eq!(
+        m.monolithic_modules[0].path,
+        "lean/Obend/Monolith/Giant.lean"
+    );
     assert!(m.monolithic_modules[0].lines > 1500);
     assert!((m.carrier_to_leaf_ratio - 1.0).abs() < 1e-6);
 }
@@ -397,7 +405,10 @@ theorem id_mono (r : MonoRel Nat) (x : Nat) : r.rel x x → r.rel x x := fun h =
 end Paco
 "#,
     );
-    git_in(&bread_repo, &["add", "orb/Crypto.lean", "metatheory/Paco/GPaco.lean"]);
+    git_in(
+        &bread_repo,
+        &["add", "orb/Crypto.lean", "metatheory/Paco/GPaco.lean"],
+    );
     git_in(&bread_repo, &["commit", "-m", "breadstuffs root"]);
     // Add a donor git tag to prove `--no-tags` prevents tag pollution in `target_repo`!
     git_in(&bread_repo, &["tag", "donor-v0.1"]);
@@ -406,7 +417,11 @@ end Paco
     let minidregg_repo = base.join("minidregg");
     fs::create_dir_all(&minidregg_repo).unwrap();
     git_in(&minidregg_repo, &["init", "-b", "main"]);
-    write_rel(&minidregg_repo, "Kernel/PayLedger.lean", "def floorOk (b : Int) : Bool := b >= 0\n");
+    write_rel(
+        &minidregg_repo,
+        "Kernel/PayLedger.lean",
+        "def floorOk (b : Int) : Bool := b >= 0\n",
+    );
     git_in(&minidregg_repo, &["add", "Kernel/PayLedger.lean"]);
     git_in(&minidregg_repo, &["commit", "-m", "minidregg root"]);
     let minidregg_sha = git_in(&minidregg_repo, &["rev-parse", "HEAD"]);
@@ -419,14 +434,21 @@ end Paco
         "corrigibility/corrigibilityScript.sml",
         "Theorem bad_hol4_thm:\n  T\nProof\n  cheat\nQED\n",
     );
-    git_in(&svenvs_repo, &["add", "corrigibility/corrigibilityScript.sml"]);
+    git_in(
+        &svenvs_repo,
+        &["add", "corrigibility/corrigibilityScript.sml"],
+    );
     git_in(&svenvs_repo, &["commit", "-m", "svenvs root"]);
     let svenvs_sha = git_in(&svenvs_repo, &["rev-parse", "HEAD"]);
 
     let transport_repo = base.join("lean-transport");
     fs::create_dir_all(&transport_repo).unwrap();
     git_in(&transport_repo, &["init", "-b", "dev"]);
-    write_rel(&transport_repo, "Transport/Walk.lean", "def walkDag (n : Nat) : Nat := n\n");
+    write_rel(
+        &transport_repo,
+        "Transport/Walk.lean",
+        "def walkDag (n : Nat) : Nat := n\n",
+    );
     git_in(&transport_repo, &["add", "Transport/Walk.lean"]);
     git_in(&transport_repo, &["commit", "-m", "transport root"]);
     let transport_sha = git_in(&transport_repo, &["rev-parse", "HEAD"]);
@@ -505,8 +527,14 @@ audit_notes = "Retired axiom-heavy crypto module."
     let sync_rep = sync_quarry(&manifest, &target_repo, false).unwrap();
     assert!(!sync_rep.dry_run);
     assert!(sync_rep.head_unchanged && sync_rep.index_unchanged && sync_rep.worktree_unchanged);
-    assert_eq!(git_in(&target_repo, &["rev-parse", "HEAD"]), target_head_before);
-    assert_eq!(fs::read(target_repo.join(".git/index")).unwrap(), index_bytes_before);
+    assert_eq!(
+        git_in(&target_repo, &["rev-parse", "HEAD"]),
+        target_head_before
+    );
+    assert_eq!(
+        fs::read(target_repo.join(".git/index")).unwrap(),
+        index_bytes_before
+    );
     assert!(
         !target_repo.join(".git/FETCH_HEAD").exists(),
         "`--no-write-fetch-head` must prevent `.git/FETCH_HEAD` creation"
@@ -528,20 +556,32 @@ audit_notes = "Retired axiom-heavy crypto module."
         svenvs_sha
     );
     assert_eq!(
-        git_in(&target_repo, &["rev-parse", "refs/quarry/lean-transport/dev"]),
+        git_in(
+            &target_repo,
+            &["rev-parse", "refs/quarry/lean-transport/dev"]
+        ),
         transport_sha
     );
 
     // 6. Status check: valid manifest passes; broken `uptaken` destination fails!
     let st_ok = status_quarry(&manifest, Some(&target_repo), None).unwrap();
-    assert!(st_ok.all_uptaken_verified, "violations: {:#?}", st_ok.uptake_violations);
+    assert!(
+        st_ok.all_uptaken_verified,
+        "violations: {:#?}",
+        st_ok.uptake_violations
+    );
     assert_eq!(st_ok.by_state.get("uptaken"), Some(&1));
     assert_eq!(st_ok.by_state.get("queued_for_upgrade"), Some(&1));
     assert_eq!(st_ok.by_state.get("retired_slop"), Some(&1));
 
     let mut broken_manifest = manifest.clone();
     broken_manifest.entries[0].destination_path = Some("lean/Obend/MissingDestination.lean".into());
-    let st_bad = status_quarry(&broken_manifest, Some(&target_repo), Some(QuarryState::Uptaken)).unwrap();
+    let st_bad = status_quarry(
+        &broken_manifest,
+        Some(&target_repo),
+        Some(QuarryState::Uptaken),
+    )
+    .unwrap();
     assert!(!st_bad.all_uptaken_verified);
     assert_eq!(st_bad.uptake_violations.len(), 1);
 
@@ -555,7 +595,9 @@ audit_notes = "Retired axiom-heavy crypto module."
     )
     .unwrap();
     assert!(
-        bad_inspect.resolution_source.starts_with("git:refs/quarry/breadstuffs/main@"),
+        bad_inspect
+            .resolution_source
+            .starts_with("git:refs/quarry/breadstuffs/main@"),
         "expected git blob inspection, got {}",
         bad_inspect.resolution_source
     );

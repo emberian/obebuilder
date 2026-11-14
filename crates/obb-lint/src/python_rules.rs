@@ -191,10 +191,9 @@ fn analyze_py_file(rel_path: &str, src: &str) -> PyFileFacts {
                     kind: PyTokKind::Ident(fname),
                     ..
                 }) = toks.get(i + 1)
+                    && (fname.starts_with("test_") || fname.starts_with("run_all_"))
                 {
-                    if fname.starts_with("test_") || fname.starts_with("run_all_") {
-                        facts.test_fn_count += 1;
-                    }
+                    facts.test_fn_count += 1;
                 }
             }
             PyTokKind::Ident(kw) if kw == "from" => {

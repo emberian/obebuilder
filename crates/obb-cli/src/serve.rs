@@ -2,19 +2,24 @@
 //! `judge.json` floors, machine disk headroom, and `obb lint` findings (`DESIGN.md` §5, `PROCESS.md` §5).
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
-use axum::Router;
 use obb_core::LintReport;
 use obb_judge::{Gate, evaluate_gate};
 use obb_lint::run_repo_lints;
 use obb_state::StateStore;
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
@@ -24,12 +29,12 @@ pub struct ServeConfig {
     pub state_dir: Option<PathBuf>,
     pub target_repo: PathBuf,
     pub judge_path: PathBuf,
+    bearer_digest: Option<[u8; 32]>,
     pub cached_lint: Arc<RwLock<Option<LintReport>>>,
 }
 
 impl ServeConfig {
     pub fn new(workspace_root: PathBuf, target_repo: PathBuf, judge_path: PathBuf) -> Self {
-        // Pre-load `reports/obend-baseline.json` if available so `/api/lints` is instant
         let baseline_path = workspace_root.join("reports/obend-baseline.json");
         let initial_lint = std::fs::read_to_string(&baseline_path)
             .ok()
@@ -39,8 +44,18 @@ impl ServeConfig {
             state_dir: None,
             target_repo,
             judge_path,
+            bearer_digest: None,
             cached_lint: Arc::new(RwLock::new(initial_lint)),
         }
+    }
+
+    pub fn with_bearer_token(mut self, token: &str) -> Self {
+        self.bearer_digest = if token.is_empty() {
+            None
+        } else {
+            Some(Sha256::digest(token.as_bytes()).into())
+        };
+        self
     }
 
     pub fn with_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
@@ -56,7 +71,83 @@ pub fn build_router(cfg: ServeConfig) -> Router {
         .route("/api/lints", get(api_lints))
         .route("/api/judge", get(api_judge))
         .route("/events", get(sse_events))
+        .layer(middleware::from_fn_with_state(
+            cfg.clone(),
+            validate_request,
+        ))
         .with_state(cfg)
+}
+
+/// Bound every body, including chunked bodies, before invoking any application handler.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
+async fn validate_request(
+    State(cfg): State<ServeConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "GET, HEAD")],
+        )
+            .into_response();
+    }
+    // The HTML shell is public; repository/state data and SSE require a bearer token.
+    if request.uri().path() != "/" {
+        let Some(expected) = cfg.bearer_digest else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+        let token = values
+            .next()
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        let valid = token
+            .map(|t| {
+                let actual: [u8; 32] = Sha256::digest(t.as_bytes()).into();
+                bool::from(actual.ct_eq(&expected))
+            })
+            .unwrap_or(false);
+        if !valid || values.next().is_some() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+            )
+                .into_response();
+        }
+    }
+    let mut types = request.headers().get_all(header::CONTENT_TYPE).iter();
+    if let Some(value) = types.next()
+        && (types.next().is_some()
+            || value.to_str().ok().is_none_or(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "application/json" | "application/json; charset=utf-8"
+                )
+            }))
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > MAX_BODY_BYTES)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    if !bytes.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    next.run(Request::from_parts(parts, axum::body::Body::empty()))
+        .await
 }
 
 pub async fn run_server(
@@ -66,7 +157,16 @@ pub async fn run_server(
     target_repo: &Path,
     judge_path: &Path,
 ) -> Result<()> {
-    run_server_with_state_dir(host, port, workspace_root, None, target_repo, judge_path).await
+    run_server_with_options(
+        host,
+        port,
+        workspace_root,
+        None,
+        target_repo,
+        judge_path,
+        false,
+    )
+    .await
 }
 
 pub async fn run_server_with_state_dir(
@@ -77,10 +177,39 @@ pub async fn run_server_with_state_dir(
     target_repo: &Path,
     judge_path: &Path,
 ) -> Result<()> {
+    run_server_with_options(
+        host,
+        port,
+        workspace_root,
+        state_dir,
+        target_repo,
+        judge_path,
+        false,
+    )
+    .await
+}
+
+pub async fn run_server_with_options(
+    host: &str,
+    port: u16,
+    workspace_root: &Path,
+    state_dir: Option<&Path>,
+    target_repo: &Path,
+    judge_path: &Path,
+    seed_demo: bool,
+) -> Result<()> {
+    let token = std::env::var("OBB_SERVE_TOKEN")
+        .context("set OBB_SERVE_TOKEN to access the dashboard API")?;
+    anyhow::ensure!(
+        !token.trim().is_empty(),
+        "OBB_SERVE_TOKEN must not be empty"
+    );
     let store = StateStore::open_with_state_dir(workspace_root, state_dir)?;
-    let snap = store.snapshot()?;
-    if snap.campaigns.is_empty() {
-        let _ = store.seed_obend_campaign(target_repo)?;
+    if seed_demo {
+        let snap = store.snapshot()?;
+        if snap.campaigns.is_empty() {
+            let _ = store.seed_obend_campaign(target_repo)?;
+        }
     }
 
     let cfg = ServeConfig::new(
@@ -88,7 +217,8 @@ pub async fn run_server_with_state_dir(
         target_repo.to_path_buf(),
         judge_path.to_path_buf(),
     )
-    .with_state_dir(state_dir.map(Path::to_path_buf));
+    .with_state_dir(state_dir.map(Path::to_path_buf))
+    .with_bearer_token(&token);
     let app = build_router(cfg);
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -140,13 +270,15 @@ async fn api_judge(State(cfg): State<ServeConfig>) -> impl IntoResponse {
 async fn sse_events(
     State(cfg): State<ServeConfig>,
 ) -> Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>> {
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(5))).map(move |_| {
-        let payload = StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
-            .and_then(|s| s.snapshot())
-            .map(|snap| serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()))
-            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string());
-        Ok(Event::default().event("status").data(payload))
-    });
+    let stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_secs(5))).map(move |_| {
+            let payload =
+                StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
+                    .and_then(|s| s.snapshot())
+                    .map(|snap| serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()))
+                    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }).to_string());
+            Ok(Event::default().event("status").data(payload))
+        });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -204,6 +336,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   </style>
 </head>
 <body>
+  <label>API token <input id="token" type="password" autocomplete="off" /></label> <button id="connect">Connect</button>
   <header>
     <div>
       <h1>obb // Process Statechart, Genealogy Judge &amp; Anti-Slop Census</h1>
@@ -250,11 +383,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
     function renderStatus(snap) {
-      document.getElementById('subtitle').textContent = `workspace: ${snap.workspace_root}`;
+      document.getElementById('subtitle').textContent =
+        `workspace: ${snap.workspace_root} | live_transitions=${snap.live_transition_count ?? 0} verified_quests=${snap.verified_quest_count ?? 0} demo_seed_events=${snap.demo_seed_event_count ?? 0}`;
       const sb = document.getElementById('sched-badge');
-      sb.innerHTML = snap.scheduler_paused
+      const demoTag = snap.contains_demo_seed ? ' <span class="badge warn">DEMO SEED PRESENT</span>' : '';
+      sb.innerHTML = (snap.scheduler_paused
         ? `<span class="badge err">SCHEDULER PAUSED: ${esc(snap.pause_reasons.join('; '))}</span>`
-        : `<span class="badge ok">SCHEDULER READY</span>`;
+        : `<span class="badge ok">SCHEDULER READY</span>`) + demoTag;
 
       const eb = document.getElementById('ember-box');
       if (!snap.waiting_on_ember || snap.waiting_on_ember.length === 0) {
@@ -275,10 +410,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }).join('') + '</table>';
 
       const qb = document.getElementById('quests-box');
-      qb.innerHTML = '<table><tr><th>Quest</th><th>State</th><th>Regime</th><th>Holder</th><th>Title</th></tr>' +
+      qb.innerHTML = '<table><tr><th>Quest</th><th>State</th><th>Effective</th><th>Target</th><th>Holder</th><th>Title</th></tr>' +
         (snap.quests || []).map(q => {
-          const cls = q.is_sink ? 'sink' : 'ok';
-          return `<tr><td>${esc(q.id)}</td><td><span class="badge ${cls}">${esc(q.state)}</span></td><td><span class="badge info">${esc(q.target_regime)}</span></td><td>${esc(q.holder_agent)}</td><td>${esc(q.title)}</td></tr>`;
+          const cls = q.is_sink ? 'sink' : (q.merged_ungated ? 'warn' : 'ok');
+          const effCls = q.origin === 'demo_seed' || q.merged_ungated ? 'warn' : 'info';
+          return `<tr><td>${esc(q.id)}</td><td><span class="badge ${cls}">${esc(q.state)}</span></td><td><span class="badge ${effCls}">${esc(q.effective_regime)}</span></td><td><span class="badge info">${esc(q.target_regime)}</span></td><td>${esc(q.holder_agent)}</td><td>${esc(q.title)}</td></tr>`;
         }).join('') + '</table>';
 
       const sgb = document.getElementById('segments-box');
@@ -288,20 +424,26 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         ).join('') + '</table>';
     }
 
+    let bearer = '';
+    async function api(path) {
+      const response = await fetch(path, {headers: {Authorization: `Bearer ${bearer}`}});
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      return response.json();
+    }
     async function refreshAll() {
       const [st, jd, ln] = await Promise.all([
-        fetch('/api/status').then(r => r.json()),
-        fetch('/api/judge').then(r => r.json()),
-        fetch('/api/lints').then(r => r.json())
+        api('/api/status'),
+        api('/api/judge'),
+        api('/api/lints')
       ]);
       if (!st.error) renderStatus(st);
 
       const jb = document.getElementById('judge-box');
       if (jd.evaluation) {
-        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` +
-          '<table><tr><th>Floor</th><th>Measured</th><th>Bound</th><th>Pass</th></tr>' +
+        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Achieved: <span class="badge info">${esc(jd.evaluation.achieved_regime)}</span> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` +
+          '<table><tr><th>Floor</th><th>Regime</th><th>Measured</th><th>Bound</th><th>Pass</th></tr>' +
           jd.evaluation.evaluations.map(ev =>
-            `<tr><td><code>${esc(ev.floor)}</code></td><td>${ev.measured}</td><td>${esc(ev.bound)}</td><td><span class="badge ${ev.passed ? 'ok' : 'err'}">${ev.passed ? 'PASS' : 'FAIL'}</span></td></tr>`
+            `<tr><td><code>${esc(ev.floor)}</code></td><td><span class="badge info">${esc(ev.regime)}</span></td><td>${ev.measured}</td><td>${esc(ev.bound)}</td><td><span class="badge ${ev.passed ? 'ok' : 'err'}">${ev.passed ? 'PASS' : 'FAIL'}</span></td></tr>`
           ).join('') + '</table>';
       }
 
@@ -315,11 +457,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
     }
 
-    refreshAll();
-    const es = new EventSource('/events');
-    es.addEventListener('status', ev => {
-      try { renderStatus(JSON.parse(ev.data)); } catch (_) {}
-    });
+    document.getElementById('connect').onclick = async () => {
+      bearer = document.getElementById('token').value;
+      document.getElementById('token').value = '';
+      try { await refreshAll(); } catch (error) { document.getElementById('subtitle').textContent = error.message; }
+    };
+    setInterval(() => { if (bearer) refreshAll().catch(() => {}); }, 5000);
   </script>
 </body>
 </html>

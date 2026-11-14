@@ -9,7 +9,6 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,7 +26,12 @@ pub struct RemoteCmdOutput {
 /// Pluggable SSH execution trait so `obb broker` runs against real `hbox`/`bb2` in production
 /// and against deterministic in-memory mocks in `< 1ms` unit tests.
 pub trait RemoteExecutor: Send + Sync {
-    fn run_ssh(&self, host: &str, remote_script: &str, timeout_secs: u64) -> Result<RemoteCmdOutput>;
+    fn run_ssh(
+        &self,
+        host: &str,
+        remote_script: &str,
+        timeout_secs: u64,
+    ) -> Result<RemoteCmdOutput>;
 }
 
 /// Production OpenSSH executor with non-interactive `BatchMode=yes`, `ConnectTimeout=5`,
@@ -36,7 +40,12 @@ pub trait RemoteExecutor: Send + Sync {
 pub struct SshExecutor;
 
 impl RemoteExecutor for SshExecutor {
-    fn run_ssh(&self, host: &str, remote_script: &str, timeout_secs: u64) -> Result<RemoteCmdOutput> {
+    fn run_ssh(
+        &self,
+        host: &str,
+        remote_script: &str,
+        timeout_secs: u64,
+    ) -> Result<RemoteCmdOutput> {
         let t0 = Instant::now();
         let mut child = Command::new("ssh")
             .args([
@@ -110,47 +119,6 @@ impl RemoteExecutor for SshExecutor {
                 .to_string(),
                 duration_ms,
             }),
-        }
-    }
-}
-
-/// Deterministic offline mock SSH executor for fast unit & integration tests.
-#[derive(Default)]
-pub struct MockSshExecutor {
-    responses: HashMap<String, RemoteCmdOutput>,
-    pub calls: Mutex<Vec<(String, String)>>,
-}
-
-impl MockSshExecutor {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_host_output(mut self, host: &str, output: RemoteCmdOutput) -> Self {
-        self.responses.insert(host.to_string(), output);
-        self
-    }
-
-    pub fn recorded_calls(&self) -> Vec<(String, String)> {
-        self.calls.lock().unwrap().clone()
-    }
-}
-
-impl RemoteExecutor for MockSshExecutor {
-    fn run_ssh(&self, host: &str, remote_script: &str, _timeout_secs: u64) -> Result<RemoteCmdOutput> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((host.to_string(), remote_script.to_string()));
-        if let Some(resp) = self.responses.get(host) {
-            Ok(resp.clone())
-        } else {
-            Ok(RemoteCmdOutput {
-                exit_code: 255,
-                stdout: String::new(),
-                stderr: format!("mock: host `{host}` unreachable"),
-                duration_ms: 1,
-            })
         }
     }
 }
@@ -274,10 +242,10 @@ pub fn parse_probe_stdout(host: &str, stdout: &str) -> Result<HostProbe> {
 
                 mem_total_gib = round2((tot_kb as f64) / (1024.0 * 1024.0));
                 let base_avail_gib = (avail_kb as f64) / (1024.0 * 1024.0);
-                zfs_arc_reclaimable_gib =
-                    round2((zfs_bytes as f64) / (1024.0 * 1024.0 * 1024.0));
+                zfs_arc_reclaimable_gib = round2((zfs_bytes as f64) / (1024.0 * 1024.0 * 1024.0));
                 // Linux MemAvailable excludes ZFS ARC (`MACHINES.md`); add reclaimable ARC capped at MemTotal
-                let eff_free = (base_avail_gib + zfs_arc_reclaimable_gib).min(mem_total_gib.max(base_avail_gib));
+                let eff_free = (base_avail_gib + zfs_arc_reclaimable_gib)
+                    .min(mem_total_gib.max(base_avail_gib));
                 mem_free_gib = round2(eff_free);
                 disk_free_gib = round2((disk_kb as f64) / (1024.0 * 1024.0));
             }
@@ -290,7 +258,11 @@ pub fn parse_probe_stdout(host: &str, stdout: &str) -> Result<HostProbe> {
                 let comm = cols[3].trim().to_string();
                 let args = cols[4].trim().to_string();
 
-                if comm.contains("lean") || comm.contains("lake") || args.contains("lean") || args.contains("lake") {
+                if comm.contains("lean")
+                    || comm.contains("lake")
+                    || args.contains("lean")
+                    || args.contains("lake")
+                {
                     active_lean_lake_procs += 1;
                 }
                 if elapsed_secs > RUNAWAY_AGE_SECS {
@@ -648,20 +620,18 @@ fn resolve_git_revisions(
     repo_root: Option<&Path>,
     explicit_commit: Option<&str>,
 ) -> Result<ResolvedGitRevisions> {
-    let cleaned_explicit = explicit_commit
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let cleaned_explicit = explicit_commit.map(str::trim).filter(|s| !s.is_empty());
 
     if let Some(root) = repo_root {
         let rev_base = cleaned_explicit.unwrap_or("HEAD");
         let commit_sha = git_rev_parse(root, &format!("{rev_base}^{{commit}}"));
-        if let Some(exp) = cleaned_explicit {
-            if commit_sha.is_none() {
-                bail!(
-                    "explicit `--commit {exp}` could not be resolved in local repository `{}`",
-                    root.display()
-                );
-            }
+        if let Some(exp) = cleaned_explicit
+            && commit_sha.is_none()
+        {
+            bail!(
+                "explicit `--commit {exp}` could not be resolved in local repository `{}`",
+                root.display()
+            );
         }
         // Prefer `<rev>:lean` tree SHA so pure docs/Rust edits reuse the exact same warm `.olean` seed!
         let seed_key = git_rev_parse(root, &format!("{rev_base}:lean"))
@@ -753,8 +723,7 @@ pub fn is_valid_lake_target(t: &str) -> bool {
         && t.len() <= 256
         && !t.starts_with('-')
         && t.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@' | b'+' | b':')
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@' | b'+' | b':')
         })
 }
 
@@ -1082,7 +1051,10 @@ pub fn plan_build(
             HostChoice::Hbox => ("hbox".to_string(), "pinned via `--host hbox`".to_string()),
             HostChoice::Auto => match class {
                 TargetWorkloadClass::GpuRdna2Litmus => {
-                    if opts.dry_run || reachable_map.contains_key("hbox") || reachable_map.is_empty() {
+                    if opts.dry_run
+                        || reachable_map.contains_key("hbox")
+                        || reachable_map.is_empty()
+                    {
                         (
                             "hbox".to_string(),
                             "GPU/RDNA2/Litmus target affinity -> `hbox`".to_string(),
@@ -1099,7 +1071,8 @@ pub fn plan_build(
                     }
                 }
                 TargetWorkloadClass::YosysVerilatorEda => {
-                    if opts.dry_run || reachable_map.contains_key("bb2") || reachable_map.is_empty() {
+                    if opts.dry_run || reachable_map.contains_key("bb2") || reachable_map.is_empty()
+                    {
                         (
                             "bb2".to_string(),
                             "Yosys/Verilator/EDA target affinity -> `bb2`".to_string(),
@@ -1118,11 +1091,18 @@ pub fn plan_build(
                 TargetWorkloadClass::GeneralLean => {
                     let score_note = reachable_map
                         .get(&healthiest_general)
-                        .map(|h| format!("health_score={:.1}, free={:.1}GiB", h.health_score, h.mem_free_gib))
+                        .map(|h| {
+                            format!(
+                                "health_score={:.1}, free={:.1}GiB",
+                                h.health_score, h.mem_free_gib
+                            )
+                        })
                         .unwrap_or_else(|| "offline default".to_string());
                     (
                         healthiest_general.clone(),
-                        format!("healthier general Lean host -> `{healthiest_general}` ({score_note})"),
+                        format!(
+                            "healthier general Lean host -> `{healthiest_general}` ({score_note})"
+                        ),
                     )
                 }
             },
@@ -1174,7 +1154,8 @@ pub fn plan_build(
         );
 
         let execution = if opts.exec && !opts.dry_run {
-            let out = executor.run_ssh(&host, &remote_recipe, opts.timeout_secs.saturating_add(30))?;
+            let out =
+                executor.run_ssh(&host, &remote_recipe, opts.timeout_secs.saturating_add(30))?;
             Some(BatchExecutionOutcome {
                 executed: true,
                 exit_code: out.exit_code,

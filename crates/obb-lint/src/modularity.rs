@@ -160,14 +160,12 @@ pub fn compute_modularity_report(index: &LeanIndex) -> ModularityReport {
     monolithic_modules.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.path.cmp(&b.path)));
 
     for d in dir_map.values_mut() {
-        d.carrier_to_leaf_ratio = round4(
-            (d.structures_and_classes as f64) / (d.isolated_leaf_theorems.max(1) as f64),
-        );
+        d.carrier_to_leaf_ratio =
+            round4((d.structures_and_classes as f64) / (d.isolated_leaf_theorems.max(1) as f64));
     }
 
     let carriers = structures + classes;
-    let carrier_to_leaf_ratio =
-        round4((carriers as f64) / (isolated_leaf_theorems.max(1) as f64));
+    let carrier_to_leaf_ratio = round4((carriers as f64) / (isolated_leaf_theorems.max(1) as f64));
     let theorem_reuse_ratio = if total_theorems == 0 {
         1.0
     } else {
@@ -175,9 +173,7 @@ pub fn compute_modularity_report(index: &LeanIndex) -> ModularityReport {
     };
 
     let reuse_score = 50.0 * theorem_reuse_ratio;
-    let interface_score = if total_theorems == 0 && carriers == 0 {
-        30.0
-    } else if isolated_leaf_theorems == 0 {
+    let interface_score = if (total_theorems == 0 && carriers == 0) || isolated_leaf_theorems == 0 {
         30.0
     } else {
         30.0 * (carrier_to_leaf_ratio / (carrier_to_leaf_ratio + 0.25))
@@ -187,7 +183,8 @@ pub fn compute_modularity_report(index: &LeanIndex) -> ModularityReport {
     } else {
         20.0 * (1.0 - (monolithic_modules.len() as f64 / lean_files as f64)).clamp(0.0, 1.0)
     };
-    let compositionality_index = round2((reuse_score + interface_score + hygiene_score).clamp(0.0, 100.0));
+    let compositionality_index =
+        round2((reuse_score + interface_score + hygiene_score).clamp(0.0, 100.0));
 
     let cone = crate::cone::compute_cone_from_index("", index, None);
 

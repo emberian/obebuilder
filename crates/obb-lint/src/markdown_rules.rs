@@ -197,7 +197,8 @@ fn extract_bare_lean_filenames(line: &str) -> Vec<(String, usize)> {
         }
         if chars[i].is_ascii_alphabetic() {
             let start = i;
-            while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '/') {
+            while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '/')
+            {
                 i += 1;
             }
             if i + 5 <= n {
@@ -256,15 +257,21 @@ fn resolve_table_target_inductive(
         let h_low = h_clean.to_ascii_lowercase();
         if matches!(
             h_low.as_str(),
-            "constructor" | "constructors" | "former" | "formers" | "lean constructor" | "variant" | "variants"
+            "constructor"
+                | "constructors"
+                | "former"
+                | "formers"
+                | "lean constructor"
+                | "variant"
+                | "variants"
         ) {
             ctor_col = Some(col_idx);
             break;
         }
-        if index.inductives.contains_key(h_clean) {
-            if let Some(ctors) = index.inductives.get(h_clean) {
-                return Some((h_clean.to_string(), ctors.clone(), Some(col_idx)));
-            }
+        if index.inductives.contains_key(h_clean)
+            && let Some(ctors) = index.inductives.get(h_clean)
+        {
+            return Some((h_clean.to_string(), ctors.clone(), Some(col_idx)));
         }
     }
 
@@ -297,7 +304,12 @@ fn resolve_table_target_inductive(
     // Fallback: check Capitalized identifiers in heading against unique `index.inductives`
     for word in heading_text
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| w.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
+        .filter(|w| {
+            w.chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false)
+        })
     {
         if let Some(ctors) = index.inductives.get(word) {
             return Some((word.to_string(), ctors.clone(), Some(ctor_col)));
@@ -344,7 +356,8 @@ pub fn lint_markdown_file(
                 fence_start_line = line_no;
                 fence_buf.clear();
             } else {
-                if has_lean_corpus && (fence_lang == "lean" || fence_lang == "lean4" || fence_lang.is_empty())
+                if has_lean_corpus
+                    && (fence_lang == "lean" || fence_lang == "lean4" || fence_lang.is_empty())
                 {
                     check_fenced_inductive_blocks(
                         rel_path,
@@ -381,31 +394,32 @@ pub fn lint_markdown_file(
         if has_lean_corpus && trimmed.starts_with('|') && i + 1 < lines.len() {
             let header_cells = split_pipe_row(line);
             let sep_cells = split_pipe_row(lines[i + 1]);
-            if !header_cells.is_empty() && is_separator_row(&sep_cells) {
-                if let Some((ind_name, actual_ctors, Some(ctor_col))) =
+            if !header_cells.is_empty()
+                && is_separator_row(&sep_cells)
+                && let Some((ind_name, actual_ctors, Some(ctor_col))) =
                     resolve_table_target_inductive(&current_heading, &header_cells, index)
-                {
-                    let mut row_i = i + 2;
-                    while row_i < lines.len() && lines[row_i].trim_start().starts_with('|') {
-                        let row_cells = split_pipe_row(lines[row_i]);
-                        if let Some(cell) = row_cells.get(ctor_col) {
-                            for (span, _) in extract_inline_code_spans(cell) {
-                                let clean_span = span.trim();
-                                let first_tok = clean_span
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("")
-                                    .trim_end_matches(|c: char| matches!(c, ',' | ';' | ')' | ':'));
-                                let ctor_candidate = first_tok
-                                    .strip_prefix(&format!("{ind_name}."))
-                                    .or_else(|| first_tok.strip_prefix('.'))
-                                    .unwrap_or(first_tok);
-                                if is_ident_token(ctor_candidate)
-                                    && !actual_ctors.contains(ctor_candidate)
-                                {
-                                    let actual_list: Vec<&str> =
-                                        actual_ctors.iter().map(String::as_str).collect();
-                                    findings.push(Finding {
+            {
+                let mut row_i = i + 2;
+                while row_i < lines.len() && lines[row_i].trim_start().starts_with('|') {
+                    let row_cells = split_pipe_row(lines[row_i]);
+                    if let Some(cell) = row_cells.get(ctor_col) {
+                        for (span, _) in extract_inline_code_spans(cell) {
+                            let clean_span = span.trim();
+                            let first_tok = clean_span
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("")
+                                .trim_end_matches([',', ';', ')', ':']);
+                            let ctor_candidate = first_tok
+                                .strip_prefix(&format!("{ind_name}."))
+                                .or_else(|| first_tok.strip_prefix('.'))
+                                .unwrap_or(first_tok);
+                            if is_ident_token(ctor_candidate)
+                                && !actual_ctors.contains(ctor_candidate)
+                            {
+                                let actual_list: Vec<&str> =
+                                    actual_ctors.iter().map(String::as_str).collect();
+                                findings.push(Finding {
                                         rule_id: "markdown/hallucinated-constructor".to_string(),
                                         severity: Severity::Error,
                                         artifact_kind: ArtifactKind::S,
@@ -423,11 +437,10 @@ pub fn lint_markdown_file(
                                             "Update the `{ind_name}` table in `{rel_path}` to match the actual Lean `inductive {ind_name}` declaration, or generate constructor tables from Lean."
                                         ),
                                     });
-                                }
                             }
                         }
-                        row_i += 1;
                     }
+                    row_i += 1;
                 }
             }
         }
@@ -472,7 +485,9 @@ pub fn lint_markdown_file(
                 && !span.contains('*')
             {
                 let norm = span.strip_prefix("lean/").unwrap_or(span);
-                if let Some(dir_sub) = norm.strip_prefix("Obend/").and_then(|s| s.strip_suffix('/'))
+                if let Some(dir_sub) = norm
+                    .strip_prefix("Obend/")
+                    .and_then(|s| s.strip_suffix('/'))
                 {
                     let top_sub = dir_sub.split('/').next().unwrap_or(dir_sub);
                     let dir_exists = index.subsystems.contains(top_sub)
@@ -792,17 +807,18 @@ fn check_fenced_inductive_blocks(
             current_ind = None;
         }
 
-        if let Some((ref ind_name, Some(ref actual_ctors), _)) = current_ind {
-            if let Some(after_pipe) = trimmed.strip_prefix('|') {
-                let ctor = after_pipe
-                    .trim_start()
-                    .trim_start_matches('.')
-                    .split(|c: char| c.is_whitespace() || matches!(c, '(' | '{' | '[' | ':'))
-                    .find(|s| !s.is_empty())
-                    .unwrap_or("");
-                if is_ident_token(ctor) && ctor != "..." && !actual_ctors.contains(ctor) {
-                    let actual_list: Vec<&str> = actual_ctors.iter().map(String::as_str).collect();
-                    findings.push(Finding {
+        if let Some((ref ind_name, Some(ref actual_ctors), _)) = current_ind
+            && let Some(after_pipe) = trimmed.strip_prefix('|')
+        {
+            let ctor = after_pipe
+                .trim_start()
+                .trim_start_matches('.')
+                .split(|c: char| c.is_whitespace() || matches!(c, '(' | '{' | '[' | ':'))
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            if is_ident_token(ctor) && ctor != "..." && !actual_ctors.contains(ctor) {
+                let actual_list: Vec<&str> = actual_ctors.iter().map(String::as_str).collect();
+                findings.push(Finding {
                         rule_id: "markdown/hallucinated-constructor".to_string(),
                         severity: Severity::Error,
                         artifact_kind: ArtifactKind::S,
@@ -820,7 +836,6 @@ fn check_fenced_inductive_blocks(
                             "Align fenced `inductive {ind_name}` constructors with the Lean definition."
                         ),
                     });
-                }
             }
         }
     }
@@ -832,13 +847,17 @@ fn check_navel_prose(rel_path: &str, line_no: usize, line: &str, findings: &mut 
         Some("historical deletion diary (`deleted/removed on 202...`) inside live architecture doc")
     } else if lower.contains("until 2026-") || lower.contains("prior to 2026-") {
         Some("dated historical confession (`until/prior to 2026-...`) inside live architecture doc")
-    } else if (lower.contains("0 sorryax") || lower.contains("zero sorryax") || lower.contains("zero sorry"))
+    } else if (lower.contains("0 sorryax")
+        || lower.contains("zero sorryax")
+        || lower.contains("zero sorry"))
         && !lower.contains("floor")
         && !lower.contains("no_sorry_ax")
         && !lower.contains("rule")
         && !lower.contains("detector")
     {
-        Some("self-congratulatory `0 sorryAx` prose assertion (put mechanical checks in `obb judge`, not prose)")
+        Some(
+            "self-congratulatory `0 sorryAx` prose assertion (put mechanical checks in `obb judge`, not prose)",
+        )
     } else {
         None
     };

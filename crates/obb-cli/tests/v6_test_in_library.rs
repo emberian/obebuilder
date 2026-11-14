@@ -27,16 +27,17 @@ fn write_rel(root: &Path, rel: &str, content: &str) {
 
 #[test]
 fn cli_v6_enforces_3way_proof_test_mutation_separation_and_tracks_tier1_metrics() {
-    // Verify crate version bumped to 0.6.0
+    // Verify crate version matches workspace Cargo.toml (`0.7.0`)
     let ver_out = Command::new(obb_bin())
         .arg("--version")
         .output()
         .expect("obb --version");
     assert!(ver_out.status.success());
     let ver_str = String::from_utf8_lossy(&ver_out.stdout);
+    let expected_ver = format!("obb {}", env!("CARGO_PKG_VERSION"));
     assert!(
-        ver_str.trim() == "obb 0.6.0",
-        "expected `obb 0.6.0`, got `{}`",
+        ver_str.trim() == expected_ver,
+        "expected `{expected_ver}`, got `{}`",
         ver_str.trim()
     );
 

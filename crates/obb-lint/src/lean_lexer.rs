@@ -10,12 +10,12 @@ pub enum LeanTokenKind {
     NatLit(String),
     DocComment(String),
     FixtureKeptComment(String),
-    CommandHash(String), // e.g. `#tooth`, `#assert_compiled`, `#silicon_check`
-    SyntaxQuoteOpen,     // `` `( ``
-    AntiquoteOpen,       // `$(`
+    CommandHash(String),    // e.g. `#tooth`, `#assert_compiled`, `#silicon_check`
+    SyntaxQuoteOpen,        // `` `( ``
+    AntiquoteOpen,          // `$(`
     AntiquoteIdent(String), // `$x`
     DoubleBacktickConst(String), // `` ``Foo.bar ``
-    Symbol(String),      // `:=`, `=>`, `|`, `:`, `(`, `)`, `{`, `}`, `[`, `]`, `⟨`, `⟩`, `∀`, `→`, `∧`, `↔`, `=`, `==`, etc.
+    Symbol(String), // `:=`, `=>`, `|`, `:`, `(`, `)`, `{`, `}`, `[`, `]`, `⟨`, `⟩`, `∀`, `→`, `∧`, `↔`, `=`, `==`, etc.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,12 @@ fn is_ident_start(c: char) -> bool {
 }
 
 fn is_ident_continue(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '\'' || c == '?' || c == '!' || matches!(c, '₀'..='₉' | 'ₐ'..='ₜ')
+    c.is_alphanumeric()
+        || c == '_'
+        || c == '\''
+        || c == '?'
+        || c == '!'
+        || matches!(c, '₀'..='₉' | 'ₐ'..='ₜ')
 }
 
 pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
@@ -219,11 +224,17 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
                     if esc == 'u' && i + 3 < n && chars[i + 2] == '{' {
                         let mut k = i + 3;
                         let mut hex = String::new();
-                        while k < n && chars[k] != '}' && hex.len() <= 6 && chars[k].is_ascii_hexdigit() {
+                        while k < n
+                            && chars[k] != '}'
+                            && hex.len() <= 6
+                            && chars[k].is_ascii_hexdigit()
+                        {
                             hex.push(chars[k]);
                             k += 1;
                         }
-                        if k < n && chars[k] == '}' && !hex.is_empty()
+                        if k < n
+                            && chars[k] == '}'
+                            && !hex.is_empty()
                             && let Ok(code) = u32::from_str_radix(&hex, 16)
                             && let Some(ch) = char::from_u32(code)
                         {
@@ -236,7 +247,7 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
                     }
                     if esc == 'u' && i + 5 < n {
                         let hex: String = chars[i + 2..i + 6].iter().collect();
-                        if hex.chars().all(| ch | ch.is_ascii_hexdigit())
+                        if hex.chars().all(|ch| ch.is_ascii_hexdigit())
                             && let Ok(code) = u32::from_str_radix(&hex, 16)
                             && let Some(ch) = char::from_u32(code)
                         {
@@ -513,34 +524,48 @@ pub fn tokenize_lean(src: &str) -> Vec<LeanToken> {
             None
         };
 
-        if let Some(ref s3) = three {
-            if matches!(s3.as_str(), "<->" | "=:=" | "=?=" | "<;>" | ">>>" | "<<<") {
-                i += 3;
-                col += 3;
-                tokens.push(LeanToken {
-                    kind: LeanTokenKind::Symbol(s3.clone()),
-                    line: start_line,
-                    col: start_col,
-                    first_on_line: tok_first,
-                });
-                continue;
-            }
+        if let Some(ref s3) = three
+            && matches!(s3.as_str(), "<->" | "=:=" | "=?=" | "<;>" | ">>>" | "<<<")
+        {
+            i += 3;
+            col += 3;
+            tokens.push(LeanToken {
+                kind: LeanTokenKind::Symbol(s3.clone()),
+                line: start_line,
+                col: start_col,
+                first_on_line: tok_first,
+            });
+            continue;
         }
-        if let Some(ref s2) = two {
-            if matches!(
+        if let Some(ref s2) = two
+            && matches!(
                 s2.as_str(),
-                ":=" | "=>" | "->" | "<-" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "++" | "::" | "|>" | "<|" | "#[" | "@["
-            ) {
-                i += 2;
-                col += 2;
-                tokens.push(LeanToken {
-                    kind: LeanTokenKind::Symbol(s2.clone()),
-                    line: start_line,
-                    col: start_col,
-                    first_on_line: tok_first,
-                });
-                continue;
-            }
+                ":=" | "=>"
+                    | "->"
+                    | "<-"
+                    | "=="
+                    | "!="
+                    | "<="
+                    | ">="
+                    | "&&"
+                    | "||"
+                    | "++"
+                    | "::"
+                    | "|>"
+                    | "<|"
+                    | "#["
+                    | "@["
+            )
+        {
+            i += 2;
+            col += 2;
+            tokens.push(LeanToken {
+                kind: LeanTokenKind::Symbol(s2.clone()),
+                line: start_line,
+                col: start_col,
+                first_on_line: tok_first,
+            });
+            continue;
         }
 
         i += 1;

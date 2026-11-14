@@ -16,7 +16,11 @@
     "docs_symbols_exist <= 0",
     "no_tautological_judge_meaning <= 0",
     "no_discarded_tactic_result <= 0",
-    "planted_fault_red <= 0"
+    "planted_fault_red <= 0",
+    "rust/test-in-library <= 0",
+    "javascript/test-in-library <= 0",
+    "python/test-in-library <= 0",
+    "lean/test-in-library <= 0"
   ],
   "methods": [
     { "format": "revert@1", "floor": "home 10", "method": "lemma" },
@@ -27,43 +31,38 @@
     { "format": "revert@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
     { "format": "revert@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
     { "format": "revert@1", "floor": "planted_fault_red <= 0", "method": "lemma" },
-
     { "format": "lean-module@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
-    { "format": "lean-module@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
-    { "format": "lean-module@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "lean-module@1", "floor": "no_sorry_ax <= 0", "method": "eval:lexical" },
+    { "format": "lean-module@1", "floor": "no_declared_axiom <= 0", "method": "eval:lexical" },
     { "format": "lean-module@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
-    { "format": "lean-module@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
-    { "format": "lean-module@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
-    { "format": "lean-module@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "lean-module@1", "floor": "docs_symbols_exist <= 0", "method": "eval:lexical" },
+    { "format": "lean-module@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:lexical" },
+    { "format": "lean-module@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:lexical" },
     { "format": "lean-module@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
-
     { "format": "judge-instance@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
-    { "format": "judge-instance@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
-    { "format": "judge-instance@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "judge-instance@1", "floor": "no_sorry_ax <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "no_declared_axiom <= 0", "method": "eval:lexical" },
     { "format": "judge-instance@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
-    { "format": "judge-instance@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
-    { "format": "judge-instance@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
-    { "format": "judge-instance@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "judge-instance@1", "floor": "docs_symbols_exist <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:lexical" },
     { "format": "judge-instance@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
-
     { "format": "tactic-elab@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
-    { "format": "tactic-elab@1", "floor": "no_sorry_ax <= 0", "method": "eval:kernel" },
-    { "format": "tactic-elab@1", "floor": "no_declared_axiom <= 0", "method": "eval:kernel" },
+    { "format": "tactic-elab@1", "floor": "no_sorry_ax <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "no_declared_axiom <= 0", "method": "eval:lexical" },
     { "format": "tactic-elab@1", "floor": "tier1_module_sec_cap <= 60", "method": "eval:compiled" },
-    { "format": "tactic-elab@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
-    { "format": "tactic-elab@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:compiled" },
-    { "format": "tactic-elab@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:compiled" },
+    { "format": "tactic-elab@1", "floor": "docs_symbols_exist <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "no_tautological_judge_meaning <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "no_discarded_tactic_result <= 0", "method": "eval:lexical" },
     { "format": "tactic-elab@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
-
     { "format": "markdown-spec@1", "floor": "home 10", "method": "eval:external:git-merge-tree" },
     { "format": "markdown-spec@1", "floor": "no_sorry_ax <= 0", "method": "lemma" },
     { "format": "markdown-spec@1", "floor": "no_declared_axiom <= 0", "method": "lemma" },
     { "format": "markdown-spec@1", "floor": "tier1_module_sec_cap <= 60", "method": "lemma" },
-    { "format": "markdown-spec@1", "floor": "docs_symbols_exist <= 0", "method": "eval:compiled" },
+    { "format": "markdown-spec@1", "floor": "docs_symbols_exist <= 0", "method": "eval:lexical" },
     { "format": "markdown-spec@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
     { "format": "markdown-spec@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
     { "format": "markdown-spec@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
-
     { "format": "judge-succession@1", "floor": "home 10", "method": "lemma" },
     { "format": "judge-succession@1", "floor": "no_sorry_ax <= 0", "method": "lemma" },
     { "format": "judge-succession@1", "floor": "no_declared_axiom <= 0", "method": "lemma" },
@@ -71,11 +70,57 @@
     { "format": "judge-succession@1", "floor": "docs_symbols_exist <= 0", "method": "lemma" },
     { "format": "judge-succession@1", "floor": "no_tautological_judge_meaning <= 0", "method": "lemma" },
     { "format": "judge-succession@1", "floor": "no_discarded_tactic_result <= 0", "method": "lemma" },
-    { "format": "judge-succession@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" }
+    { "format": "judge-succession@1", "floor": "planted_fault_red <= 0", "method": "eval:compiled" },
+    { "format": "revert@1", "floor": "rust/test-in-library <= 0", "method": "lemma" },
+    { "format": "lean-module@1", "floor": "rust/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "rust/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "rust/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "markdown-spec@1", "floor": "rust/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-succession@1", "floor": "rust/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "revert@1", "floor": "javascript/test-in-library <= 0", "method": "lemma" },
+    { "format": "lean-module@1", "floor": "javascript/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "javascript/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "javascript/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "markdown-spec@1", "floor": "javascript/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-succession@1", "floor": "javascript/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "revert@1", "floor": "python/test-in-library <= 0", "method": "lemma" },
+    { "format": "lean-module@1", "floor": "python/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "python/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "python/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "markdown-spec@1", "floor": "python/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-succession@1", "floor": "python/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "revert@1", "floor": "lean/test-in-library <= 0", "method": "lemma" },
+    { "format": "lean-module@1", "floor": "lean/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-instance@1", "floor": "lean/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "tactic-elab@1", "floor": "lean/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "markdown-spec@1", "floor": "lean/test-in-library <= 0", "method": "eval:lexical" },
+    { "format": "judge-succession@1", "floor": "lean/test-in-library <= 0", "method": "eval:lexical" }
   ],
   "basis": [
-    "kernel",
+    "lexical",
     "compiled",
     "external:git-merge-tree"
+  ],
+  "teeth": [
+    {
+      "id": "tier1-structural-anti-vacuity",
+      "description": "Execute five built-in positive/negative structural scanner controls; no Lean execution.",
+      "mutation": {
+        "kind": "structural_probe"
+      }
+    },
+    {
+      "id": "tooth-judge-revert-bedrock",
+      "description": "Verify that dropping revert@1 or home N bedrock in judge.json trips structural gate invariant check",
+      "check_cmd": "python3 -c 'import json, sys; j = json.load(open(\"judge.json\")); ok = (\"revert@1\" in j[\"formats\"]) and any(f.startswith(\"home \") for f in j[\"floors\"]); sys.stderr.write(\"ASSERTION_FAILED: revert@1/home bedrock missing\\n\") if not ok else sys.stdout.write(\"ran 1 check: ok\\n\"); sys.exit(0 if ok else 1)'",
+      "mutation": {
+        "kind": "replace",
+        "file": "judge.json",
+        "search": "\"revert@1\",",
+        "replace": ""
+      },
+      "expect_failure_substring": "ASSERTION_FAILED: revert@1/home bedrock missing",
+      "timeout_ms": 5000
+    }
   ]
 }

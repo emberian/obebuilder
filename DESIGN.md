@@ -76,8 +76,8 @@ frustration that persisted across the prompt corpus (`~/dev/collected-writings/p
 ## 3. Objects
 
 - **Segment**: (parent segment or none, model, effort, brief, worktree, machine, budget, start,
-  end, outcome, regime of its claims, agent id in `cv`). Operations: `fork`, `continue-with`,
-  `compare`, `merge`, `forget-and-continue`.
+  end, outcome, regime of its claims, agent id in `cv`). Operations (`obb seg`): `new`, `continue`,
+  `distill`, `fork`, `merge`, `forget`, `adopt`, `compare`, `list`.
 - **Artifact**: a spec section, statement, module, brief, or note, with a content hash, a kind tag
   (W/R/S/P/M), a regime label, and a population of variants each carrying its critiques and
   evaluator results.
@@ -102,37 +102,48 @@ frustration that persisted across the prompt corpus (`~/dev/collected-writings/p
 
 `obb serve` on localhost: segments as a tree with states, runtime, retries, budget use, machine
 load; artifacts with their populations and evaluator verdicts; a "ready" column and a "waiting on
-ember" column; server-sent events. This is how a person follows forty segments without reading
-forty transcripts (after Luke Hutchison's Zed plan page).
+ember" column; server-sent events. An unseeded vault opens empty (`0` live transitions) unless
+`--seed-demo` is passed explicitly, and `StateSnapshot` separates `live` verified quests and
+`AttestedOverride` emergency merges from `demo_seed` fixtures. This is how a person follows forty
+segments without reading forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 6. Shape and landed engines (`obb v6`)
+## 6. Shape and landed engines (`obb v7`, `0.7.0`)
 
-Rust 2024 workspace (`obb-core`, `obb-lint`, `obb-judge`, `obb-state`, `obb-broker`, `obb-cli`), one
-binary `obb`:
+Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-quarry`,
+`obb-state`, `obb-broker`, `obb-cli`), one binary `obb` with twelve top-level commands (`lint`,
+`cone`, `apex`, `pipeline`, `harness`, `broker`, `quarry`, `judge`, `state`, `seg`, `ledger`,
+`serve`):
 
-1. **`obb lint` & `--modularity` (`obb-lint`)**: Vacuity, `atp-checkers`, uninhabited-premise,
+1. **`obb lint` & `obb harness` (`obb-lint`)**: Vacuity, `atp-checkers`, uninhabited-premise,
    `Judge.Fragment` operational-check restatement (`lean/judge-fragment-restates-check`),
    Pigeonhole/Minkowski vacuous cryptographic hardness & unkeyed `Prop` collision disjunctions
    (`lean/pigeonhole-vacuous-premise`), cross-language `Rust ↔ Lean` domain-tag & static framing
    arity drift (`cross-lang/domain-tag-drift`), 3-way proof/test/mutation separation
    (`lean/test-in-library` under `--strict-tests` + always-on `tier1_guards` / `tier1_teeth` /
    `tier1_evals` telemetry), `native_decide`, narrow-digest-weld (`< 128` bits),
-   and Lean 4.35 module-hygiene rules (`lean/file-wide-expose`, `lean/public-meta-import-leak`),
-   plus `.obend` claim checks, process sink detectors, and typeclass/structure compositionality
-   indexing.
+   Lean 4.35 module-hygiene rules (`lean/file-wide-expose`, `lean/public-meta-import-leak`),
+   `.obend` claim checks, process sink detectors, typeclass/structure compositionality indexing,
+   and cross-agent `AGENTS.md` / `GEMINI.md` / `CLAUDE.md` harness parity (`obb harness`).
 2. **`obb cone` & `obb apex` (`obb-lint`)**: `< 25 ms` parallel Lean module-header DAG analyzer and
    disjoint shard planner (`obb cone plan`, isolating high-fan-in Wave-0 hubs), paired with
    whole-system Apex theorem reverse-cone coverage and leaf-island detection against
    `quarry/obend-apex.toml`.
 3. **`obb pipeline` & `obb judge` (`obb-judge`)**: Two-stage `[HypothesisLedger]` / `[Obligations]`
    interface-lock (`STAGE_A_LOCKED`) and non-vacuous instance-seal (`STAGE_B_SEALED`) swarm gate,
-   plus `Genealogy`-style monotone floor judging (`g0-obebuilder` self-hosting floors).
-4. **`obb quarry` (`obb-lint` / `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
+   plus `Genealogy`-style monotone floor judging (`g0-obebuilder` self-hosting floors), isolated
+   `/private/tmp` `#tooth` (`planted_fault_red`) negative-control execution (`BIT`, `VACUOUS`,
+   `INVALID_TOOTH`, `POSITIVE_FAILED`), fail-closed `UnknownFloor` / `MissingMeasurement`
+   diagnostics, honest `eval:lexical` (*attested*) vs `HEAD`-bound `KernelReceipt` (`eval:kernel`,
+   *decided*) regimes, and SHA-bound `JudgeReceipt` issuance (`--base`, `--emit-receipt`).
+4. **`obb quarry` (`obb-quarry`, `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
    synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
-5. **`obb broker`, `obb state`/`seg` & `obb serve` (`obb-broker`, `obb-state`)**: ZFS-ARC-aware SSH
-   probe and CoW/reflink (`cp -R --reflink=auto`) `.lake/build` seed-pool router across `bb2` and
-   `hbox` with `0700` per-invocation worktrees, hard wall-clock and RSS reapers, segment/worktree/ledger
-   tracking, and live SSE dashboard.
+5. **`obb broker`, `obb state`, `obb seg`, `obb ledger` & `obb serve` (`obb-broker`, `obb-state`)**:
+   ZFS-ARC-aware SSH probe and CoW/reflink (`cp -R --reflink=auto`) `.lake/build` seed-pool router
+   across `bb2` and `hbox` with `0700` per-invocation worktrees, hard wall-clock and RSS reapers,
+   receipt-verified quest lifecycle (`take` with non-overlapping footprint leases, `propose`,
+   `land` with TOCTOU `StaleBaseSha` enforcement, and `AttestedOverride` emergency bypass logging),
+   segment handoff-tax & pressure statechart, SHA-256 hash-chained JSONL ledger, and live SSE
+   dashboard.
 6. **Multi-family Mixture-of-Agents (`Principles 3 & 4`)**: Parallel Round-1 population drafts
    across Gemini (`agy`), GPT-6-Astra (`codex exec`), and Claude-Fable-5.2 (`claude -p`) armed with
    `~/swarm/research.py` and `~/paperbin`, followed by Round-2 cross-family synthesis before Wave

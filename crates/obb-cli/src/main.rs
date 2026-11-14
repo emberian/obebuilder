@@ -5,14 +5,13 @@ use clap::{Parser, Subcommand};
 use obb_broker::{
     BuildPlanOptions, HostChoice, SshExecutor, plan_build as broker_plan_build, probe_hosts,
 };
-use obb_cli::serve::run_server_with_state_dir;
+use obb_cli::serve::run_server_with_options;
 use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
-    Gate, TrustBase, check_revert_clean, check_succeed, check_well_formed, evaluate_gate,
+    Gate, JudgeReceipt, TrustBase, check_revert_clean, check_succeed, check_well_formed,
+    evaluate_gate, issue_judge_receipt,
 };
-use obb_lint::apex::{
-    ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex,
-};
+use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
 use obb_lint::harness::{harness_check, harness_install, harness_list};
 use obb_lint::spec_check::run_spec_sensitivity_check;
@@ -21,7 +20,7 @@ use obb_quarry::{
     DEFAULT_QUARRY_MANIFEST_REL, QuarryManifest, QuarryState, inspect_quarry_target, status_quarry,
     sync_quarry,
 };
-use obb_state::StateStore;
+use obb_state::{CampaignGuardEvidence, QuestGuardEvidence, StateStore};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -36,7 +35,7 @@ struct Cli {
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
 
-    /// Explicit directory for `state.db` and `events.jsonl` (defaults to `$XDG_STATE_HOME/obb/<repo_hash>/` or `<obb_workspace>/.obb-state/<repo_hash>/`, never `<target_repo>/.obb/`)
+    /// Local state vault for `state.db` and `events.jsonl`; overrides OBB_STATE_DIR and default workspace/XDG locations
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
 
@@ -80,7 +79,7 @@ enum Commands {
         #[arg(long)]
         strict_wire: bool,
 
-        /// Enforce 3-way proof/test/mutation separation (`lean/test-in-library` error on `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1 `lean/Obend/` library modules outside `lean/Obend/Teeth/`)
+        /// Reject test declarations in Rust, JS/TS, Python and Lean library sources
         #[arg(long)]
         strict_tests: bool,
 
@@ -149,7 +148,7 @@ enum Commands {
     /// Campaign & Quest statechart supervisor + live `cv` / disk / git guards (`PROCESS.md`)
     State {
         #[command(subcommand)]
-        sub: StateSubcommand,
+        sub: Box<StateSubcommand>,
     },
 
     /// First-class Segment lifecycle (`new`, `fork`, `continue`, `distill`, `merge`, `forget`, `adopt`, `compare`, `list`)
@@ -158,7 +157,7 @@ enum Commands {
         sub: SegSubcommand,
     },
 
-    /// Append-only hash-chained JSONL ledger (`ledger/events.jsonl`)
+    /// Append-only hash-chained JSONL ledger (`<state_dir>/events.jsonl`)
     Ledger {
         #[command(subcommand)]
         sub: LedgerSubcommand,
@@ -175,6 +174,10 @@ enum Commands {
         /// Target repository for live `obb lint` inspection (read-only)
         #[arg(long, default_value = "/Users/ember/dev/obend")]
         repo: PathBuf,
+
+        /// Explicitly populate an empty state vault with `demo_seed` fixture rows for UI preview
+        #[arg(long)]
+        seed_demo: bool,
     },
 }
 
@@ -447,13 +450,25 @@ enum QuarrySubcommand {
 
 #[derive(Subcommand, Debug)]
 enum JudgeSubcommand {
-    /// Evaluate current `judge.json` floors against `--repo` (read-only)
+    /// Evaluate current `judge.json` floors against `--repo` (read-only, with isolated `#tooth` execution)
     Check {
         #[arg(long)]
         judge: Option<PathBuf>,
 
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+
+        /// Enforce test placement in Rust, JS/TS, Python and Lean library sources
+        #[arg(long)]
+        strict_tests: bool,
+
+        /// Base git revision (`main`, commit SHA, etc.) when issuing a SHA-bound `JudgeReceipt`
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Write a SHA-bound `JudgeReceipt` JSON file for `obb state propose` / `obb state land`
+        #[arg(long)]
+        emit_receipt: Option<PathBuf>,
 
         #[arg(long)]
         json: bool,
@@ -472,7 +487,7 @@ enum JudgeSubcommand {
         #[arg(long = "lob")]
         lobs: Vec<String>,
 
-        /// Replace `<judge>` on disk and record `LobCost` to `ledger/events.jsonl` if accepted
+        /// Replace `<judge>` on disk and record `LobCost` to `<state_dir>/events.jsonl` if accepted
         #[arg(long)]
         apply: bool,
 
@@ -500,10 +515,10 @@ enum JudgeSubcommand {
 
 #[derive(Subcommand, Debug)]
 enum StateSubcommand {
-    /// Initialize `.obb/state.db` and `ledger/events.jsonl`
+    /// Initialize out-of-tree `state.db` and `events.jsonl`
     Init,
 
-    /// Seed the realistic `obend` Campaign/Quest/Segment tree (`DESIGN.md` §6 Milestone 1)
+    /// Seed an explicitly marked `demo_seed` Campaign/Quest/Segment fixture (`origin="demo_seed"`)
     SeedObend {
         #[arg(long, default_value = "/Users/ember/dev/obend")]
         repo: PathBuf,
@@ -515,7 +530,7 @@ enum StateSubcommand {
         json: bool,
     },
 
-    /// Create or transition a Campaign
+    /// Create or transition a Campaign (with verified `G1`/`G2` evidence or explicit `AttestedOverride`)
     Campaign {
         #[arg(long)]
         id: String,
@@ -529,9 +544,17 @@ enum StateSubcommand {
         repo: String,
         #[arg(long, default_value = "manual")]
         evidence: String,
+        #[arg(long = "foundation-file")]
+        foundation_files: Vec<String>,
+        #[arg(long)]
+        judge: Option<PathBuf>,
+        #[arg(long)]
+        override_operator: Option<String>,
+        #[arg(long)]
+        override_reason: Option<String>,
     },
 
-    /// Create or transition a Quest (enforcing `spec/process.json` + 18 sinks + `sink_exit_rule`)
+    /// Create or transition a Quest (enforcing `spec/process.json`, real `JudgeReceipt`s, 18 sinks + `sink_exit_rule`)
     Quest {
         #[arg(long)]
         id: String,
@@ -549,6 +572,75 @@ enum StateSubcommand {
         remedial_action: Option<String>,
         #[arg(long)]
         tooth: Option<String>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
+        #[arg(long = "footprint")]
+        footprints: Vec<String>,
+        #[arg(long, default_value = "")]
+        deliverable: String,
+        #[arg(long, default_value_t = 1.0)]
+        hours: f64,
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+        #[arg(long, default_value = "main")]
+        trunk: String,
+        #[arg(long, default_value = "")]
+        summary: String,
+        #[arg(long)]
+        override_operator: Option<String>,
+        #[arg(long)]
+        override_reason: Option<String>,
+    },
+
+    /// Take a `Grounded` quest with an exclusive non-overlapping footprint lease pinned to `--trunk`
+    Take {
+        id: String,
+        #[arg(long, default_value = "agent-main")]
+        actor: String,
+        #[arg(long)]
+        deliverable: String,
+        #[arg(long = "footprint", required = true)]
+        footprints: Vec<String>,
+        #[arg(long, default_value_t = 2.0)]
+        hours: f64,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value = "main")]
+        trunk: String,
+    },
+
+    /// Propose a committed candidate with a SHA-bound `JudgeReceipt` (`Scoped` -> `Toothed`)
+    Propose {
+        id: String,
+        #[arg(long, default_value = "agent-main")]
+        actor: String,
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value = "main")]
+        trunk: String,
+    },
+
+    /// Land a `Toothed` quest onto `--trunk` via fast-forward + `JudgeReceipt` re-verification (or `--override-*` emergency bypass)
+    Land {
+        id: String,
+        #[arg(long, default_value = "agent-main")]
+        actor: String,
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value = "main")]
+        trunk: String,
+        #[arg(long)]
+        override_operator: Option<String>,
+        #[arg(long)]
+        override_reason: Option<String>,
+        #[arg(long, default_value = "HEAD")]
+        head: String,
     },
 
     /// Enqueue an event for ember (`aim`, `decision`, or `taste` ONLY — operational noise refused!)
@@ -675,7 +767,16 @@ enum LedgerSubcommand {
         json: bool,
     },
 
-    /// Verify SHA-256 hash chain integrity of `ledger/events.jsonl`
+    /// Print a deterministic fold of the verified local event ledger
+    Snapshot,
+
+    /// Import a legacy ledger into an empty local vault (source retained)
+    Migrate {
+        #[arg(long)]
+        from: PathBuf,
+    },
+
+    /// Verify SHA-256 hash chain integrity of `<state_dir>/events.jsonl`
     Verify,
 }
 
@@ -714,11 +815,8 @@ async fn run() -> Result<ExitCode> {
                 json: spec_json,
             }) = sub
             {
-                let res = run_spec_sensitivity_check(
-                    &lean_root,
-                    &changed,
-                    transport_bin.as_deref(),
-                )?;
+                let res =
+                    run_spec_sensitivity_check(&lean_root, &changed, transport_bin.as_deref())?;
                 if spec_json || json {
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 } else {
@@ -880,8 +978,8 @@ async fn run() -> Result<ExitCode> {
                 } else {
                     print_human_pipeline_report(&rep, require_sealed, strict);
                 }
-                let ok = rep.passed
-                    && (!require_sealed || rep.stage == PipelineStage::StageBSealed);
+                let ok =
+                    rep.passed && (!require_sealed || rep.stage == PipelineStage::StageBSealed);
                 Ok(if ok {
                     ExitCode::SUCCESS
                 } else {
@@ -1095,22 +1193,72 @@ async fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
 
-            JudgeSubcommand::Check { judge, repo, json } => {
+            JudgeSubcommand::Check {
+                judge,
+                repo,
+                base,
+                emit_receipt,
+                strict_tests,
+                json,
+            } => {
                 let jpath = resolve_judge_path(&cli.workspace, judge);
-                let gate = Gate::load_from_path(&jpath)?;
+                let mut gate = Gate::load_from_path(&jpath)?;
+                if strict_tests {
+                    gate.require_strict_tests();
+                }
+                if let Some(ref out_path) = emit_receipt {
+                    let base_rev = base.as_deref().unwrap_or("main");
+                    let receipt = issue_judge_receipt(&gate, &repo, base_rev)?;
+                    if let Some(parent) = out_path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(
+                        out_path,
+                        format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&receipt)?);
+                    } else {
+                        println!(
+                            "obb judge check: gate=`{}` base=`{}` head=`{}` all_passed={} clean_tree={} achieved_regime={} receipt=`{}`",
+                            receipt.judge_name,
+                            &receipt.base_sha[..receipt.base_sha.len().min(12)],
+                            &receipt.head_sha[..receipt.head_sha.len().min(12)],
+                            receipt.all_passed,
+                            receipt.clean_working_tree,
+                            receipt.achieved_regime,
+                            out_path.display()
+                        );
+                        for ev in &receipt.evaluations {
+                            let tag = if ev.passed { "PASS" } else { "FAIL" };
+                            println!(
+                                "  [{tag}] {:<36} regime={:<10} measured={:<4} bound={:<12} ({})",
+                                ev.floor, ev.regime, ev.measured, ev.bound, ev.detail
+                            );
+                        }
+                    }
+                    return Ok(if receipt.all_passed && receipt.clean_working_tree {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(2)
+                    });
+                }
+
                 let rep = evaluate_gate(&gate, &repo)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&rep)?);
                 } else {
                     println!(
-                        "obb judge check: gate=`{}` repo=`{}` all_passed={}",
-                        rep.judge_name, rep.repo_root, rep.all_passed
+                        "obb judge check: gate=`{}` repo=`{}` all_passed={} achieved_regime={}",
+                        rep.judge_name, rep.repo_root, rep.all_passed, rep.achieved_regime
                     );
                     for ev in &rep.evaluations {
                         let tag = if ev.passed { "PASS" } else { "FAIL" };
                         println!(
-                            "  [{tag}] {:<36} measured={:<4} bound={:<12} ({})",
-                            ev.floor, ev.measured, ev.bound, ev.detail
+                            "  [{tag}] {:<36} regime={:<10} measured={:<4} bound={:<12} ({})",
+                            ev.floor, ev.regime, ev.measured, ev.bound, ev.detail
                         );
                     }
                 }
@@ -1213,7 +1361,7 @@ async fn run() -> Result<ExitCode> {
 
         Commands::State { sub } => {
             let store = StateStore::open_with_state_dir(&cli.workspace, cli.state_dir.as_deref())?;
-            match sub {
+            match *sub {
                 StateSubcommand::Init => {
                     let _ = store.probe_machines(false)?;
                     println!(
@@ -1225,10 +1373,11 @@ async fn run() -> Result<ExitCode> {
                 StateSubcommand::SeedObend { repo } => {
                     let snap = store.seed_obend_campaign(&repo)?;
                     println!(
-                        "Seeded campaign ({} quests, {} segments, {} ember events)",
+                        "Seeded DEMO campaign [origin=demo_seed] ({} quests, {} segments, {} ember events; live_transitions={})",
                         snap.quests.len(),
                         snap.segments.len(),
-                        snap.waiting_on_ember.len()
+                        snap.waiting_on_ember.len(),
+                        snap.live_transition_count
                     );
                     Ok(ExitCode::SUCCESS)
                 }
@@ -1238,32 +1387,50 @@ async fn run() -> Result<ExitCode> {
                         println!("{}", serde_json::to_string_pretty(&snap)?);
                     } else {
                         println!(
-                            "Workspace: {} | scheduler_paused={}",
-                            snap.workspace_root, snap.scheduler_paused
+                            "Workspace: {} | scheduler_paused={} | live_transitions={} verified_quests={} ungated_overrides={} demo_seed_events={}",
+                            snap.workspace_root,
+                            snap.scheduler_paused,
+                            snap.live_transition_count,
+                            snap.verified_quest_count,
+                            snap.ungated_override_count,
+                            snap.demo_seed_event_count
                         );
                         println!("Campaigns ({}):", snap.campaigns.len());
                         for c in &snap.campaigns {
-                            println!("  - {} [{}]: {}", c.id, c.state, c.title);
+                            println!(
+                                "  - {} [{}] (origin={}): {}",
+                                c.id, c.state, c.origin, c.title
+                            );
                         }
                         println!("Quests ({}):", snap.quests.len());
                         for q in &snap.quests {
                             let sink_tag = if q.is_sink { " (SINK)" } else { "" };
+                            let ov_tag = if q.merged_ungated { " [UNGATED]" } else { "" };
                             println!(
-                                "  - {} [{}{}] regime={} holder={}: {}",
-                                q.id, q.state, sink_tag, q.target_regime, q.holder_agent, q.title
+                                "  - {} [{}{}{}] effective={} target={} origin={} holder={}: {}",
+                                q.id,
+                                q.state,
+                                sink_tag,
+                                ov_tag,
+                                q.effective_regime,
+                                q.target_regime,
+                                q.origin,
+                                q.holder_agent,
+                                q.title
                             );
                         }
                         println!("Segments ({}):", snap.segments.len());
                         for s in &snap.segments {
                             println!(
-                                "  - {} (quest={}, parent={}) [{}] tokens={} mode={} host={}",
+                                "  - {} (quest={}, parent={}) [{}] tokens={} mode={} host={} origin={}",
                                 s.id,
                                 s.quest_id,
                                 s.parent_id.as_deref().unwrap_or("-"),
                                 s.state,
                                 s.token_count,
                                 s.transcript_mode,
-                                s.host
+                                s.host,
+                                s.origin
                             );
                         }
                         println!("Waiting on ember ({}):", snap.waiting_on_ember.len());
@@ -1280,10 +1447,42 @@ async fn run() -> Result<ExitCode> {
                     aim,
                     repo,
                     evidence,
+                    foundation_files,
+                    judge,
+                    override_operator,
+                    override_reason,
                 } => {
                     if let Some(target) = to {
+                        let ev = if let (Some(op), Some(reason)) =
+                            (override_operator, override_reason)
+                        {
+                            CampaignGuardEvidence::AttestedOverride {
+                                operator: op,
+                                reason,
+                            }
+                        } else if target == "Grounded" {
+                            CampaignGuardEvidence::WholeRead {
+                                foundation_files,
+                                note: evidence,
+                            }
+                        } else if target == "Running"
+                            && !foundation_files.is_empty()
+                            && judge.is_none()
+                        {
+                            CampaignGuardEvidence::Unconditional { note: evidence }
+                        } else if target == "Running" {
+                            let jpath = resolve_judge_path(&cli.workspace, judge);
+                            CampaignGuardEvidence::Briefed {
+                                judge_path: jpath,
+                                note: evidence,
+                            }
+                        } else if target == "Reground" {
+                            CampaignGuardEvidence::RegroundTrigger { trigger: evidence }
+                        } else {
+                            CampaignGuardEvidence::Unconditional { note: evidence }
+                        };
                         let row = store
-                            .transition_campaign(&id, &target, true, &evidence)
+                            .transition_campaign(&id, &target, ev)
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         println!("Campaign `{}` -> `{}`", row.id, row.state);
                     } else {
@@ -1301,26 +1500,171 @@ async fn run() -> Result<ExitCode> {
                     regime,
                     remedial_action,
                     tooth,
+                    repo,
+                    artifacts,
+                    footprints,
+                    deliverable,
+                    hours,
+                    receipt,
+                    trunk,
+                    summary,
+                    override_operator,
+                    override_reason,
                 } => {
                     if let Some(target) = to {
+                        let cur_opt = store.get_quest(&id)?;
+                        let is_sink_target =
+                            store.spec.machines.quest.sinks.iter().any(|s| s == &target);
+                        let is_currently_sink = cur_opt.as_ref().is_some_and(|q| q.is_sink);
+
+                        let ev = if let (Some(op), Some(reason)) =
+                            (override_operator, override_reason)
+                        {
+                            QuestGuardEvidence::AttestedOverride {
+                                operator: op,
+                                reason,
+                                head_sha: None,
+                            }
+                        } else if is_sink_target {
+                            QuestGuardEvidence::EnterSink {
+                                reason: remedial_action
+                                    .unwrap_or_else(|| "sink entered".to_string()),
+                            }
+                        } else if is_currently_sink {
+                            QuestGuardEvidence::ExitSink {
+                                remedial_action: remedial_action.unwrap_or_default(),
+                            }
+                        } else if target == "Scoped" {
+                            QuestGuardEvidence::ScopeBrief {
+                                deliverable: if deliverable.is_empty() {
+                                    title.clone()
+                                } else {
+                                    deliverable
+                                },
+                                footprint_paths: footprints,
+                                estimated_swarm_hours: hours,
+                                base_sha: None,
+                            }
+                        } else if matches!(target.as_str(), "Built" | "Wired") {
+                            QuestGuardEvidence::RepoCheck {
+                                repo_root: repo,
+                                artifacts,
+                            }
+                        } else if matches!(target.as_str(), "Toothed" | "Landed" | "Claimed") {
+                            let rpath = receipt.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "transition to `{target}` requires `--receipt <receipt.json>` from `obb judge check --emit-receipt`"
+                                )
+                            })?;
+                            let loaded = JudgeReceipt::load_from_path(&rpath)?;
+                            QuestGuardEvidence::Receipt {
+                                receipt: Box::new(loaded),
+                                repo_root: repo,
+                                trunk_branch: trunk,
+                            }
+                        } else if target == "Recorded" {
+                            QuestGuardEvidence::RecordCheck {
+                                repo_root: repo,
+                                summary,
+                            }
+                        } else {
+                            QuestGuardEvidence::EnterSink {
+                                reason: "transition".to_string(),
+                            }
+                        };
+
                         let row = store
-                            .transition_quest(
-                                &id,
-                                &target,
-                                &actor,
-                                remedial_action.as_deref(),
-                                tooth.as_deref(),
-                                true,
-                            )
+                            .transition_quest(&id, &target, &actor, tooth.as_deref(), ev)
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         println!(
-                            "Quest `{}` -> `{}` (sink={})",
-                            row.id, row.state, row.is_sink
+                            "Quest `{}` -> `{}` (sink={}, effective_regime={}, merged_ungated={})",
+                            row.id,
+                            row.state,
+                            row.is_sink,
+                            row.effective_regime,
+                            row.merged_ungated
                         );
                     } else {
                         let row = store.create_quest(&id, &campaign, &title, &actor, &regime)?;
                         println!("Created quest `{}` in `{}`", row.id, row.state);
                     }
+                    Ok(ExitCode::SUCCESS)
+                }
+                StateSubcommand::Take {
+                    id,
+                    actor,
+                    deliverable,
+                    footprints,
+                    hours,
+                    repo,
+                    trunk,
+                } => {
+                    let row = store
+                        .take_quest(&id, &actor, &deliverable, footprints, hours, &repo, &trunk)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    println!(
+                        "Took quest `{}` -> `{}` (base_sha={}, footprint={:?})",
+                        row.id,
+                        row.state,
+                        row.base_sha.as_deref().unwrap_or("-"),
+                        row.footprint_lease
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                StateSubcommand::Propose {
+                    id,
+                    actor,
+                    receipt,
+                    repo,
+                    trunk,
+                } => {
+                    let loaded = JudgeReceipt::load_from_path(&receipt)?;
+                    let row = store
+                        .propose_quest(&id, &actor, &loaded, &repo, &trunk)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    println!(
+                        "Proposed quest `{}` -> `{}` (head_sha={}, receipt={})",
+                        row.id,
+                        row.state,
+                        row.proposed_head_sha.as_deref().unwrap_or("-"),
+                        row.verified_receipt_hash.as_deref().unwrap_or("-")
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                StateSubcommand::Land {
+                    id,
+                    actor,
+                    receipt,
+                    repo,
+                    trunk,
+                    override_operator,
+                    override_reason,
+                    head,
+                } => {
+                    let row = if let (Some(op), Some(reason)) = (override_operator, override_reason)
+                    {
+                        store
+                            .land_quest_ungated(&id, &op, &reason, &repo, &trunk, &head)
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    } else {
+                        let rpath = receipt.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "`obb state land` requires `--receipt <receipt.json>` (or `--override-operator` + `--override-reason`)"
+                            )
+                        })?;
+                        let loaded = JudgeReceipt::load_from_path(&rpath)?;
+                        store
+                            .land_quest(&id, &actor, &loaded, &repo, &trunk)
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    };
+                    println!(
+                        "Landed quest `{}` -> `{}` (landed_sha={}, effective_regime={}, merged_ungated={})",
+                        row.id,
+                        row.state,
+                        row.landed_sha.as_deref().unwrap_or("-"),
+                        row.effective_regime,
+                        row.merged_ungated
+                    );
                     Ok(ExitCode::SUCCESS)
                 }
                 StateSubcommand::Ember {
@@ -1331,7 +1675,10 @@ async fn run() -> Result<ExitCode> {
                     let row = store
                         .enqueue_ember_event(&kind, &subject, &prompt)
                         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                    println!("Queued ember `{}` event #{} on `{}`", row.kind, row.id, row.subject_id);
+                    println!(
+                        "Queued ember `{}` event #{} on `{}`",
+                        row.kind, row.id, row.subject_id
+                    );
                     Ok(ExitCode::SUCCESS)
                 }
                 StateSubcommand::ProbeMachines { remotes, json } => {
@@ -1342,7 +1689,12 @@ async fn run() -> Result<ExitCode> {
                         for m in &ms {
                             println!(
                                 "{:<8} reachable={:<5} avail={:>6.1} GB / {:>6.1} GB below_20gb_floor={:<5} ({})",
-                                m.host, m.reachable, m.avail_gb, m.total_gb, m.below_floor, m.load_summary
+                                m.host,
+                                m.reachable,
+                                m.avail_gb,
+                                m.total_gb,
+                                m.below_floor,
+                                m.load_summary
                             );
                         }
                     }
@@ -1506,6 +1858,15 @@ async fn run() -> Result<ExitCode> {
                         }
                     }
                 }
+                LedgerSubcommand::Snapshot => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&store.ledger_snapshot()?)?
+                    );
+                }
+                LedgerSubcommand::Migrate { from } => {
+                    println!("Migrated {} events", store.migrate_ledger(&from)?);
+                }
                 LedgerSubcommand::Verify => {
                     let count = store.verify_ledger_chain()?;
                     println!("PASS ledger hash-chain verified ({count} event(s))");
@@ -1514,18 +1875,24 @@ async fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Commands::Serve { host, port, repo } => {
+        Commands::Serve {
+            host,
+            port,
+            repo,
+            seed_demo,
+        } => {
             let jpath = resolve_judge_path(&cli.workspace, None);
             if !jpath.is_file() {
                 bail!("judge.json not found at {}", jpath.display());
             }
-            run_server_with_state_dir(
+            run_server_with_options(
                 &host,
                 port,
                 &cli.workspace,
                 cli.state_dir.as_deref(),
                 &repo,
                 &jpath,
+                seed_demo,
             )
             .await?;
             Ok(ExitCode::SUCCESS)
@@ -1545,8 +1912,9 @@ fn resolve_quarry_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> 
     if ws_candidate.is_file() {
         return Ok(ws_candidate);
     }
-    let crate_root_candidate =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../").join(DEFAULT_QUARRY_MANIFEST_REL);
+    let crate_root_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../")
+        .join(DEFAULT_QUARRY_MANIFEST_REL);
     if crate_root_candidate.is_file() {
         return Ok(crate_root_candidate);
     }
@@ -1564,8 +1932,9 @@ fn resolve_apex_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> Re
     if ws_candidate.is_file() {
         return Ok(ws_candidate);
     }
-    let crate_root_candidate =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../").join(DEFAULT_APEX_MANIFEST_REL);
+    let crate_root_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../")
+        .join(DEFAULT_APEX_MANIFEST_REL);
     if crate_root_candidate.is_file() {
         return Ok(crate_root_candidate);
     }
@@ -1603,7 +1972,10 @@ fn parse_proposed_shard_spec(raw: &str, wave0_barrier: bool) -> Result<ProposedS
 fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: bool) {
     println!(
         "obb lint: repo={} files_scanned={} lean_decls={} lean_inductives={}",
-        rep.repo_root, rep.files_scanned, rep.lean_declarations_indexed, rep.lean_inductives_indexed
+        rep.repo_root,
+        rep.files_scanned,
+        rep.lean_declarations_indexed,
+        rep.lean_inductives_indexed
     );
     println!(
         "totals: {} findings ({} errors, {} warnings)",
@@ -1639,7 +2011,14 @@ fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: b
             println!("\nModularity & Compositionality by directory:");
             println!(
                 "  {:<28} {:>5} {:>8} {:>7} {:>8} {:>9} {:>9} {:>10}",
-                "Directory", "Files", "Lines", "MaxLine", "Carriers", "CompThm", "LeafThm", "Carr/Leaf"
+                "Directory",
+                "Files",
+                "Lines",
+                "MaxLine",
+                "Carriers",
+                "CompThm",
+                "LeafThm",
+                "Carr/Leaf"
             );
             for d in &m.by_directory {
                 println!(
@@ -1714,10 +2093,7 @@ fn print_human_lint_report(rep: &obb_core::LintReport, show_modularity_detail: b
 
     println!("\nFindings detail (showing up to 60):");
     for f in rep.findings.iter().take(60) {
-        let sink_str = f
-            .sink
-            .map(|s| format!(" sink={s}"))
-            .unwrap_or_default();
+        let sink_str = f.sink.map(|s| format!(" sink={s}")).unwrap_or_default();
         println!(
             "  [{}][{}][max_regime={}{}] {}:{}:{} ({})\n    {}\n    fix: {}",
             f.severity,
@@ -1804,7 +2180,10 @@ fn print_human_quarry_status(rep: &obb_quarry::QuarryStatusReport) {
     }
 
     if !rep.uptake_violations.is_empty() {
-        println!("\nUPTAKE VERIFICATION VIOLATIONS ({}):", rep.uptake_violations.len());
+        println!(
+            "\nUPTAKE VERIFICATION VIOLATIONS ({}):",
+            rep.uptake_violations.len()
+        );
         for v in &rep.uptake_violations {
             println!("  [FAIL] {} ({}): {}", v.entry_id, v.donor, v.reason);
         }
@@ -1856,7 +2235,10 @@ fn print_human_quarry_inspect(rep: &obb_quarry::QuarryInspectReport) {
     );
 
     if !rep.matched_manifest_entries.is_empty() {
-        println!("\nManifest tracking ({}):", rep.matched_manifest_entries.len());
+        println!(
+            "\nManifest tracking ({}):",
+            rep.matched_manifest_entries.len()
+        );
         for m in &rep.matched_manifest_entries {
             println!(
                 "  - {} [state={}] -> {}\n    audit: {}",
@@ -1949,8 +2331,8 @@ fn print_human_cone_report(rep: &obb_lint::cone::ConeReport) {
             rep.high_blast_radius_hubs.len()
         );
         println!(
-            "  {:<42} {:>10} {:>12}  {}",
-            "Module", "PubFanIn", "BlastRadius", "Path"
+            "  {:<42} {:>10} {:>12}  Path",
+            "Module", "PubFanIn", "BlastRadius"
         );
         for h in rep.high_blast_radius_hubs.iter().take(20) {
             println!(
@@ -2073,7 +2455,10 @@ fn print_human_apex_report(rep: &obb_lint::apex::ApexReport, subcmd: &str) {
         );
     }
 
-    println!("\nRegistered `[apex]` Whole-System Theorems ({}):", rep.apex_theorems.len());
+    println!(
+        "\nRegistered `[apex]` Whole-System Theorems ({}):",
+        rep.apex_theorems.len()
+    );
     for a in &rep.apex_theorems {
         let tag = if a.valid { "PASS" } else { "FAIL" };
         println!(
@@ -2095,7 +2480,11 @@ fn print_human_apex_report(rep: &obb_lint::apex::ApexReport, subcmd: &str) {
     if !rep.planned_apex.is_empty() {
         println!("\nPlanned Wave 4–5 Vertical Spines (`[planned_apex]`):");
         for p in &rep.planned_apex {
-            let st = if p.materialized { "MATERIALIZED" } else { "PENDING" };
+            let st = if p.materialized {
+                "MATERIALIZED"
+            } else {
+                "PENDING"
+            };
             println!(
                 "  [{st:<12}] [{}] {:<32} {}::{} ({})",
                 p.pillar, p.id, p.target_module, p.target_theorem, p.wave
@@ -2151,7 +2540,11 @@ fn print_human_pipeline_report(
     if !rep.obligations.is_empty() {
         println!("\nHypothesisLedger / *Obligations / @[obb_obligation] classes:");
         for ob in &rep.obligations {
-            let st = if ob.discharged { "SEALED" } else { "OPEN_STAGE_A" };
+            let st = if ob.discharged {
+                "SEALED"
+            } else {
+                "OPEN_STAGE_A"
+            };
             println!(
                 "  [{st:<12}] {} ({}:{}) fields={} consumers={} instances={}",
                 ob.fq_name,

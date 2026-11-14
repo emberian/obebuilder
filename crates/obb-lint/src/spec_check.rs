@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
-pub const DEFAULT_TRANSPORT_BIN: &str =
-    "/Users/ember/dev/lean-transport/.lake/build/bin/transport";
+pub const DEFAULT_TRANSPORT_BIN: &str = "/Users/ember/dev/lean-transport/.lake/build/bin/transport";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokenDecl {
@@ -156,7 +155,10 @@ pub fn run_spec_sensitivity_check(
         );
     }
     if !lean_root.is_dir() {
-        bail!("lean root directory does not exist: {}", lean_root.display());
+        bail!(
+            "lean root directory does not exist: {}",
+            lean_root.display()
+        );
     }
 
     let shadow_out = tempfile::tempdir().context("failed to create temporary output dir")?;

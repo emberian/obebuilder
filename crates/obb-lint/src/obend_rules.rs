@@ -54,11 +54,12 @@ pub fn lint_obend_file(rel_path: &str, src: &str) -> Vec<Finding> {
                     .trim_end_matches(':')
                     .to_string();
                 current_spec = Some(spec_name);
-            } else if let Some(rest) = trimmed.strip_prefix("law ") {
-                if let Some((law_name, expr)) = rest.split_once(':') {
-                    let norm = normalize_obend_expr(expr);
-                    if norm == "true" || is_reflexive_eq(&norm) {
-                        findings.push(Finding {
+            } else if let Some(rest) = trimmed.strip_prefix("law ")
+                && let Some((law_name, expr)) = rest.split_once(':')
+            {
+                let norm = normalize_obend_expr(expr);
+                if norm == "true" || is_reflexive_eq(&norm) {
+                    findings.push(Finding {
                             rule_id: "obend/tautological-law".to_string(),
                             severity: Severity::Error,
                             artifact_kind: ArtifactKind::S,
@@ -75,7 +76,6 @@ pub fn lint_obend_file(rel_path: &str, src: &str) -> Vec<Finding> {
                             ),
                             remediation: "State a non-trivial state transition or invariant constraint over `old`/`new` fields.".to_string(),
                         });
-                    }
                 }
             }
             i += 1;
@@ -86,12 +86,7 @@ pub fn lint_obend_file(rel_path: &str, src: &str) -> Vec<Finding> {
         if let Some(ref sname) = current_spec {
             if let Some(rest) = trimmed.strip_prefix("def ") {
                 if let Some((sig, after_colon)) = rest.split_once(':') {
-                    let def_name = sig
-                        .split('(')
-                        .next()
-                        .unwrap_or(sig)
-                        .trim()
-                        .to_string();
+                    let def_name = sig.split('(').next().unwrap_or(sig).trim().to_string();
                     // Note: signature has `:` for param types too! Split at `:=` or trailing `:` after `-> Ret`
                     let inline_body = if let Some((_, rhs_assign)) = rest.split_once(":=") {
                         rhs_assign.trim()
@@ -192,15 +187,13 @@ fn flush_spec_claims(
 
             // Check `self.<method>(...) == <body of def <method>>` or `<method>(...) == <body of def <method>>`
             let call_target = lhs_trim.strip_prefix("self.").unwrap_or(lhs_trim);
-            let method_name = call_target
-                .split('(')
-                .next()
-                .unwrap_or(call_target)
-                .trim();
-            if !method_name.is_empty() {
-                if let Some(def_info) = spec_defs.get(method_name) {
-                    if !def_info.body_norm.is_empty() && def_info.body_norm == rhs_norm {
-                        findings.push(Finding {
+            let method_name = call_target.split('(').next().unwrap_or(call_target).trim();
+            if !method_name.is_empty()
+                && let Some(def_info) = spec_defs.get(method_name)
+                && !def_info.body_norm.is_empty()
+                && def_info.body_norm == rhs_norm
+            {
+                findings.push(Finding {
                             rule_id: "obend/claim-restates-method".to_string(),
                             severity: Severity::Warning,
                             artifact_kind: ArtifactKind::S,
@@ -218,8 +211,6 @@ fn flush_spec_claims(
                                 "State a relational property (e.g. monotonicity, conservation, round-trip, or equivalence to an independent spec) rather than repeating `{method_name}`'s formula."
                             ),
                         });
-                    }
-                }
             }
         }
     }

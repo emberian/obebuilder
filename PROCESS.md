@@ -8,7 +8,7 @@ process, so the process is what gets rebuilt here: as a statechart whose guards 
 whose sinks are the eighteen patterns, and whose only inputs from ember are the three kinds of
 event the prompts show ember actually wanted to supply. `DESIGN.md` holds the objects (segment,
 artifact, evaluator, ledger) and the executors; this file holds the control flow those objects
-move through. `spec/process.json` is the same machine in a form `obb run` can load.
+move through. `spec/process.json` is the same machine in a form `obb state` and `obb seg` load.
 
 ## 0. The invariants, in the words that set them
 
@@ -138,7 +138,16 @@ escalate with the prefix compacted and the working tree kept. A fork at large co
 Every transition above names a guard. Each guard is computable today from one of three sources:
 the elaborated Lean environment (the unified instrument of `DESIGN.md` §2.6, classes 1 to 10),
 the transcripts (`cv events`, `cv doctor`, `cv deferrals`, `cv lanes`), or the repository (git
-and the ledger). None is a question to the agent.
+and the ledger). None is a question to the agent, and `obb-state` (`0.7.0`) never accepts a
+caller-supplied boolean in place of guard evidence: `obb state take` (`Q1`) acquires an exclusive
+non-overlapping path lease (`FootprintLeaseConflict`) pinned to trunk `base_sha`; `obb state propose`
+(`Q4`) and `obb state land` (`Q5`) verify a SHA-bound `JudgeReceipt` (`TamperedReceipt`,
+`FootprintViolation`, `StaleBaseSha` if trunk moved) with an executed red `#tooth`. An emergency
+operator bypass (`obb state land --override-operator <who> --override-reason <why>`) records the
+merge unconditionally in the ledger with `effective_regime = "AttestedOverride"` and
+`merged_ungated = true`, refusing promotion to `Claimed` or `Recorded` as `decided`/`certified`.
+Seeded UI fixtures (`obb state seed-obend`, `obb serve --seed-demo`) carry `origin = "demo_seed"`
+so demo rows are never counted as live verified transitions.
 
 | guard | computed from | passes when |
 |---|---|---|
@@ -208,3 +217,27 @@ transition names. Section 6's milestone 1 becomes: `obb lint` producing the sink
 obend and over a session's transcripts, and `obb serve` showing every quest's state and every
 segment's state, with the sinks coloured, so the first thing a reader sees is which pattern the
 swarm is in, not how many tokens it spent.
+
+### v7 local ledger and dashboard
+
+The operational ledger is local state, not a tracked merge input. `--state-dir` and
+`OBB_STATE_DIR` select a vault; XDG and workspace defaults remain supported, with
+`.obb/ledger/` as the generic repository fallback. Ignore `.obb/` when using that fallback.
+The old tracked `ledger/events.jsonl` demo seed has been removed. Demo data is available
+only through explicit seeding.
+
+To preserve a historical ledger, export its original bytes and run
+`obb --state-dir <vault> ledger migrate --from <exported-events.jsonl>`.
+Import verifies hashes and contiguous sequence numbers, is idempotent, refuses a divergent
+nonempty destination, and retains the source for review. It migrates the audit history,
+not the old SQLite statechart tables. `ledger snapshot` deterministically folds the verified
+stream into event counts, a chain tip, and the latest event per entity. `ledger verify`
+checks the original chain. OS file locks serialize appends and protect readers across
+threads and processes; a successful append flushes its bytes to storage.
+
+Set `OBB_SERVE_TOKEN` before `obb serve`, then enter it into the dashboard's token field.
+The token stays in page memory, never in a URL or browser storage. Repository JSON and SSE
+require bearer authentication. The read-only API accepts GET/HEAD, rejects request bodies,
+and enforces a 64 KiB ceiling even on chunked input. It uses fixed-size digest comparison
+through `subtle`, rejects duplicate authorization/content-type headers, and has no HTTP
+state-mutation endpoint. Concurrent CLI/state-store ledger writers share the same lock.

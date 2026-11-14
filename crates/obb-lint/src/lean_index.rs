@@ -318,14 +318,14 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
 
     // Scan for raw `sorry` / `sorryAx` tokens outside strings/comments (comments and strings are already distinct token kinds!)
     for (idx, tok) in tokens.iter().enumerate() {
-        if let LeanTokenKind::Ident(id) = &tok.kind {
-            if id == "sorry" || id == "sorryAx" {
-                // Exclude constant quote / name check sites like `n == ``sorryAx` (which lexes as DoubleBacktickConst)
-                let prev_is_dot = idx > 0
-                    && matches!(&tokens[idx - 1].kind, LeanTokenKind::Symbol(s) if s == ".");
-                if !prev_is_dot {
-                    raw_sorry_sites.push((tok.line, tok.col, id.clone()));
-                }
+        if let LeanTokenKind::Ident(id) = &tok.kind
+            && (id == "sorry" || id == "sorryAx")
+        {
+            // Exclude constant quote / name check sites like `n == ``sorryAx` (which lexes as DoubleBacktickConst)
+            let prev_is_dot =
+                idx > 0 && matches!(&tokens[idx - 1].kind, LeanTokenKind::Symbol(s) if s == ".");
+            if !prev_is_dot {
+                raw_sorry_sites.push((tok.line, tok.col, id.clone()));
             }
         }
     }
@@ -431,16 +431,13 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
 
         // `set_option maxHeartbeats N`
         if matches!(&tokens[i].kind, LeanTokenKind::Ident(s) if s == "set_option") {
-            if i + 2 < n {
-                if let (LeanTokenKind::Ident(opt), LeanTokenKind::NatLit(num_s)) =
+            if i + 2 < n
+                && let (LeanTokenKind::Ident(opt), LeanTokenKind::NatLit(num_s)) =
                     (&tokens[i + 1].kind, &tokens[i + 2].kind)
-                {
-                    if opt == "maxHeartbeats" {
-                        if let Ok(v) = num_s.replace('_', "").parse::<u64>() {
-                            max_heartbeats.push((v, tokens[i].line));
-                        }
-                    }
-                }
+                && opt == "maxHeartbeats"
+                && let Ok(v) = num_s.replace('_', "").parse::<u64>()
+            {
+                max_heartbeats.push((v, tokens[i].line));
             }
             // If `set_option ... in`, skip past `in` without clearing `pending_fixture_kept`
             let mut j = i + 1;
@@ -496,13 +493,13 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                         break;
                     }
                     match &tokens[gend].kind {
-                        LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{" | "#[") => {
+                        LeanTokenKind::Symbol(s)
+                            if matches!(s.as_str(), "(" | "[" | "{" | "#[") =>
+                        {
                             depth += 1;
                         }
                         LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                            if depth > 0 {
-                                depth -= 1;
-                            }
+                            depth = (depth - 1).max(0);
                         }
                         _ => {}
                     }
@@ -516,59 +513,56 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
         }
 
         // `namespace Foo.Bar` / `section [Foo]` / `end [Foo.Bar]`
-        if tokens[i].col == 1 {
-            if let LeanTokenKind::Ident(kw) = &tokens[i].kind {
-                if kw == "namespace" {
-                    let mut parts = Vec::new();
-                    if let Some(LeanToken {
-                        kind: LeanTokenKind::Ident(ns),
-                        ..
-                    }) = tokens.get(i + 1)
-                    {
-                        if tokens[i + 1].line == tokens[i].line {
-                            parts = ns.split('.').map(str::to_string).collect();
-                            i += 2;
-                            ns_stack.push((true, parts));
-                            continue;
-                        }
-                    }
+        if tokens[i].col == 1
+            && let LeanTokenKind::Ident(kw) = &tokens[i].kind
+        {
+            if kw == "namespace" {
+                let mut parts = Vec::new();
+                if let Some(LeanToken {
+                    kind: LeanTokenKind::Ident(ns),
+                    ..
+                }) = tokens.get(i + 1)
+                    && tokens[i + 1].line == tokens[i].line
+                {
+                    parts = ns.split('.').map(str::to_string).collect();
+                    i += 2;
                     ns_stack.push((true, parts));
-                    i += 1;
-                    continue;
-                } else if kw == "section" {
-                    // Careful: `public section` is handled in modifiers if not caught here; top-level `section` pushes scope
-                    let mut parts = Vec::new();
-                    if let Some(LeanToken {
-                        kind: LeanTokenKind::Ident(sec),
-                        ..
-                    }) = tokens.get(i + 1)
-                    {
-                        if tokens[i + 1].line == tokens[i].line {
-                            parts = sec.split('.').map(str::to_string).collect();
-                            i += 2;
-                            ns_stack.push((false, parts));
-                            continue;
-                        }
-                    }
-                    ns_stack.push((false, parts));
-                    i += 1;
-                    continue;
-                } else if kw == "end" {
-                    if let Some(LeanToken {
-                        kind: LeanTokenKind::Ident(_closed),
-                        ..
-                    }) = tokens.get(i + 1)
-                    {
-                        if tokens[i + 1].line == tokens[i].line {
-                            let _ = ns_stack.pop();
-                            i += 2;
-                            continue;
-                        }
-                    }
-                    let _ = ns_stack.pop();
-                    i += 1;
                     continue;
                 }
+                ns_stack.push((true, parts));
+                i += 1;
+                continue;
+            } else if kw == "section" {
+                // Careful: `public section` is handled in modifiers if not caught here; top-level `section` pushes scope
+                let mut parts = Vec::new();
+                if let Some(LeanToken {
+                    kind: LeanTokenKind::Ident(sec),
+                    ..
+                }) = tokens.get(i + 1)
+                    && tokens[i + 1].line == tokens[i].line
+                {
+                    parts = sec.split('.').map(str::to_string).collect();
+                    i += 2;
+                    ns_stack.push((false, parts));
+                    continue;
+                }
+                ns_stack.push((false, parts));
+                i += 1;
+                continue;
+            } else if kw == "end" {
+                if let Some(LeanToken {
+                    kind: LeanTokenKind::Ident(_closed),
+                    ..
+                }) = tokens.get(i + 1)
+                    && tokens[i + 1].line == tokens[i].line
+                {
+                    let _ = ns_stack.pop();
+                    i += 2;
+                    continue;
+                }
+                let _ = ns_stack.pop();
+                i += 1;
+                continue;
             }
         }
 
@@ -640,11 +634,12 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
             let is_meta = mods.iter().any(|m| m == "meta");
             let mut j = cursor + 1;
             let mut is_all = false;
-            if j < n && tokens[j].line == tokens[cursor].line {
-                if matches!(&tokens[j].kind, LeanTokenKind::Ident(s) if s == "all") {
-                    is_all = true;
-                    j += 1;
-                }
+            if j < n
+                && tokens[j].line == tokens[cursor].line
+                && matches!(&tokens[j].kind, LeanTokenKind::Ident(s) if s == "all")
+            {
+                is_all = true;
+                j += 1;
             }
             while j < n {
                 if j > cursor + 1 && tokens[j].first_on_line {
@@ -683,11 +678,10 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                 line: sline,
                 ..
             }) = tokens.get(cursor + 1)
+                && *sline == tokens[cursor].line
             {
-                if *sline == tokens[cursor].line {
-                    parts = sec.split('.').map(str::to_string).collect();
-                    next_i = cursor + 2;
-                }
+                parts = sec.split('.').map(str::to_string).collect();
+                next_i = cursor + 2;
             }
             ns_stack.push((false, parts));
             pending_fixture_kept = false;
@@ -737,9 +731,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                         bdepth += 1;
                     }
                     LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                        if bdepth > 0 {
-                            bdepth -= 1;
-                        }
+                        bdepth = (bdepth - 1).max(0);
                     }
                     _ => {}
                 }
@@ -780,7 +772,9 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
         let mut cmd_end = cursor + 1;
         let mut bracket_depth = 0isize;
         while cmd_end < n {
-            if bracket_depth == 0 && cmd_end > cursor + 1 && is_top_command_starter(&tokens[cmd_end])
+            if bracket_depth == 0
+                && cmd_end > cursor + 1
+                && is_top_command_starter(&tokens[cmd_end])
             {
                 break;
             }
@@ -792,9 +786,7 @@ pub fn parse_lean_file(rel_path: &str, src: &str) -> ParsedLeanFile {
                     bracket_depth += 1;
                 }
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                    if bracket_depth > 0 {
-                        bracket_depth -= 1;
-                    }
+                    bracket_depth = (bracket_depth - 1).max(0);
                 }
                 _ => {}
             }
@@ -845,15 +837,17 @@ fn qualify_name(ns_stack: &[(bool, Vec<String>)], name: &str) -> String {
             }
         }
     }
-    if prefix.is_empty() {
-        name.to_string()
-    } else if name.starts_with(&format!("{}.", prefix.join("."))) {
+    if prefix.is_empty() || name.starts_with(&format!("{}.", prefix.join("."))) {
         name.to_string()
     } else {
         format!("{}.{}", prefix.join("."), name)
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "parser inputs mirror the declaration header fields"
+)]
 fn parse_command_slice(
     kind: DeclKind,
     cmd: &[LeanToken],
@@ -886,11 +880,12 @@ fn parse_command_slice(
                     tactic_name = clean;
                     break;
                 }
-            } else if let LeanTokenKind::Ident(id) = &tok.kind {
-                if id != "elab" && id != "macro" {
-                    tactic_name = id.clone();
-                    break;
-                }
+            } else if let LeanTokenKind::Ident(id) = &tok.kind
+                && id != "elab"
+                && id != "macro"
+            {
+                tactic_name = id.clone();
+                break;
             }
         }
         if !is_tactic {
@@ -904,9 +899,7 @@ fn parse_command_slice(
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
                 LeanTokenKind::SyntaxQuoteOpen | LeanTokenKind::AntiquoteOpen => depth += 1,
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                    depth = (depth - 1).max(0);
                 }
                 LeanTokenKind::Symbol(s) if s == "=>" && depth == 0 => {
                     arrow_pos = Some(idx);
@@ -915,9 +908,7 @@ fn parse_command_slice(
                 _ => {}
             }
         }
-        let body_tokens = arrow_pos
-            .map(|p| cmd[p + 1..].to_vec())
-            .unwrap_or_default();
+        let body_tokens = arrow_pos.map(|p| cmd[p + 1..].to_vec()).unwrap_or_default();
         return Some(ParsedLeanDecl {
             kind,
             name: tactic_name.clone(),
@@ -972,7 +963,8 @@ fn parse_command_slice(
     };
 
     // Skip universe parameters `.{u, v}` if present
-    if pos < cmd.len() && matches!(&cmd[pos].kind, LeanTokenKind::Symbol(s) if s == "." || s == "{") {
+    if pos < cmd.len() && matches!(&cmd[pos].kind, LeanTokenKind::Symbol(s) if s == "." || s == "{")
+    {
         if matches!(&cmd[pos].kind, LeanTokenKind::Symbol(s) if s == ".") {
             pos += 1;
         }
@@ -1010,11 +1002,11 @@ fn parse_command_slice(
             match &cmd[idx].kind {
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                    depth = (depth - 1).max(0);
                 }
-                LeanTokenKind::Symbol(s) if s == ":" && !in_body && depth == 0 && header_colon_idx.is_none() => {
+                LeanTokenKind::Symbol(s)
+                    if s == ":" && !in_body && depth == 0 && header_colon_idx.is_none() =>
+                {
                     header_colon_idx = Some(idx);
                 }
                 LeanTokenKind::Ident(s) if s == "where" && depth == 0 => {
@@ -1037,7 +1029,10 @@ fn parse_command_slice(
                     // Next identifier (skipping optional doc comments or modifiers) is the constructor name!
                     let mut k = idx + 1;
                     while k < cmd.len()
-                        && matches!(&cmd[k].kind, LeanTokenKind::DocComment(_) | LeanTokenKind::Symbol(_))
+                        && matches!(
+                            &cmd[k].kind,
+                            LeanTokenKind::DocComment(_) | LeanTokenKind::Symbol(_)
+                        )
                     {
                         if matches!(&cmd[k].kind, LeanTokenKind::Symbol(sym) if sym != ".") {
                             break;
@@ -1060,7 +1055,7 @@ fn parse_command_slice(
         let header_type_tokens = match header_colon_idx {
             Some(hc) => {
                 let end_hdr = body_start_idx.unwrap_or(cmd.len());
-                if hc + 1 <= end_hdr {
+                if hc < end_hdr {
                     cmd[hc + 1..end_hdr].to_vec()
                 } else {
                     Vec::new()
@@ -1121,11 +1116,7 @@ fn parse_command_slice(
                     }
                     let gend = b_idx.saturating_sub(1);
                     if gstart <= gend && gend <= cmd.len() {
-                        extract_binder_group(
-                            &cmd[gstart..gend],
-                            open == "[",
-                            &mut struct_binders,
-                        );
+                        extract_binder_group(&cmd[gstart..gend], open == "[", &mut struct_binders);
                     }
                 }
                 _ => break,
@@ -1135,14 +1126,16 @@ fn parse_command_slice(
             match &tok.kind {
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
                 LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
+                    depth = (depth - 1).max(0);
                 }
-                LeanTokenKind::Ident(s) if s == "extends" && !after_where && depth == 0 && extends_idx.is_none() => {
+                LeanTokenKind::Ident(s)
+                    if s == "extends" && !after_where && depth == 0 && extends_idx.is_none() =>
+                {
                     extends_idx = Some(idx);
                 }
-                LeanTokenKind::Symbol(s) if s == ":" && !after_where && depth == 0 && header_colon_idx.is_none() => {
+                LeanTokenKind::Symbol(s)
+                    if s == ":" && !after_where && depth == 0 && header_colon_idx.is_none() =>
+                {
                     header_colon_idx = Some(idx);
                 }
                 LeanTokenKind::Ident(s) if s == "where" && depth == 0 => {
@@ -1153,96 +1146,99 @@ fn parse_command_slice(
                     break;
                 }
                 LeanTokenKind::Ident(field_id)
-                    if after_where && depth == 0 && tok.first_on_line && tok.col > 1 =>
-                {
-                    if idx + 1 < cmd.len()
+                    if after_where
+                        && depth == 0
+                        && tok.first_on_line
+                        && tok.col > 1
+                        && idx + 1 < cmd.len()
                         && matches!(
                             &cmd[idx + 1].kind,
                             LeanTokenKind::Symbol(sym) if sym == ":" || sym == "(" || sym == "{" || sym == "["
-                        )
-                    {
-                        fields.push(field_id.clone());
-                        // Extract field's type tokens between `:` (at depth 0 relative to field) and `:=` or next field / `deriving`
-                        let mut k = idx + 1;
-                        let mut fdepth = 0isize;
-                        let mut fcolon = None;
-                        while k < cmd.len() {
-                            if fdepth == 0
-                                && k > idx + 1
-                                && ((cmd[k].first_on_line && cmd[k].col <= tok.col)
-                                    || matches!(&cmd[k].kind, LeanTokenKind::Ident(s) if s == "deriving")
-                                    || matches!(&cmd[k].kind, LeanTokenKind::Symbol(s) if s == ":="))
+                        ) =>
+                {
+                    fields.push(field_id.clone());
+                    // Extract field's type tokens between `:` (at depth 0 relative to field) and `:=` or next field / `deriving`
+                    let mut k = idx + 1;
+                    let mut fdepth = 0isize;
+                    let mut fcolon = None;
+                    while k < cmd.len() {
+                        if fdepth == 0
+                            && k > idx + 1
+                            && ((cmd[k].first_on_line && cmd[k].col <= tok.col)
+                                || matches!(&cmd[k].kind, LeanTokenKind::Ident(s) if s == "deriving")
+                                || matches!(&cmd[k].kind, LeanTokenKind::Symbol(s) if s == ":="))
+                        {
+                            break;
+                        }
+                        match &cmd[k].kind {
+                            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
+                                fdepth += 1;
+                            }
+                            LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
+                                if fdepth > 0 {
+                                    fdepth -= 1;
+                                }
+                            }
+                            LeanTokenKind::Symbol(s)
+                                if s == ":" && fdepth == 0 && fcolon.is_none() =>
                             {
-                                break;
+                                fcolon = Some(k);
                             }
-                            match &cmd[k].kind {
-                                LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => {
-                                    fdepth += 1;
-                                }
-                                LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                                    if fdepth > 0 {
-                                        fdepth -= 1;
-                                    }
-                                }
-                                LeanTokenKind::Symbol(s) if s == ":" && fdepth == 0 && fcolon.is_none() => {
-                                    fcolon = Some(k);
-                                }
-                                _ => {}
-                            }
-                            k += 1;
+                            _ => {}
                         }
-                        let mut fbinders = Vec::new();
-                        if let Some(fc) = fcolon {
-                            let mut fb_idx = idx + 1;
-                            while fb_idx < fc {
-                                match &cmd[fb_idx].kind {
-                                    LeanTokenKind::Symbol(s)
-                                        if matches!(s.as_str(), "(" | "{" | "[") =>
-                                    {
-                                        let open = s.as_str();
-                                        let close = match open {
-                                            "(" => ")",
-                                            "{" => "}",
-                                            _ => "]",
-                                        };
-                                        let gstart = fb_idx + 1;
-                                        let mut d = 1usize;
-                                        fb_idx += 1;
-                                        while fb_idx < fc && d > 0 {
-                                            match &cmd[fb_idx].kind {
-                                                LeanTokenKind::Symbol(o) if o == open => d += 1,
-                                                LeanTokenKind::Symbol(c) if c == close => d -= 1,
-                                                _ => {}
-                                            }
-                                            fb_idx += 1;
-                                        }
-                                        let gend = fb_idx.saturating_sub(1);
-                                        if gstart <= gend && gend <= fc {
-                                            extract_binder_group(
-                                                &cmd[gstart..gend],
-                                                open == "[",
-                                                &mut fbinders,
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        fb_idx += 1;
-                                    }
-                                }
-                            }
-                        }
-                        let ftype = match fcolon {
-                            Some(fc) if fc + 1 <= k => cmd[fc + 1..k].to_vec(),
-                            _ => Vec::new(),
-                        };
-                        struct_fields.push(StructField {
-                            name: field_id.clone(),
-                            binders: fbinders,
-                            type_tokens: ftype,
-                            line: tok.line,
-                            col: tok.col,
-                        });
+                        k += 1;
                     }
+                    let mut fbinders = Vec::new();
+                    if let Some(fc) = fcolon {
+                        let mut fb_idx = idx + 1;
+                        while fb_idx < fc {
+                            match &cmd[fb_idx].kind {
+                                LeanTokenKind::Symbol(s)
+                                    if matches!(s.as_str(), "(" | "{" | "[") =>
+                                {
+                                    let open = s.as_str();
+                                    let close = match open {
+                                        "(" => ")",
+                                        "{" => "}",
+                                        _ => "]",
+                                    };
+                                    let gstart = fb_idx + 1;
+                                    let mut d = 1usize;
+                                    fb_idx += 1;
+                                    while fb_idx < fc && d > 0 {
+                                        match &cmd[fb_idx].kind {
+                                            LeanTokenKind::Symbol(o) if o == open => d += 1,
+                                            LeanTokenKind::Symbol(c) if c == close => d -= 1,
+                                            _ => {}
+                                        }
+                                        fb_idx += 1;
+                                    }
+                                    let gend = fb_idx.saturating_sub(1);
+                                    if gstart <= gend && gend <= fc {
+                                        extract_binder_group(
+                                            &cmd[gstart..gend],
+                                            open == "[",
+                                            &mut fbinders,
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    fb_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                    let ftype = match fcolon {
+                        Some(fc) if fc < k => cmd[fc + 1..k].to_vec(),
+                        _ => Vec::new(),
+                    };
+                    struct_fields.push(StructField {
+                        name: field_id.clone(),
+                        binders: fbinders,
+                        type_tokens: ftype,
+                        line: tok.line,
+                        col: tok.col,
+                    });
                 }
                 _ => {}
             }
@@ -1252,10 +1248,10 @@ fn parse_command_slice(
             if ext <= end_hdr {
                 header_type_tokens = cmd[ext..end_hdr].to_vec();
             }
-        } else if let Some(hc) = header_colon_idx {
-            if hc + 1 <= end_hdr {
-                header_type_tokens = cmd[hc + 1..end_hdr].to_vec();
-            }
+        } else if let Some(hc) = header_colon_idx
+            && hc < end_hdr
+        {
+            header_type_tokens = cmd[hc + 1..end_hdr].to_vec();
         }
         return Some(ParsedLeanDecl {
             kind,
@@ -1286,7 +1282,9 @@ fn parse_command_slice(
     while idx < cmd.len() {
         let tok = &cmd[idx];
         match &tok.kind {
-            LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "{" | "[") && colon_idx.is_none() && depth == 0 => {
+            LeanTokenKind::Symbol(s)
+                if matches!(s.as_str(), "(" | "{" | "[") && colon_idx.is_none() && depth == 0 =>
+            {
                 let open = s.as_str();
                 let close = match open {
                     "(" => ")",
@@ -1336,9 +1334,7 @@ fn parse_command_slice(
                 depth += 1;
             }
             LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "}" | "]") => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = (depth - 1).max(0);
             }
             LeanTokenKind::Symbol(s) if s == ":" && depth == 0 && colon_idx.is_none() => {
                 colon_idx = Some(idx);
@@ -1372,8 +1368,8 @@ fn parse_command_slice(
     }
 
     let type_tokens = match (colon_idx, body_sep_idx) {
-        (Some(c), Some((b, _))) if c + 1 <= b => cmd[c + 1..b].to_vec(),
-        (Some(c), None) if c + 1 <= cmd.len() => cmd[c + 1..].to_vec(),
+        (Some(c), Some((b, _))) if c < b => cmd[c + 1..b].to_vec(),
+        (Some(c), None) if c < cmd.len() => cmd[c + 1..].to_vec(),
         _ => Vec::new(),
     };
 
@@ -1405,7 +1401,11 @@ fn parse_command_slice(
     })
 }
 
-fn extract_binder_group(group: &[LeanToken], is_instance_bracket: bool, out: &mut Vec<BinderParam>) {
+fn extract_binder_group(
+    group: &[LeanToken],
+    is_instance_bracket: bool,
+    out: &mut Vec<BinderParam>,
+) {
     // Find top-level `:` inside the binder group `(x y : Nat)`
     let mut depth = 0isize;
     let mut colon_pos = None;
@@ -1413,9 +1413,7 @@ fn extract_binder_group(group: &[LeanToken], is_instance_bracket: bool, out: &mu
         match &t.kind {
             LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
             LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = (depth - 1).max(0);
             }
             LeanTokenKind::Symbol(s) if s == ":" && depth == 0 => {
                 colon_pos = Some(i);
@@ -1470,25 +1468,24 @@ fn parse_where_fields(tokens: &[LeanToken]) -> Vec<WhereField> {
         if matches!(&tok.kind, LeanTokenKind::Ident(s) if s == "deriving") && depth == 0 {
             break;
         }
-        if depth == 0 && tok.first_on_line {
-            if let LeanTokenKind::Ident(_fname) = &tok.kind {
-                if let Some(bc) = base_col {
-                    if tok.col == bc {
-                        field_starts.push(idx);
-                    }
-                } else if tok.col > 1 {
-                    base_col = Some(tok.col);
+        if depth == 0
+            && tok.first_on_line
+            && let LeanTokenKind::Ident(_fname) = &tok.kind
+        {
+            if let Some(bc) = base_col {
+                if tok.col == bc {
                     field_starts.push(idx);
                 }
+            } else if tok.col > 1 {
+                base_col = Some(tok.col);
+                field_starts.push(idx);
             }
         }
         match &tok.kind {
             LeanTokenKind::Symbol(s) if matches!(s.as_str(), "(" | "[" | "{") => depth += 1,
             LeanTokenKind::SyntaxQuoteOpen | LeanTokenKind::AntiquoteOpen => depth += 1,
             LeanTokenKind::Symbol(s) if matches!(s.as_str(), ")" | "]" | "}") => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = (depth - 1).max(0);
             }
             _ => {}
         }
@@ -1559,15 +1556,15 @@ pub fn build_lean_index(repo_root: &Path) -> LeanIndex {
 
     // Collect `review/*.md` if present
     let review_dir = repo_root.join("review");
-    if review_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&review_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
-                        index.review_paths.insert(format!("review/{fname}"));
-                    }
-                }
+    if review_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&review_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Some(fname) = p.file_name().and_then(|n| n.to_str())
+            {
+                index.review_paths.insert(format!("review/{fname}"));
             }
         }
     }
@@ -1606,19 +1603,19 @@ pub fn build_lean_index(repo_root: &Path) -> LeanIndex {
 
     // Subsystem discovery under `lean/Obend/`
     let obend_dir = repo_root.join("lean/Obend");
-    if obend_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&obend_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    if let Some(sub) = p.file_name().and_then(|s| s.to_str()) {
-                        index.subsystems.insert(sub.to_string());
-                    }
-                } else if p.extension().and_then(|e| e.to_str()) == Some("lean") {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        index.subsystems.insert(stem.to_string());
-                    }
+    if obend_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&obend_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(sub) = p.file_name().and_then(|s| s.to_str()) {
+                    index.subsystems.insert(sub.to_string());
                 }
+            } else if p.extension().and_then(|e| e.to_str()) == Some("lean")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+            {
+                index.subsystems.insert(stem.to_string());
             }
         }
     }
@@ -1633,7 +1630,10 @@ pub fn build_lean_index(repo_root: &Path) -> LeanIndex {
         };
 
         // Record `Obend/.../*.lean` relative path (normalized without `lean/` prefix, matching `DocsCensus.lean`)
-        let norm_obend_rel = rel_str.strip_prefix("lean/").unwrap_or(&rel_str).to_string();
+        let norm_obend_rel = rel_str
+            .strip_prefix("lean/")
+            .unwrap_or(&rel_str)
+            .to_string();
         if norm_obend_rel.starts_with("Obend/") {
             index.lean_rel_paths.insert(norm_obend_rel.clone());
             if let Some(base) = abs_path.file_name().and_then(|s| s.to_str()) {

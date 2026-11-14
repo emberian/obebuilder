@@ -383,15 +383,15 @@ impl ProcessSpec {
         if !self.machines.quest.sinks.iter().any(|s| s == sink) {
             return false;
         }
-        if let Some(allowed) = self.machines.quest.sink_edges.get("*") {
-            if allowed.iter().any(|s| s == sink) {
-                return true;
-            }
+        if let Some(allowed) = self.machines.quest.sink_edges.get("*")
+            && allowed.iter().any(|s| s == sink)
+        {
+            return true;
         }
-        if let Some(allowed) = self.machines.quest.sink_edges.get(from_state) {
-            if allowed.iter().any(|s| s == sink) {
-                return true;
-            }
+        if let Some(allowed) = self.machines.quest.sink_edges.get(from_state)
+            && allowed.iter().any(|s| s == sink)
+        {
+            return true;
         }
         false
     }

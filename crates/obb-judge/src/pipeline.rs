@@ -168,7 +168,7 @@ fn is_trivial_type_carrier_expr(expr: &str) -> bool {
         return true;
     }
     let parts: Vec<&str> = expr
-        .split(|c: char| matches!(c, '(' | ')' | ',' | ' ' | '×'))
+        .split(['(', ')', ',', ' ', '×'])
         .filter(|s| !s.is_empty())
         .collect();
     if parts.is_empty() {
@@ -268,10 +268,14 @@ fn tokens_have_unquoted_sorry(tokens: &[LeanToken]) -> Option<usize> {
             LeanTokenKind::SyntaxQuoteOpen => {
                 quote_depth += 1;
             }
-            LeanTokenKind::Symbol(s) if quote_depth > 0 && matches!(s.as_str(), "(" | "[" | "{") => {
+            LeanTokenKind::Symbol(s)
+                if quote_depth > 0 && matches!(s.as_str(), "(" | "[" | "{") =>
+            {
                 quote_depth += 1;
             }
-            LeanTokenKind::Symbol(s) if quote_depth > 0 && matches!(s.as_str(), ")" | "]" | "}") => {
+            LeanTokenKind::Symbol(s)
+                if quote_depth > 0 && matches!(s.as_str(), ")" | "]" | "}") =>
+            {
                 quote_depth -= 1;
             }
             LeanTokenKind::Ident(id) if quote_depth == 0 && (id == "sorry" || id == "sorryAx") => {
@@ -330,7 +334,9 @@ fn parse_head_class_and_args(tokens: &[LeanToken]) -> Option<(String, Vec<String
     while idx < tail.len() {
         match &tail[idx].kind {
             LeanTokenKind::Ident(id)
-                if matches!(id.as_str(), "where") || (head_class.is_none() && matches!(id.as_str(), "∀" | "forall" | "outParam" | "semiOutParam")) =>
+                if matches!(id.as_str(), "where")
+                    || (head_class.is_none()
+                        && matches!(id.as_str(), "∀" | "forall" | "outParam" | "semiOutParam")) =>
             {
                 if id == "where" {
                     break;
@@ -476,9 +482,7 @@ fn carrier_args_cover(inst_args: &[String], req_args: &[String]) -> bool {
         return false;
     }
     inst_args.iter().zip(req_args.iter()).all(|(ia, ra)| {
-        ia == "*"
-            || ia == ra
-            || (ia.starts_with("*:") && ra != "*" && !ra.starts_with("*:"))
+        ia == "*" || ia == ra || (ia.starts_with("*:") && ra != "*" && !ra.starts_with("*:"))
     })
 }
 
@@ -577,10 +581,11 @@ pub fn check_pipeline_with_index_and_options(
                     ),
                     remediation: "Delete `axiom` and express cross-shard interface assumptions as an explicit `class *Obligations` / `HypothesisLedger` typeclass parameter.".to_string(),
                 });
-            } else if !is_planted_sorry_fixture_name(&decl.name) {
-                if let Some(sline) = find_sorry_in_decl(decl) {
-                    smuggled_sorry_count += 1;
-                    violations.push(PipelineViolation {
+            } else if !is_planted_sorry_fixture_name(&decl.name)
+                && let Some(sline) = find_sorry_in_decl(decl)
+            {
+                smuggled_sorry_count += 1;
+                violations.push(PipelineViolation {
                         kind: "smuggled_sorry".to_string(),
                         path: file.rel_path.clone(),
                         line: sline,
@@ -591,7 +596,6 @@ pub fn check_pipeline_with_index_and_options(
                         ),
                         remediation: "Remove `sorry`; parameterize Stage-A consumer theorems over `[HypothesisLedger ...]` / `[*Obligations ...]` and discharge the instance in Stage B.".to_string(),
                     });
-                }
             }
 
             let has_obl_attr = decl.attributes.iter().any(|a| a == "obb_obligation");
@@ -605,10 +609,9 @@ pub fn check_pipeline_with_index_and_options(
                 let extends_named_ledger = parents.iter().any(|p| is_ledger_class_name(p));
                 if is_ledger_class_name(&decl.name) || has_obl_attr || extends_named_ledger {
                     for p in &parents {
-                        if let Some(pk) = short_to_key
-                            .get(p.as_str())
-                            .or_else(|| short_to_key.get(p.rsplit('.').next().unwrap_or(p.as_str())))
-                        {
+                        if let Some(pk) = short_to_key.get(p.as_str()).or_else(|| {
+                            short_to_key.get(p.rsplit('.').next().unwrap_or(p.as_str()))
+                        }) {
                             extended_parent_keys.insert(pk.clone());
                         } else {
                             extended_parent_keys.insert(p.clone());
@@ -633,7 +636,10 @@ pub fn check_pipeline_with_index_and_options(
                     candidate_subclasses.push((&file.rel_path, decl, parents));
                 }
             } else if has_obl_attr
-                && matches!(decl.kind, DeclKind::Theorem | DeclKind::Def | DeclKind::Structure)
+                && matches!(
+                    decl.kind,
+                    DeclKind::Theorem | DeclKind::Def | DeclKind::Structure
+                )
             {
                 // Non-class `@[obb_obligation]` stub: track as an obligation entry
                 let entry = DiscoveredClass {
@@ -716,37 +722,35 @@ pub fn check_pipeline_with_index_and_options(
     // Track named ledger instances to catch mutual instance-body recursion (`instA` calls `instB` and `instB` calls `instA`)
     let mut inst_records: Vec<(String, String, String, usize, Vec<String>)> = Vec::new();
 
-    let check_binder_for_consumer = |b: &BinderParam,
-                                     scope_binders: &[BinderParam],
-                                     owner_sym: &str,
-                                     rel_path: &str,
-                                     consumer_sites: &mut Vec<ConsumerSite>,
-                                     consumer_counts: &mut HashMap<String, usize>,
-                                     required_carriers_by_class: &mut HashMap<
-        String,
-        BTreeSet<Vec<String>>,
-    >,
-                                     violations: &mut Vec<PipelineViolation>| {
-        if !b.is_instance_bracket {
-            return;
-        }
-        if let Some((head, raw_args)) = parse_head_class_and_args(&b.type_tokens) {
-            if let Some(key) = resolve_ledger_key(&head) {
-                let norm_args = normalize_carrier_args(&raw_args, scope_binders);
-                *consumer_counts.entry(key.clone()).or_insert(0) += 1;
-                required_carriers_by_class
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(norm_args.clone());
-                consumer_sites.push(ConsumerSite {
-                    symbol: owner_sym.to_string(),
-                    path: rel_path.to_string(),
-                    line: b.line,
-                    ledger_class: key,
-                    carrier_args: norm_args,
-                });
-            } else if is_ledger_class_name(&head) {
-                violations.push(PipelineViolation {
+    let check_binder_for_consumer =
+        |b: &BinderParam,
+         scope_binders: &[BinderParam],
+         owner_sym: &str,
+         rel_path: &str,
+         consumer_sites: &mut Vec<ConsumerSite>,
+         consumer_counts: &mut HashMap<String, usize>,
+         required_carriers_by_class: &mut HashMap<String, BTreeSet<Vec<String>>>,
+         violations: &mut Vec<PipelineViolation>| {
+            if !b.is_instance_bracket {
+                return;
+            }
+            if let Some((head, raw_args)) = parse_head_class_and_args(&b.type_tokens) {
+                if let Some(key) = resolve_ledger_key(&head) {
+                    let norm_args = normalize_carrier_args(&raw_args, scope_binders);
+                    *consumer_counts.entry(key.clone()).or_insert(0) += 1;
+                    required_carriers_by_class
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(norm_args.clone());
+                    consumer_sites.push(ConsumerSite {
+                        symbol: owner_sym.to_string(),
+                        path: rel_path.to_string(),
+                        line: b.line,
+                        ledger_class: key,
+                        carrier_args: norm_args,
+                    });
+                } else if is_ledger_class_name(&head) {
+                    violations.push(PipelineViolation {
                     kind: "undeclared_ledger_class".to_string(),
                     path: rel_path.to_string(),
                     line: b.line,
@@ -757,9 +761,9 @@ pub fn check_pipeline_with_index_and_options(
                     ),
                     remediation: "Declare the obligation `class` explicitly in the shared interface module.".to_string(),
                 });
+                }
             }
-        }
-    };
+        };
 
     for file in &index.files {
         if is_test_only_path(&file.rel_path) {
@@ -826,7 +830,7 @@ pub fn check_pipeline_with_index_and_options(
             // Track explicit binder names referenced in `target_args` so `(u : Unit) : FooObligations u` is caught as dummy carrier
             let referenced_arg_idents: HashSet<&str> = target_args
                 .iter()
-                .flat_map(|a| a.split(|c: char| matches!(c, '(' | ')' | ',' | ' ')))
+                .flat_map(|a| a.split(['(', ')', ',', ' ']))
                 .filter(|s| !s.is_empty())
                 .collect();
 
@@ -838,12 +842,12 @@ pub fn check_pipeline_with_index_and_options(
 
             for b in &decl.binders {
                 if b.is_instance_bracket {
-                    if let Some((b_head, b_args)) = parse_head_class_and_args(&b.type_tokens) {
-                        if let Some(dep_key) = resolve_ledger_key(&b_head) {
-                            let dep_norm = normalize_carrier_args(&b_args, &combined_binders);
-                            dep_ledgers.insert(dep_key.clone());
-                            dep_applications.push((dep_key, dep_norm));
-                        }
+                    if let Some((b_head, b_args)) = parse_head_class_and_args(&b.type_tokens)
+                        && let Some(dep_key) = resolve_ledger_key(&b_head)
+                    {
+                        let dep_norm = normalize_carrier_args(&b_args, &combined_binders);
+                        dep_ledgers.insert(dep_key.clone());
+                        dep_applications.push((dep_key, dep_norm));
                     }
                 } else {
                     let used_as_carrier =
@@ -890,12 +894,10 @@ pub fn check_pipeline_with_index_and_options(
 
             // Check if any type/carrier argument to the class is uninhabited (`VoidCarrier`) or a trivial carrier (`Unit`/`PUnit`/`Bool`/`Nat`/`True`)
             for (param_idx, arg) in target_args.iter().enumerate() {
-                for sub_id in arg
-                    .split(|c: char| matches!(c, '(' | ')' | ',' | ' '))
-                    .filter(|s| !s.is_empty())
-                {
+                for sub_id in arg.split(['(', ')', ',', ' ']).filter(|s| !s.is_empty()) {
                     let short_a = sub_id.rsplit('.').next().unwrap_or(sub_id);
-                    if zero_ctor_inductives.contains(sub_id) || zero_ctor_inductives.contains(short_a)
+                    if zero_ctor_inductives.contains(sub_id)
+                        || zero_ctor_inductives.contains(short_a)
                     {
                         witness_inhabited = false;
                         violations.push(PipelineViolation {
@@ -955,7 +957,9 @@ pub fn check_pipeline_with_index_and_options(
                         "Instance `{}` for `{}` supplies no `where` fields or proof term",
                         decl.fq_name, target_key
                     ),
-                    remediation: "Provide concrete proof terms for all obligation fields in `where` or `:=`.".to_string(),
+                    remediation:
+                        "Provide concrete proof terms for all obligation fields in `where` or `:=`."
+                            .to_string(),
                 });
             }
 
@@ -1159,9 +1163,13 @@ pub fn check_pipeline_with_index_and_options(
                     if already_recorded {
                         continue;
                     }
-                    let deps_ok = inst.depends_on_applications.iter().all(|(dep_cls, dep_args)| {
-                        dep_cls != class_key && app_is_covered(&active_applications, dep_cls, dep_args)
-                    });
+                    let deps_ok = inst
+                        .depends_on_applications
+                        .iter()
+                        .all(|(dep_cls, dep_args)| {
+                            dep_cls != class_key
+                                && app_is_covered(&active_applications, dep_cls, dep_args)
+                        });
                     if deps_ok {
                         active_applications
                             .entry(class_key.clone())
@@ -1219,9 +1227,9 @@ pub fn check_pipeline_with_index_and_options(
             let has_valid_inst = active_applications
                 .get(key)
                 .map(|vec_args| {
-                    vec_args
-                        .iter()
-                        .any(|ia| ia.len() >= cls.explicit_param_count || cls.explicit_param_count == 0)
+                    vec_args.iter().any(|ia| {
+                        ia.len() >= cls.explicit_param_count || cls.explicit_param_count == 0
+                    })
                 })
                 .unwrap_or(false);
             (has_valid_inst, Vec::new())
@@ -1262,8 +1270,10 @@ pub fn check_pipeline_with_index_and_options(
 
     let passed =
         stage != PipelineStage::Failed && (!opts.strict || stage != PipelineStage::Undeclared);
-    let ready_for_parallel_swarm =
-        matches!(stage, PipelineStage::StageALocked | PipelineStage::StageBSealed);
+    let ready_for_parallel_swarm = matches!(
+        stage,
+        PipelineStage::StageALocked | PipelineStage::StageBSealed
+    );
     let ready_for_claimed = stage == PipelineStage::StageBSealed;
 
     PipelineReport {

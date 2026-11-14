@@ -151,17 +151,18 @@ pub fn tokenize_rust(src: &str) -> Vec<RsTok> {
         }
 
         // Raw string or raw byte string literal `r#"..."#`, `r"..."`, `br#"..."#`, `br"..."`
-        let raw_prefix_len = if c == 'r' && i + 1 < n && (chars[i + 1] == '#' || chars[i + 1] == '"') {
-            Some(1usize)
-        } else if c == 'b'
-            && i + 2 < n
-            && chars[i + 1] == 'r'
-            && (chars[i + 2] == '#' || chars[i + 2] == '"')
-        {
-            Some(2usize)
-        } else {
-            None
-        };
+        let raw_prefix_len =
+            if c == 'r' && i + 1 < n && (chars[i + 1] == '#' || chars[i + 1] == '"') {
+                Some(1usize)
+            } else if c == 'b'
+                && i + 2 < n
+                && chars[i + 1] == 'r'
+                && (chars[i + 2] == '#' || chars[i + 2] == '"')
+            {
+                Some(2usize)
+            } else {
+                None
+            };
         if let Some(plen) = raw_prefix_len {
             let mut hashes = 0usize;
             let mut j = i + plen;
@@ -351,7 +352,10 @@ pub fn tokenize_rust(src: &str) -> Vec<RsTok> {
 
         if i + 1 < n {
             let two = format!("{}{}", c, chars[i + 1]);
-            if matches!(two.as_str(), "::" | "->" | "=>" | "==" | "!=" | "<=" | ">=" | "#[") {
+            if matches!(
+                two.as_str(),
+                "::" | "->" | "=>" | "==" | "!=" | "<=" | ">=" | "#["
+            ) {
                 i += 2;
                 col += 2;
                 out.push(RsTok {
@@ -392,14 +396,15 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
         match &toks[idx].kind {
             RsTokKind::Symbol(s) if s == "{" => brace_depth += 1,
             RsTokKind::Symbol(s) if s == "}" => brace_depth = (brace_depth - 1).max(0),
-            RsTokKind::Symbol(s) if s == "#[" && brace_depth == 0 => {
-                if idx + 4 < n
+            RsTokKind::Symbol(s)
+                if s == "#["
+                    && brace_depth == 0
+                    && idx + 4 < n
                     && matches!(&toks[idx + 1].kind, RsTokKind::Ident(id) if id == "cfg")
-                    && matches!(&toks[idx + 3].kind, RsTokKind::Ident(id) if id == "test")
-                {
-                    effective_len = idx;
-                    break;
-                }
+                    && matches!(&toks[idx + 3].kind, RsTokKind::Ident(id) if id == "test") =>
+            {
+                effective_len = idx;
+                break;
             }
             _ => {}
         }
@@ -416,20 +421,20 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
 
     // 1. Detect `struct Mock*` / `struct Dummy*` / `struct *SimBackend*` in non-test crate `src/`
     for (idx, tok) in prod_toks.iter().enumerate() {
-        if matches!(&tok.kind, RsTokKind::Ident(kw) if kw == "struct" || kw == "enum") {
-            if let Some(RsTok {
+        if matches!(&tok.kind, RsTokKind::Ident(kw) if kw == "struct" || kw == "enum")
+            && let Some(RsTok {
                 kind: RsTokKind::Ident(type_name),
                 line,
                 col,
             }) = prod_toks.get(idx + 1)
+        {
+            let lower = type_name.to_ascii_lowercase();
+            if lower.starts_with("mock")
+                || lower.starts_with("dummy")
+                || lower.ends_with("mock")
+                || lower.contains("simbackend")
             {
-                let lower = type_name.to_ascii_lowercase();
-                if lower.starts_with("mock")
-                    || lower.starts_with("dummy")
-                    || lower.ends_with("mock")
-                    || lower.contains("simbackend")
-                {
-                    findings.push(Finding {
+                findings.push(Finding {
                         rule_id: "rust/mock-backend-in-src".to_string(),
                         severity: Severity::Error,
                         artifact_kind: ArtifactKind::P,
@@ -444,7 +449,6 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
                         ),
                         remediation: "Replace in-process Rust mock backend with IPC/FFI calls to the real Verilated RTL binary or `obend_ffi` session, or gate mocks strictly under `#[cfg(test)]`.".to_string(),
                     });
-                }
             }
         }
     }
@@ -456,21 +460,26 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
         let mut references_obend_source = false;
         let mut first_obend_str_loc: Option<(String, usize, usize)> = None;
         for tok in prod_toks {
-            if let RsTokKind::StrLit(s) = &tok.kind {
-                if s.ends_with(".obend") || s.contains(".obend") || s.contains("edition ObjectiveBend") {
-                    references_obend_source = true;
-                    if first_obend_str_loc.is_none() {
-                        first_obend_str_loc = Some((s.clone(), tok.line, tok.col));
-                    }
+            if let RsTokKind::StrLit(s) = &tok.kind
+                && (s.ends_with(".obend")
+                    || s.contains(".obend")
+                    || s.contains("edition ObjectiveBend"))
+            {
+                references_obend_source = true;
+                if first_obend_str_loc.is_none() {
+                    first_obend_str_loc = Some((s.clone(), tok.line, tok.col));
                 }
             }
         }
 
         // Check for `*SpecEvaluation` structs or functions computing hardcoded numeric mirrors of `.obend`
         for (idx, tok) in prod_toks.iter().enumerate() {
-            if let RsTokKind::Ident(id) = &tok.kind {
-                if id.ends_with("SpecEvaluation") && idx > 0 && matches!(&prod_toks[idx - 1].kind, RsTokKind::Ident(kw) if kw == "struct") {
-                    findings.push(Finding {
+            if let RsTokKind::Ident(id) = &tok.kind
+                && id.ends_with("SpecEvaluation")
+                && idx > 0
+                && matches!(&prod_toks[idx - 1].kind, RsTokKind::Ident(kw) if kw == "struct")
+            {
+                findings.push(Finding {
                         rule_id: "rust/obend-semantic-mirror".to_string(),
                         severity: Severity::Error,
                         artifact_kind: ArtifactKind::P,
@@ -485,37 +494,36 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
                         ),
                         remediation: "Evaluate `.obend` modules through `obend_ffi::session::ObendSession` or load Lean-emitted artifacts instead of re-computing `.obend` formulas in Rust.".to_string(),
                     });
-                }
             }
         }
 
         // Also check functions like `step_one_cycle` that claim `.obend` core evaluation in comments while computing hardcoded `wrapping_mul`/`wrapping_add` constants
         for (idx, tok) in prod_toks.iter().enumerate() {
-            if matches!(&tok.kind, RsTokKind::Ident(kw) if kw == "fn") {
-                if let Some(RsTok {
+            if matches!(&tok.kind, RsTokKind::Ident(kw) if kw == "fn")
+                && let Some(RsTok {
                     kind: RsTokKind::Ident(fn_name),
                     line,
                     col,
                 }) = prod_toks.get(idx + 1)
-                {
-                    // Scan function body until matching `}`
-                    if let Some((body_start, body_end)) = find_fn_body_bounds(prod_toks, idx + 2) {
-                        let fn_body = &prod_toks[body_start..body_end];
-                        let body_mentions_obend_eval = fn_body.iter().any(|t| match &t.kind {
-                            RsTokKind::DocOrLineComment(c) => {
-                                let cl = c.to_ascii_lowercase();
-                                cl.contains(".obend")
-                                    && (cl.contains("evaluate") || cl.contains("semantics"))
-                            }
-                            _ => false,
-                        });
-                        let num_count = fn_body
-                            .iter()
-                            .filter(|t| matches!(&t.kind, RsTokKind::NumLit(_)))
-                            .count();
+            {
+                // Scan function body until matching `}`
+                if let Some((body_start, body_end)) = find_fn_body_bounds(prod_toks, idx + 2) {
+                    let fn_body = &prod_toks[body_start..body_end];
+                    let body_mentions_obend_eval = fn_body.iter().any(|t| match &t.kind {
+                        RsTokKind::DocOrLineComment(c) => {
+                            let cl = c.to_ascii_lowercase();
+                            cl.contains(".obend")
+                                && (cl.contains("evaluate") || cl.contains("semantics"))
+                        }
+                        _ => false,
+                    });
+                    let num_count = fn_body
+                        .iter()
+                        .filter(|t| matches!(&t.kind, RsTokKind::NumLit(_)))
+                        .count();
 
-                        if body_mentions_obend_eval && num_count >= 6 {
-                            findings.push(Finding {
+                    if body_mentions_obend_eval && num_count >= 6 {
+                        findings.push(Finding {
                                 rule_id: "rust/obend-semantic-mirror".to_string(),
                                 severity: Severity::Error,
                                 artifact_kind: ArtifactKind::P,
@@ -530,7 +538,6 @@ pub fn lint_rust_file(rel_path: &str, src: &str) -> Vec<Finding> {
                                 ),
                                 remediation: "Delegate `.obend` evaluation to `obend_ffi` or a compiled/Verilated artifact emitted by Lean (`Obend/Leaf/Emit.lean`).".to_string(),
                             });
-                        }
                     }
                 }
             }

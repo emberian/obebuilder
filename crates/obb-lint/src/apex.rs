@@ -27,7 +27,10 @@ pub const CANONICAL_SUBSYSTEMS: &[&str] = &[
 ];
 
 fn default_subsystems() -> Vec<String> {
-    CANONICAL_SUBSYSTEMS.iter().map(|s| (*s).to_string()).collect()
+    CANONICAL_SUBSYSTEMS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 fn default_entry_points() -> Vec<String> {
@@ -249,7 +252,9 @@ fn decl_has_sorry(decl: &ParsedLeanDecl) -> bool {
         .iter()
         .chain(decl.body_tokens.iter())
         .chain(decl.where_fields.iter().flat_map(|w| w.rhs_tokens.iter()))
-        .any(|tok| matches!(&tok.kind, LeanTokenKind::Ident(id) if id == "sorry" || id == "sorryAx"))
+        .any(
+            |tok| matches!(&tok.kind, LeanTokenKind::Ident(id) if id == "sorry" || id == "sorryAx"),
+        )
 }
 
 pub fn evaluate_apex(
@@ -298,10 +303,10 @@ pub fn evaluate_apex_with_index(
     let mut mod_imports: Vec<Vec<usize>> = vec![Vec::new(); n_files];
     for (u, f) in index.files.iter().enumerate() {
         for imp in &f.imports {
-            if let Some(&v) = lookup_file.get(&imp.module) {
-                if u != v {
-                    mod_imports[u].push(v);
-                }
+            if let Some(&v) = lookup_file.get(&imp.module)
+                && u != v
+            {
+                mod_imports[u].push(v);
             }
         }
         mod_imports[u].sort_unstable();
@@ -328,8 +333,14 @@ pub fn evaluate_apex_with_index(
     let mut by_short: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
     for (f_idx, f) in index.files.iter().enumerate() {
         for (d_idx, d) in f.declarations.iter().enumerate() {
-            by_fq.entry(d.fq_name.as_str()).or_default().push((f_idx, d_idx));
-            by_short.entry(d.name.as_str()).or_default().push((f_idx, d_idx));
+            by_fq
+                .entry(d.fq_name.as_str())
+                .or_default()
+                .push((f_idx, d_idx));
+            by_short
+                .entry(d.name.as_str())
+                .or_default()
+                .push((f_idx, d_idx));
         }
     }
 
@@ -340,7 +351,9 @@ pub fn evaluate_apex_with_index(
     let mut apex_count_by_sub: BTreeMap<String, usize> = BTreeMap::new();
 
     for entry in &manifest.apex {
-        *apex_count_by_sub.entry(entry.subsystem.clone()).or_insert(0) += 1;
+        *apex_count_by_sub
+            .entry(entry.subsystem.clone())
+            .or_insert(0) += 1;
 
         let Some(&f_idx) = lookup_file.get(&entry.module) else {
             let reason = format!(
@@ -660,14 +673,14 @@ pub fn evaluate_apex_with_index(
         options.max_islands.or(manifest.max_unwired_islands)
     };
 
-    if let Some(cap) = effective_island_cap {
-        if unwired_leaf_islands.len() > cap {
-            failure_reasons.push(format!(
-                "Unwired leaf islands ({}) exceed allowed cap ({})",
-                unwired_leaf_islands.len(),
-                cap
-            ));
-        }
+    if let Some(cap) = effective_island_cap
+        && unwired_leaf_islands.len() > cap
+    {
+        failure_reasons.push(format!(
+            "Unwired leaf islands ({}) exceed allowed cap ({})",
+            unwired_leaf_islands.len(),
+            cap
+        ));
     }
 
     let check_passed = all_apex_valid && failure_reasons.is_empty();
