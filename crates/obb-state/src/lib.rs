@@ -5,9 +5,10 @@
 //! - Caller-supplied `guard_passed: bool` self-attestation is eliminated from both campaign and
 //!   quest statechart transitions (`CampaignGuardEvidence`, `QuestGuardEvidence`).
 //! - Authoritative quest transitions (`Toothed`, `Landed`, `Claimed`, `Recorded`, and composite
-//!   verbs `take_quest`, `propose_quest`, `land_quest`) verify cryptographic `JudgeReceipt`s bound
+//!   verbs `take_quest`, `propose_quest`, `land_quest`) verify content-addressed `JudgeReceipt`s bound
 //!   to `(base_sha, head_sha, tree_oid)`, live trunk SHA freshness (`StaleBaseSha`), and non-overlapping
-//!   footprint leases (`FootprintLeaseConflict`, `FootprintViolation`).
+//!   footprint leases. A lease detects contention between quests (`FootprintLeaseConflict`); an
+//!   uncontended out-of-lease path extends the lease at `propose` and is recorded, never refused.
 //! - Emergency operator overrides record reality unconditionally in the append-only ledger with
 //!   `effective_regime = "AttestedOverride"` and `merged_ungated = true` without certifying the
 //!   quest as `decided` or `certified` (`obend-swarm` Finding 14).
@@ -1599,7 +1600,7 @@ impl StateStore {
             });
         }
 
-        // Compute live git diff `base_sha..head_sha` and enforce leased footprint
+        // Compute the live git diff `base_sha..head_sha`; callers decide what the lease means for it
         let diff_raw = run_git_ro(
             repo_root,
             &["diff", "--name-only", &receipt.base_sha, &receipt.head_sha],
@@ -1622,22 +1623,88 @@ impl StateStore {
             });
         }
 
-        if !q.footprint_lease.is_empty() {
-            let violating: Vec<String> = changed_paths
-                .iter()
-                .filter(|p| !path_within_footprint(p, &q.footprint_lease))
-                .cloned()
-                .collect();
-            if !violating.is_empty() {
-                return Err(StateRefusal::FootprintViolation {
-                    quest_id: q.id.clone(),
-                    violating_paths: violating,
-                    allowed_footprint: q.footprint_lease.clone(),
-                });
+        Ok(changed_paths)
+    }
+
+    /// Changed paths that fall outside the quest's footprint lease.
+    fn paths_outside_lease(q: &QuestRow, changed_paths: &[String]) -> Vec<String> {
+        if q.footprint_lease.is_empty() {
+            return Vec::new();
+        }
+        changed_paths
+            .iter()
+            .filter(|p| !path_within_footprint(p, &q.footprint_lease))
+            .cloned()
+            .collect()
+    }
+
+    /// A lease only grows through `propose_quest`, where the new paths are checked against
+    /// sibling leases. Any other receipt-bearing transition must stay inside the current lease.
+    fn enforce_lease(
+        q: &QuestRow,
+        changed_paths: &[String],
+    ) -> std::result::Result<(), StateRefusal> {
+        let violating = Self::paths_outside_lease(q, changed_paths);
+        if violating.is_empty() {
+            return Ok(());
+        }
+        Err(StateRefusal::FootprintViolation {
+            quest_id: q.id.clone(),
+            violating_paths: violating,
+            allowed_footprint: q.footprint_lease.clone(),
+        })
+    }
+
+    /// The lease is a contention detector, not an edit ceiling: a candidate that had to touch a
+    /// path nobody else holds (a shared type, a helper) gets that path added to its lease and the
+    /// expansion is recorded for convergence review. Only an overlap with another active quest's
+    /// lease is refused (`FootprintLeaseConflict`).
+    fn extend_footprint_lease(
+        &self,
+        quest_id: &str,
+        outside: &[String],
+        head_sha: &str,
+    ) -> std::result::Result<QuestRow, StateRefusal> {
+        let mut conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        let mut q = Self::load_quest_in_conn(&tx, quest_id)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?
+            .ok_or_else(|| StateRefusal::IllegalTransition {
+                machine: "quest".into(),
+                id: quest_id.into(),
+                from: "<missing>".into(),
+                to: "Toothed".into(),
+            })?;
+        Self::check_footprint_lease_conflicts(&tx, quest_id, &q.campaign_id, outside)?;
+        let declared = q.footprint_lease.clone();
+        for path in outside {
+            if !q.footprint_lease.contains(path) {
+                q.footprint_lease.push(path.clone());
             }
         }
-
-        Ok(changed_paths)
+        q.updated_at = Utc::now().to_rfc3339();
+        Self::upsert_quest_in_tx(&tx, &q)?;
+        self.append_ledger_or_refuse(
+            "quest.footprint_extended",
+            quest_id,
+            &format!(
+                "Quest `{quest_id}` candidate touched {} path(s) outside its declared footprint; lease extended",
+                outside.len()
+            ),
+            serde_json::json!({
+                "origin": q.origin,
+                "head_sha": head_sha,
+                "declared_footprint": declared,
+                "out_of_declared_footprint": outside,
+            }),
+        )?;
+        tx.commit()
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        Ok(q)
     }
 
     pub fn transition_quest(
@@ -1958,7 +2025,7 @@ impl StateStore {
                     repo_root,
                     trunk_branch,
                 } => {
-                    Self::verify_candidate_receipt(
+                    let changed = Self::verify_candidate_receipt(
                         &q,
                         "Q4",
                         receipt,
@@ -1966,6 +2033,7 @@ impl StateStore {
                         trunk_branch,
                         false,
                     )?;
+                    Self::enforce_lease(&q, &changed)?;
                     let first_tooth = receipt
                         .teeth_report
                         .results
@@ -2003,7 +2071,7 @@ impl StateStore {
                             ),
                         });
                     }
-                    Self::verify_candidate_receipt(
+                    let changed = Self::verify_candidate_receipt(
                         &q,
                         "Q5",
                         receipt,
@@ -2011,6 +2079,7 @@ impl StateStore {
                         trunk_branch,
                         true,
                     )?;
+                    Self::enforce_lease(&q, &changed)?;
                     // Verify trunk is now fast-forwarded to `receipt.head_sha` and `probe_git_q5` passes!
                     let live_trunk_sha = run_git_ro(
                         repo_root,
@@ -2080,7 +2149,7 @@ impl StateStore {
                             ),
                         });
                     }
-                    Self::verify_candidate_receipt(
+                    let changed = Self::verify_candidate_receipt(
                         &q,
                         "Q6",
                         receipt,
@@ -2088,6 +2157,7 @@ impl StateStore {
                         trunk_branch,
                         true,
                     )?;
+                    Self::enforce_lease(&q, &changed)?;
                     if let Some(ref landed) = q.landed_sha
                         && landed != &receipt.head_sha
                     {
@@ -2289,6 +2359,12 @@ impl StateStore {
         // Pre-verify full candidate receipt BEFORE advancing intermediate states (`Built`, `Wired`)
         let changed_paths =
             Self::verify_candidate_receipt(&cur, "Q4", receipt, repo_root, trunk_branch, false)?;
+        let outside = Self::paths_outside_lease(&cur, &changed_paths);
+        let cur = if outside.is_empty() {
+            cur
+        } else {
+            self.extend_footprint_lease(quest_id, &outside, &receipt.head_sha)?
+        };
 
         // Re-proposing when already `Toothed` (e.g. after rebasing onto an advanced trunk) updates
         // `(base_sha, proposed_head_sha, verified_receipt_hash)` atomically.
@@ -2319,6 +2395,18 @@ impl StateStore {
                 .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             return Ok(updated);
         }
+
+        // A candidate may delete files; only paths still present are artifacts to check on disk.
+        let present: Vec<String> = changed_paths
+            .iter()
+            .filter(|p| repo_root.join(p).exists())
+            .cloned()
+            .collect();
+        let changed_paths = if present.is_empty() {
+            changed_paths
+        } else {
+            present
+        };
 
         if cur.state == "Scoped" {
             self.transition_quest(
@@ -2426,7 +2514,10 @@ impl StateStore {
             });
         }
 
-        Self::verify_candidate_receipt(&cur, "Q5", receipt, repo_root, trunk_branch, true)?;
+        // Checked before the fast-forward: a refusal here must not leave trunk already moved.
+        let changed =
+            Self::verify_candidate_receipt(&cur, "Q5", receipt, repo_root, trunk_branch, true)?;
+        Self::enforce_lease(&cur, &changed)?;
 
         // Fast-forward `trunk_branch` to `receipt.head_sha` and remove merged side branch if any
         let current_branch = run_git_ro(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -3136,18 +3227,20 @@ impl StateStore {
     }
 
     fn enforce_host_headroom(&self, host: &str) -> std::result::Result<(), StateRefusal> {
-        let conn = self.conn().expect("sqlite connection");
+        let conn = self
+            .conn()
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        // `below_floor` also covers a local disk that could not be measured at all.
         let row: Option<(i64, f64)> = conn
             .query_row(
-                "SELECT reachable, avail_gb FROM machines WHERE host = ?1",
+                "SELECT below_floor, avail_gb FROM machines WHERE host = ?1",
                 params![host],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
-            .expect("query machine");
-        if let Some((reachable, avail_gb)) = row
-            && reachable != 0
-            && avail_gb < DISK_FREE_FLOOR_GB
+            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        if let Some((below_floor, avail_gb)) = row
+            && below_floor != 0
         {
             return Err(StateRefusal::DiskHeadroomFloor {
                 host: host.to_string(),
@@ -3170,16 +3263,28 @@ impl StateStore {
         {
             Ok(out) if out.status.success() => {
                 let s = String::from_utf8_lossy(&out.stdout);
-                let (avail_gb, total_gb) = parse_df_pk(&s).unwrap_or((100.0, 500.0));
-                MachineStatus {
-                    host: "local".to_string(),
-                    reachable: true,
-                    required_for_dispatch: true,
-                    avail_gb,
-                    total_gb,
-                    load_summary: "local workspace".to_string(),
-                    below_floor: avail_gb < DISK_FREE_FLOOR_GB,
-                    checked_at: now.clone(),
+                // An unreadable `df` is an unknown, never a made-up healthy reading.
+                match parse_df_pk(&s) {
+                    Some((avail_gb, total_gb)) => MachineStatus {
+                        host: "local".to_string(),
+                        reachable: true,
+                        required_for_dispatch: true,
+                        avail_gb,
+                        total_gb,
+                        load_summary: "local workspace".to_string(),
+                        below_floor: avail_gb < DISK_FREE_FLOOR_GB,
+                        checked_at: now.clone(),
+                    },
+                    None => MachineStatus {
+                        host: "local".to_string(),
+                        reachable: false,
+                        required_for_dispatch: true,
+                        avail_gb: 0.0,
+                        total_gb: 0.0,
+                        load_summary: "df output unparsable".to_string(),
+                        below_floor: true,
+                        checked_at: now.clone(),
+                    },
                 }
             }
             _ => MachineStatus {
@@ -3465,6 +3570,11 @@ impl StateStore {
                 pause_reasons.push(format!(
                     "machine `{}` free disk {:.2} GB < {:.1} GB floor",
                     m.host, m.avail_gb, DISK_FREE_FLOOR_GB
+                ));
+            } else if m.below_floor {
+                pause_reasons.push(format!(
+                    "machine `{}` free disk could not be measured ({})",
+                    m.host, m.load_summary
                 ));
             }
         }

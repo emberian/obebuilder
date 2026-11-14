@@ -8,8 +8,8 @@ use obb_broker::{
 use obb_cli::serve::run_server_with_options;
 use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
-    Gate, JudgeReceipt, TrustBase, check_revert_clean, check_succeed, check_well_formed,
-    evaluate_gate, issue_judge_receipt,
+    Gate, JudgeClock, JudgeReceipt, TrustBase, check_revert_clean, check_succeed,
+    check_well_formed, evaluate_gate_on, issue_judge_receipt,
 };
 use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
@@ -469,6 +469,11 @@ enum JudgeSubcommand {
         /// Write a SHA-bound `JudgeReceipt` JSON file for `obb state propose` / `obb state land`
         #[arg(long)]
         emit_receipt: Option<PathBuf>,
+
+        /// Construction clock: static floors only. Executed `#tooth` runs and `home N` revert
+        /// merges are deferred and listed; the result is at most `attested` and issues no receipt
+        #[arg(long, conflicts_with = "emit_receipt")]
+        fast: bool,
 
         #[arg(long)]
         json: bool,
@@ -1199,6 +1204,7 @@ async fn run() -> Result<ExitCode> {
                 base,
                 emit_receipt,
                 strict_tests,
+                fast,
                 json,
             } => {
                 let jpath = resolve_judge_path(&cli.workspace, judge);
@@ -1246,7 +1252,12 @@ async fn run() -> Result<ExitCode> {
                     });
                 }
 
-                let rep = evaluate_gate(&gate, &repo)?;
+                let clock = if fast {
+                    JudgeClock::Construction
+                } else {
+                    JudgeClock::Convergence
+                };
+                let rep = evaluate_gate_on(&gate, &repo, clock)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&rep)?);
                 } else {
@@ -1254,6 +1265,9 @@ async fn run() -> Result<ExitCode> {
                         "obb judge check: gate=`{}` repo=`{}` all_passed={} achieved_regime={}",
                         rep.judge_name, rep.repo_root, rep.all_passed, rep.achieved_regime
                     );
+                    for floor in &rep.deferred_floors {
+                        println!("  [DEFERRED] {floor} (not run on the construction clock)");
+                    }
                     for ev in &rep.evaluations {
                         let tag = if ev.passed { "PASS" } else { "FAIL" };
                         println!(
@@ -1853,7 +1867,7 @@ async fn run() -> Result<ExitCode> {
                                 ev.event_type,
                                 ev.entity_id,
                                 ev.summary,
-                                &ev.event_hash[..12]
+                                ev.event_hash.get(..12).unwrap_or(&ev.event_hash)
                             );
                         }
                     }

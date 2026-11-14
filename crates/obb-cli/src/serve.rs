@@ -11,7 +11,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::get;
 use obb_core::LintReport;
-use obb_judge::{Gate, evaluate_gate};
+use obb_judge::{Gate, JudgeClock, evaluate_gate_on};
 use obb_lint::run_repo_lints;
 use obb_state::StateStore;
 use sha2::{Digest, Sha256};
@@ -229,42 +229,69 @@ pub async fn run_server_with_options(
     Ok(())
 }
 
+/// Run filesystem / SQLite / git work off the async executor so one slow scan cannot stall
+/// every other request and the SSE stream.
+async fn blocking_json<F>(work: F) -> Json<serde_json::Value>
+where
+    F: FnOnce() -> serde_json::Value + Send + 'static,
+{
+    Json(
+        tokio::task::spawn_blocking(work)
+            .await
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() })),
+    )
+}
+
 async fn api_status(State(cfg): State<ServeConfig>) -> impl IntoResponse {
-    match StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
-        .and_then(|s| s.snapshot())
-    {
-        Ok(snap) => Json(serde_json::to_value(snap).unwrap_or_default()),
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+    blocking_json(move || {
+        match StateStore::open_with_state_dir(&cfg.workspace_root, cfg.state_dir.as_deref())
+            .and_then(|s| s.snapshot())
+        {
+            Ok(snap) => serde_json::to_value(snap).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        }
+    })
+    .await
 }
 
 async fn api_lints(State(cfg): State<ServeConfig>) -> impl IntoResponse {
-    if let Some(cached) = cfg.cached_lint.read().unwrap().clone() {
-        return Json(serde_json::to_value(cached).unwrap_or_default());
-    }
-    match run_repo_lints(&cfg.target_repo) {
-        Ok(rep) => {
-            *cfg.cached_lint.write().unwrap() = Some(rep.clone());
-            Json(serde_json::to_value(rep).unwrap_or_default())
+    blocking_json(move || {
+        let cached = cfg.cached_lint.read().ok().and_then(|guard| guard.clone());
+        if let Some(cached) = cached {
+            return serde_json::to_value(cached).unwrap_or_default();
         }
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+        match run_repo_lints(&cfg.target_repo) {
+            Ok(rep) => {
+                if let Ok(mut slot) = cfg.cached_lint.write() {
+                    *slot = Some(rep.clone());
+                }
+                serde_json::to_value(rep).unwrap_or_default()
+            }
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        }
+    })
+    .await
 }
 
+/// The dashboard polls this, so it runs on the construction clock: static floors only, with
+/// executed teeth and revert merges listed under `deferred_floors` instead of re-run per poll.
 async fn api_judge(State(cfg): State<ServeConfig>) -> impl IntoResponse {
-    match Gate::load_from_path(&cfg.judge_path) {
-        Ok(gate) => match evaluate_gate(&gate, &cfg.workspace_root) {
-            Ok(eval) => Json(serde_json::json!({
-                "gate": gate,
-                "evaluation": eval,
-            })),
-            Err(e) => Json(serde_json::json!({
-                "gate": gate,
-                "evaluation_error": e.to_string(),
-            })),
-        },
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+    blocking_json(move || match Gate::load_from_path(&cfg.judge_path) {
+        Ok(gate) => {
+            match evaluate_gate_on(&gate, &cfg.workspace_root, JudgeClock::Construction) {
+                Ok(eval) => serde_json::json!({
+                    "gate": gate,
+                    "evaluation": eval,
+                }),
+                Err(e) => serde_json::json!({
+                    "gate": gate,
+                    "evaluation_error": e.to_string(),
+                }),
+            }
+        }
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    })
+    .await
 }
 
 async fn sse_events(
@@ -436,11 +463,18 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         api('/api/judge'),
         api('/api/lints')
       ]);
-      if (!st.error) renderStatus(st);
+      if (st.error) document.getElementById('subtitle').textContent = `state unavailable: ${st.error}`;
+      else renderStatus(st);
 
       const jb = document.getElementById('judge-box');
-      if (jd.evaluation) {
-        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Achieved: <span class="badge info">${esc(jd.evaluation.achieved_regime)}</span> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` +
+      if (jd.error || jd.evaluation_error) {
+        jb.innerHTML = `<span class="badge err">JUDGE UNAVAILABLE</span> ${esc(jd.error || jd.evaluation_error)}`;
+      } else if (jd.evaluation) {
+        const deferred = jd.evaluation.deferred_floors || [];
+        const deferredNote = deferred.length
+          ? `<div class="muted" style="margin-bottom:8px">Not run here (convergence only, <code>obb judge check</code>): <code>${esc(deferred.join(', '))}</code></div>`
+          : '';
+        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Achieved: <span class="badge info">${esc(jd.evaluation.achieved_regime)}</span> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` + deferredNote +
           '<table><tr><th>Floor</th><th>Regime</th><th>Measured</th><th>Bound</th><th>Pass</th></tr>' +
           jd.evaluation.evaluations.map(ev =>
             `<tr><td><code>${esc(ev.floor)}</code></td><td><span class="badge info">${esc(ev.regime)}</span></td><td>${ev.measured}</td><td>${esc(ev.bound)}</td><td><span class="badge ${ev.passed ? 'ok' : 'err'}">${ev.passed ? 'PASS' : 'FAIL'}</span></td></tr>`
@@ -448,9 +482,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
 
       const lb = document.getElementById('lints-box');
-      if (ln && ln.by_rule) {
+      if (ln && ln.error) {
+        lb.innerHTML = `<span class="badge err">LINT UNAVAILABLE</span> ${esc(ln.error)}`;
+      } else if (ln && ln.by_rule) {
         const rules = Object.entries(ln.by_rule).sort((a,b) => b[1] - a[1]);
-        lb.innerHTML = `<div style="margin-bottom:8px">Target: <code>${esc(ln.repo_root)}</code> — <b>${ln.total_findings}</b> findings (${ln.errors} errors, ${ln.warnings} warnings) across ${ln.files_scanned} files</div>` +
+        lb.innerHTML = `<div style="margin-bottom:8px">Target: <code>${esc(ln.repo_root)}</code> — <b>${ln.total_findings}</b> findings (${ln.errors} errors, ${ln.warnings} warnings) across ${ln.files_scanned} files <span class="muted">(scan of ${esc(ln.generated_at)}; cached, not live)</span></div>` +
           '<table><tr><th>Rule</th><th>Count</th></tr>' +
           rules.map(([r, c]) => `<tr><td><code>${esc(r)}</code></td><td>${c}</td></tr>`).join('') +
           '</table>';

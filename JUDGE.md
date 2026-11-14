@@ -36,8 +36,11 @@ process (`PROCESS.md`), what `obb v7` (`0.7.0`) enforces mechanically, and which
   - `planted_fault_red` executes positive (`exit == 0`) and mutated negative (`exit != 0`) controls inside disposable `/private/tmp` sandboxes without touching the candidate working tree; static/index presence is segregated under `tooth_structural_presence` (`eval:lexical`, `attested`).
   - `home N` corrigibility (`obb judge check-revert`) runs 3-way `git merge-tree --write-tree` in a scratch bare repo via read-only `objects/info/alternates`.
   - `obb judge succeed` enforces G4 floor/cap non-regression and persists `LobCost` succession records to the SHA-256 hash-chained ledger (`obb ledger verify`).
-  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans.
+  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans. The receipt hash is unkeyed SHA-256: it makes a receipt tamper-evident and binds it to one tree, and `obb-state` re-derives the git facts itself, but it does not prove who ran the judge. Floor and tooth verdicts are read from the receipt.
+  - Two clocks. `obb judge check --fast` is the construction clock: static floors and recorded measurements only, executed `#tooth` runs and `home N` revert merges listed as `deferred_floors`, result at most `attested`, no receipt (`--fast` conflicts with `--emit-receipt`). Plain `obb judge check` is the convergence clock and runs everything. `obb serve` polls on the construction clock.
 - **What does not exist yet**:
+  - Input-cone receipt reuse. Floors do not declare their inputs, so every convergence check re-runs every tooth even when the change is outside what the tooth reads. A receipt keyed on `(check id, tree hashes of declared inputs, runner digest)` is the intended shape.
+  - Authenticated receipts (a keyed MAC or signature held outside the agent's reach).
   - The Lean `Habitat.State` instance over git (`(commit, ledger)`, `step` as applying a landed diff, and machine-checked Lean proofs of `Method.lemma` floor preservation for `revert@1` and path-disjoint edits in `~/dev/obend/lean/Obend/Judge/Genealogy.lean`).
   - Workstream 9's landing condition: self-modification of `obb` and `obend`'s kernel judged directly inside a proved Lean git habitat.
 
@@ -48,7 +51,9 @@ exercise the Rust workspace. Run `obb judge show`, `obb lint --repo . --strict -
 and `obb judge check --repo . --strict-tests` for the configured self-check.
 Neither the structural scanner nor the built-in mutation probe invokes Lean or Lake.
 
-`--strict-tests` checks Rust test attributes, JS/TS test calls, Python test definitions
+`--strict-tests` checks Rust test attributes (`#[test]`, any `#[<path>::test]`, `#[cfg(test)]`,
+`#![cfg(test)]`; `#[cfg(not(test))]` is library code), JS/TS test calls with a literal name
+(`describe`/`it`/`test`, including `.only`/`.skip`), Python test definitions
 and TestCase references, and Lean test commands in library sources. The scanner keeps
 line positions while excluding comments and literals. Tests live in dedicated test files
 or directories; the repository's Rust tests and SSH test executor now live under `tests/`.

@@ -150,11 +150,11 @@ fn tokens(source: &str, language: Language) -> Vec<Token> {
         if i == start && language == Language::Rust && c[i] == '\'' {
             let mut j = i + 1;
             if c.get(j) == Some(&'\\') {
+                // `'\''`, `'\n'`, `'\x41'`, `'\u{10FFFF}'`: skip the escaped char, then scan the
+                // short escape body to its closing quote.
                 j += 2;
-                if c.get(j - 1) == Some(&'u') && c.get(j) == Some(&'{') {
-                    while j < c.len() && c[j] != '}' {
-                        j += 1;
-                    }
+                let limit = (j + 10).min(c.len());
+                while j < limit && c[j] != '\'' && c[j] != '\n' {
                     j += 1;
                 }
             } else {
@@ -228,6 +228,61 @@ fn tokens(source: &str, language: Language) -> Vec<Token> {
     out
 }
 
+/// `#[test]`, `#[<runtime>::test(..)]`, `#[cfg(test)]` and the inner `#![cfg(test)]` form.
+/// `#[cfg(not(test))]` gates library code and is not a test declaration.
+fn rust_test_attribute(ts: &[Token], i: usize) -> bool {
+    let text = |k: usize| ts.get(k).map(|t| t.text.as_str()).unwrap_or("");
+    if text(i) != "#" {
+        return false;
+    }
+    let open = if text(i + 1) == "!" { i + 2 } else { i + 1 };
+    if text(open) != "[" {
+        return false;
+    }
+    let attr: Vec<&str> = ts[open + 1..]
+        .iter()
+        .take_while(|t| t.text != "]")
+        .map(|t| t.text.as_str())
+        .collect();
+    let path_len = attr
+        .iter()
+        .position(|t| matches!(*t, "(" | "="))
+        .unwrap_or(attr.len());
+    let path = &attr[..path_len];
+    if path.last() == Some(&"test") {
+        return true;
+    }
+    path.len() == 1
+        && path[0] == "cfg"
+        && attr.iter().enumerate().any(|(k, t)| {
+            *t == "test"
+                && !(k >= 2
+                    && attr[k - 1] == "("
+                    && attr[k - 2] == "not"
+                    && attr.get(k + 1) == Some(&")"))
+        })
+}
+
+/// `describe('..', ..)`, `it("..", ..)`, `test(`..`, ..)` and their `.only` / `.skip` /
+/// `.concurrent` / `.todo` forms. The name must be a literal: `test(value)` is an ordinary call
+/// (or a method definition) in library code, not a test declaration.
+fn javascript_test_call(ts: &[Token], i: usize) -> bool {
+    let text = |k: usize| ts.get(k).map(|t| t.text.as_str()).unwrap_or("");
+    if !matches!(text(i), "describe" | "it" | "test")
+        || (i > 0 && matches!(ts[i - 1].text.as_str(), "." | "function"))
+    {
+        return false;
+    }
+    let open = if text(i + 1) == "."
+        && matches!(text(i + 2), "only" | "skip" | "concurrent" | "todo")
+    {
+        i + 3
+    } else {
+        i + 1
+    };
+    text(open) == "(" && text(open + 1) == "<literal>"
+}
+
 fn test_path(path: &str) -> bool {
     let parts: Vec<_> = path.split('/').collect();
     let file = parts.last().copied().unwrap_or("");
@@ -280,26 +335,8 @@ pub fn scan_test_in_library(root: &Path) -> Result<Vec<Finding>> {
         for (i, token) in ts.iter().enumerate() {
             let at = |k: usize| ts.get(i + k).map(|t| t.text.as_str()).unwrap_or("");
             let matches = match language {
-                Language::Rust => {
-                    if at(0) != "#" || at(1) != "[" {
-                        false
-                    } else {
-                        let attr: Vec<_> = ts[i + 2..]
-                            .iter()
-                            .take_while(|t| t.text != "]")
-                            .map(|t| t.text.as_str())
-                            .collect();
-                        attr == ["test"]
-                            || attr == ["tokio", ":", ":", "test"]
-                            || attr.starts_with(&["tokio", ":", ":", "test", "("])
-                            || (attr.first() == Some(&"cfg") && attr.contains(&"test"))
-                    }
-                }
-                Language::JavaScript => {
-                    matches!(at(0), "describe" | "it" | "test")
-                        && at(1) == "("
-                        && (i == 0 || !matches!(ts[i - 1].text.as_str(), "." | "function"))
-                }
+                Language::Rust => rust_test_attribute(&ts, i),
+                Language::JavaScript => javascript_test_call(&ts, i),
                 Language::Python => {
                     (at(0) == "def" && at(1).starts_with("test_"))
                         || [at(0), at(1), at(2)] == ["unittest", ".", "TestCase"]

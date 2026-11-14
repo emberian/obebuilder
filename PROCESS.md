@@ -139,10 +139,17 @@ Every transition above names a guard. Each guard is computable today from one of
 the elaborated Lean environment (the unified instrument of `DESIGN.md` §2.6, classes 1 to 10),
 the transcripts (`cv events`, `cv doctor`, `cv deferrals`, `cv lanes`), or the repository (git
 and the ledger). None is a question to the agent, and `obb-state` (`0.7.0`) never accepts a
-caller-supplied boolean in place of guard evidence: `obb state take` (`Q1`) acquires an exclusive
+caller-supplied boolean in place of guard evidence: `obb state take` (`Q1`) acquires a
 non-overlapping path lease (`FootprintLeaseConflict`) pinned to trunk `base_sha`; `obb state propose`
 (`Q4`) and `obb state land` (`Q5`) verify a SHA-bound `JudgeReceipt` (`TamperedReceipt`,
-`FootprintViolation`, `StaleBaseSha` if trunk moved) with an executed red `#tooth`. An emergency
+`StaleBaseSha` if trunk moved) with an executed red `#tooth`. The lease detects contention; it is
+not an edit ceiling. A candidate that touches a path outside its declared lease is refused at
+`propose` only when another active quest holds that path (`FootprintLeaseConflict`). Otherwise the
+lease grows to cover it and a `quest.footprint_extended` ledger event lists the
+`out_of_declared_footprint` paths for convergence review, so a quest never has to copy a shared
+type into its own directory to stay legal. `land` accepts only what `propose` leased
+(`FootprintViolation`). There is no required-files list: touching fewer files, or deleting some,
+is always allowed. An emergency
 operator bypass (`obb state land --override-operator <who> --override-reason <why>`) records the
 merge unconditionally in the ledger with `effective_regime = "AttestedOverride"` and
 `merged_ungated = true`, refusing promotion to `Claimed` or `Recorded` as `decided`/`certified`.

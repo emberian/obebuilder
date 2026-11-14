@@ -920,9 +920,32 @@ pub struct JudgeCheckReport {
     pub basis: Vec<TrustBase>,
     pub teeth_report: TeethReport,
     pub evaluations: Vec<FloorEvaluation>,
+    #[serde(default)]
+    pub clock: JudgeClock,
+    /// Floors not evaluated on this clock. `all_passed` speaks only for `evaluations`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_floors: Vec<String>,
 }
 
-/// Cryptographically bound candidate evaluation receipt consumed by `obb-state` transitions.
+/// Which clock a gate evaluation runs on.
+///
+/// `Construction` is the inner loop: static scans and recorded measurements only. Executed
+/// `#tooth` sandboxes and the `home N` revert merges are deferred, the result is never better
+/// than `attested`, and no `JudgeReceipt` is issued from it. `Convergence` runs everything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeClock {
+    #[default]
+    Convergence,
+    Construction,
+}
+
+/// Content-addressed candidate evaluation receipt consumed by `obb-state` transitions.
+///
+/// `receipt_hash` is an unkeyed SHA-256 over the other fields: it detects edits to a receipt and
+/// binds it to `(gate_sha256, base_sha, head_sha, tree_oid)`, but it does not authenticate who
+/// produced it. `obb-state` independently re-checks the git facts; the floor and tooth verdicts
+/// are taken from the receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeReceipt {
     pub receipt_version: u32,
@@ -1614,7 +1637,18 @@ pub fn evaluate_teeth(repo_root: &Path, specs: &[ToothSpec]) -> Result<TeethRepo
 
 /// Evaluate all floors of `gate` against `repo_root` (100% read-only on `repo_root`).
 pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> {
+    evaluate_gate_on(gate, repo_root, JudgeClock::Convergence)
+}
+
+/// Evaluate `gate` on the given clock (see [`JudgeClock`]).
+pub fn evaluate_gate_on(
+    gate: &Gate,
+    repo_root: &Path,
+    clock: JudgeClock,
+) -> Result<JudgeCheckReport> {
     check_well_formed(gate).context("judge failed WellFormed check")?;
+    let fast = clock == JudgeClock::Construction;
+    let mut deferred_floors = Vec::new();
 
     let canon = repo_root
         .canonicalize()
@@ -1675,7 +1709,7 @@ pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> 
         .iter()
         .any(|fl| fl.cell_key() == "planted_fault_red");
     let teeth_specs = load_repo_teeth(gate, &canon)?;
-    let teeth_report = if gate_needs_teeth || !teeth_specs.is_empty() {
+    let teeth_report = if !fast && (gate_needs_teeth || !teeth_specs.is_empty()) {
         evaluate_teeth(&canon, &teeth_specs)?
     } else {
         TeethReport::default()
@@ -1686,6 +1720,10 @@ pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> 
     let mut evaluations = Vec::new();
 
     for fl in &gate.floors {
+        if fast && matches!(fl.cell_key(), "home_revert_clean" | "planted_fault_red") {
+            deferred_floors.push(fl.to_wire());
+            continue;
+        }
         let claims_kernel = gate.floor_claims_kernel(fl);
         match fl {
             Floor::Home(n) => {
@@ -1781,7 +1819,7 @@ pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> 
             .results
             .iter()
             .any(|r| r.positive_exit == Some(0) && r.negative_exit.is_some());
-    let achieved_regime = if !all_passed {
+    let achieved_regime = if !all_passed || fast {
         Regime::Attested
     } else if kernel_verified_any || teeth_executed_bit {
         Regime::Decided
@@ -1802,6 +1840,8 @@ pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> 
         basis: gate.basis.clone(),
         teeth_report,
         evaluations,
+        clock,
+        deferred_floors,
     })
 }
 

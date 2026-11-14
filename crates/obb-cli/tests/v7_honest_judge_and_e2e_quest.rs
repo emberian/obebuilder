@@ -845,7 +845,28 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
         "expected FootprintLeaseConflict, got {overlap_err:?}"
     );
 
-    // 4. Test out-of-footprint violation (`docs/rogue.md` outside lease)
+    // 4. An out-of-lease edit is refused only when it collides with another active lease
+    //    (`docs/rogue.md` lands inside `Q-docs`'s `docs/` lease).
+    store
+        .create_quest(
+            "Q-docs",
+            "C-live",
+            "Own the docs tree",
+            "lane-gamma",
+            "attested",
+        )
+        .unwrap();
+    store
+        .take_quest(
+            "Q-docs",
+            "lane-gamma",
+            "Docs sweep",
+            vec!["docs/".into()],
+            1.0,
+            &repo,
+            "main",
+        )
+        .unwrap();
     git_cmd(&repo, &["checkout", "-b", "quest/Q-e2e"]);
     write_rel(&repo, "docs/rogue.md", "# Out of footprint\n");
     write_rel(
@@ -881,9 +902,12 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
         .propose_quest("Q-e2e", "lane-alpha", &rogue_receipt, &repo, "main")
         .unwrap_err();
     assert!(
-        matches!(fp_err, StateRefusal::FootprintViolation { ref violating_paths, .. } if violating_paths == &vec!["docs/rogue.md".to_string()]),
-        "expected FootprintViolation on docs/rogue.md, got {fp_err:?}"
+        matches!(fp_err, StateRefusal::FootprintLeaseConflict { ref requested, ref conflicting_quest, .. } if requested == "docs/rogue.md" && conflicting_quest == "Q-docs"),
+        "expected FootprintLeaseConflict on docs/rogue.md against Q-docs, got {fp_err:?}"
     );
+    let q_refused = store.get_quest("Q-e2e").unwrap().unwrap();
+    assert_eq!(q_refused.state, "Scoped");
+    assert!(!q_refused.footprint_lease.iter().any(|p| p.starts_with("docs")));
 
     // 5. Reset to `main` and commit an in-footprint candidate whose tooth is VACUOUS (`VACUOUS` caught!)
     git_cmd(&repo, &["reset", "--hard", "main"]);
@@ -967,7 +991,13 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
         "teeth.json",
         &serde_json::to_string_pretty(&biting_spec).unwrap(),
     );
-    git_cmd(&repo, &["add", "tests/test_calc.py", "teeth.json"]);
+    // `shared/util.txt` is outside the declared lease and held by nobody: the lease grows to
+    // cover it instead of forcing the candidate to duplicate the shared file locally.
+    write_rel(&repo, "shared/util.txt", "shared helper\n");
+    git_cmd(
+        &repo,
+        &["add", "tests/test_calc.py", "teeth.json", "shared/util.txt"],
+    );
     git_cmd(
         &repo,
         &[
@@ -1020,6 +1050,19 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
     );
     let q_toothed = store.get_quest("Q-e2e").unwrap().unwrap();
     assert_eq!(q_toothed.state, "Toothed");
+    assert!(
+        q_toothed
+            .footprint_lease
+            .iter()
+            .any(|p| p == "shared/util.txt"),
+        "uncontended out-of-lease path must extend the lease: {:?}",
+        q_toothed.footprint_lease
+    );
+    assert!(store.read_ledger().unwrap().iter().any(|e| {
+        e.event_type == "quest.footprint_extended"
+            && e.entity_id == "Q-e2e"
+            && e.payload["out_of_declared_footprint"] == serde_json::json!(["shared/util.txt"])
+    }));
 
     // 7. Advance `main` with an independent commit so `good_receipt.base_sha` becomes STALE!
     git_cmd(&repo, &["checkout", "main"]);
@@ -1346,7 +1389,18 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
     }
     let converged = store.snapshot().unwrap();
     assert_eq!(converged.verified_quest_count, 2);
-    assert!(converged.quests.iter().all(|q| q.state == "Recorded"));
+    // `Q-docs` only exists to hold the contended `docs/` lease in step 4 and stays `Scoped`.
+    assert!(
+        converged
+            .quests
+            .iter()
+            .filter(|q| q.id != "Q-docs")
+            .all(|q| q.state == "Recorded")
+    );
+    assert_eq!(
+        store.get_quest("Q-docs").unwrap().unwrap().state,
+        "Scoped"
+    );
     assert!(StateStore::probe_git_q5(&repo).unwrap().q5_passed);
     assert!(git_cmd(&repo, &["status", "--porcelain"]).trim().is_empty());
     cli_ok(&["ledger", "--state-dir", state, "verify"]);
@@ -1824,5 +1878,63 @@ test('real', () => {});
                 serde_json::json!({})
             )
             .is_err()
+    );
+}
+
+#[test]
+fn scanner_skips_cfg_not_test_and_plain_calls_but_catches_inner_attrs_and_focused_tests() {
+    let tmp = temp_in_private_tmp("obb-v7-scanner-edges-");
+    write_rel(
+        tmp.path(),
+        "src/lib.rs",
+        r#"#[cfg(not(test))]
+pub fn prod() {}
+pub const X: char = '\x41';
+pub const Q: char = '\'';
+#[async_std::test]
+async fn runtime_case() {}
+"#,
+    );
+    write_rel(tmp.path(), "src/inner.rs", "#![cfg(test)]\nfn helper() {}\n");
+    write_rel(
+        tmp.path(),
+        "src/lib.ts",
+        r#"export function check(value: string) { return test(value); }
+class Probe { test(value: string) { return value; } }
+it.only('focused', () => {});
+"#,
+    );
+    let mut got: Vec<(String, usize)> =
+        obb_lint::test_in_library::scan_test_in_library(tmp.path())
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.line))
+            .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("src/inner.rs".to_string(), 1),
+            ("src/lib.rs".to_string(), 5),
+            ("src/lib.ts".to_string(), 3),
+        ]
+    );
+}
+
+#[test]
+fn construction_clock_defers_teeth_and_revert_floors_and_never_exceeds_attested() {
+    use obb_judge::{JudgeClock, evaluate_gate_on};
+    let workspace = workspace_root();
+    let gate = Gate::load_from_path(&workspace.join("judge.json")).unwrap();
+    let report = evaluate_gate_on(&gate, &workspace, JudgeClock::Construction).unwrap();
+    assert_eq!(report.clock, JudgeClock::Construction);
+    assert_eq!(report.achieved_regime, Regime::Attested);
+    assert_eq!(report.teeth_report.total, 0);
+    assert!(report.deferred_floors.iter().any(|f| f.starts_with("home ")));
+    assert!(
+        report
+            .evaluations
+            .iter()
+            .all(|e| e.cell != "home_revert_clean" && e.cell != "planted_fault_red")
     );
 }
