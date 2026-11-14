@@ -17,7 +17,6 @@ use obb_state::StateStore;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio_stream::StreamExt;
@@ -30,22 +29,16 @@ pub struct ServeConfig {
     pub target_repo: PathBuf,
     pub judge_path: PathBuf,
     bearer_digest: Option<[u8; 32]>,
-    pub cached_lint: Arc<RwLock<Option<LintReport>>>,
 }
 
 impl ServeConfig {
     pub fn new(workspace_root: PathBuf, target_repo: PathBuf, judge_path: PathBuf) -> Self {
-        let baseline_path = workspace_root.join("reports/obend-baseline.json");
-        let initial_lint = std::fs::read_to_string(&baseline_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<LintReport>(&s).ok());
         Self {
             workspace_root,
             state_dir: None,
             target_repo,
             judge_path,
             bearer_digest: None,
-            cached_lint: Arc::new(RwLock::new(initial_lint)),
         }
     }
 
@@ -256,18 +249,52 @@ async fn api_status(State(cfg): State<ServeConfig>) -> impl IntoResponse {
 
 async fn api_lints(State(cfg): State<ServeConfig>) -> impl IntoResponse {
     blocking_json(move || {
-        let cached = cfg.cached_lint.read().ok().and_then(|guard| guard.clone());
-        if let Some(cached) = cached {
-            return serde_json::to_value(cached).unwrap_or_default();
+        if !cfg.target_repo.is_dir() {
+            return serde_json::json!({ "error": "lint target directory is unavailable", "source": "live" });
         }
+        // Scan the target on every request, including dirty/untracked files. The baseline is
+        // comparison data only; neither a committed report nor an old scan substitutes for it.
         match run_repo_lints(&cfg.target_repo) {
             Ok(rep) => {
-                if let Ok(mut slot) = cfg.cached_lint.write() {
-                    *slot = Some(rep.clone());
-                }
-                serde_json::to_value(rep).unwrap_or_default()
+                let baseline = [
+                    cfg.target_repo.join("reports/obend-baseline.json"),
+                    cfg.workspace_root.join("reports/obend-baseline.json"),
+                ]
+                .into_iter()
+                .find_map(|path| {
+                    let report: LintReport =
+                        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+                    let baseline_repo = Path::new(&report.repo_root).canonicalize().ok()?;
+                    (Some(baseline_repo) == cfg.target_repo.canonicalize().ok()).then_some(report)
+                });
+                let delta = baseline.as_ref().map(|base| {
+                    let rules: std::collections::BTreeSet<_> =
+                        base.by_rule.keys().chain(rep.by_rule.keys()).collect();
+                    let by_rule: std::collections::BTreeMap<_, _> = rules
+                        .into_iter()
+                        .map(|rule| {
+                            (
+                                rule,
+                                *rep.by_rule.get(rule).unwrap_or(&0) as i128
+                                    - *base.by_rule.get(rule).unwrap_or(&0) as i128,
+                            )
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "baseline_generated_at": base.generated_at,
+                        "total_findings": rep.total_findings as i128 - base.total_findings as i128,
+                        "errors": rep.errors as i128 - base.errors as i128,
+                        "warnings": rep.warnings as i128 - base.warnings as i128,
+                        "by_rule": by_rule,
+                    })
+                });
+                let mut response = serde_json::to_value(&rep).unwrap_or_default();
+                response["source"] = serde_json::json!("live");
+                response["scanned_at"] = serde_json::json!(rep.generated_at);
+                response["delta"] = serde_json::json!(delta);
+                response
             }
-            Err(e) => serde_json::json!({ "error": e.to_string() }),
+            Err(e) => serde_json::json!({ "error": e.to_string(), "source": "live" }),
         }
     })
     .await
@@ -277,18 +304,16 @@ async fn api_lints(State(cfg): State<ServeConfig>) -> impl IntoResponse {
 /// executed teeth and revert merges listed under `deferred_floors` instead of re-run per poll.
 async fn api_judge(State(cfg): State<ServeConfig>) -> impl IntoResponse {
     blocking_json(move || match Gate::load_from_path(&cfg.judge_path) {
-        Ok(gate) => {
-            match evaluate_gate_on(&gate, &cfg.workspace_root, JudgeClock::Construction) {
-                Ok(eval) => serde_json::json!({
-                    "gate": gate,
-                    "evaluation": eval,
-                }),
-                Err(e) => serde_json::json!({
-                    "gate": gate,
-                    "evaluation_error": e.to_string(),
-                }),
-            }
-        }
+        Ok(gate) => match evaluate_gate_on(&gate, &cfg.workspace_root, JudgeClock::Construction) {
+            Ok(eval) => serde_json::json!({
+                "gate": gate,
+                "evaluation": eval,
+            }),
+            Err(e) => serde_json::json!({
+                "gate": gate,
+                "evaluation_error": e.to_string(),
+            }),
+        },
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     })
     .await
@@ -486,7 +511,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         lb.innerHTML = `<span class="badge err">LINT UNAVAILABLE</span> ${esc(ln.error)}`;
       } else if (ln && ln.by_rule) {
         const rules = Object.entries(ln.by_rule).sort((a,b) => b[1] - a[1]);
-        lb.innerHTML = `<div style="margin-bottom:8px">Target: <code>${esc(ln.repo_root)}</code> — <b>${ln.total_findings}</b> findings (${ln.errors} errors, ${ln.warnings} warnings) across ${ln.files_scanned} files <span class="muted">(scan of ${esc(ln.generated_at)}; cached, not live)</span></div>` +
+        lb.innerHTML = `<div style="margin-bottom:8px">Target: <code>${esc(ln.repo_root)}</code> — <b>${ln.total_findings}</b> findings (${ln.errors} errors, ${ln.warnings} warnings) across ${ln.files_scanned} files <span class="muted">(live scan ${esc(ln.scanned_at)})${ln.delta ? `; findings delta ${ln.delta.total_findings >= 0 ? '+' : ''}${ln.delta.total_findings} since ${esc(ln.delta.baseline_generated_at)}` : '; no matching baseline'}</span></div>` +
           '<table><tr><th>Rule</th><th>Count</th></tr>' +
           rules.map(([r, c]) => `<tr><td><code>${esc(r)}</code></td><td>${c}</td></tr>`).join('') +
           '</table>';

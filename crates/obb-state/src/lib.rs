@@ -1426,6 +1426,7 @@ impl StateStore {
     /// Verify a `JudgeReceipt` against live git state, trunk SHA freshness, `#tooth` execution,
     /// footprint lease, and `target_regime`.
     fn verify_candidate_receipt(
+        &self,
         q: &QuestRow,
         guard_name: &str,
         receipt: &JudgeReceipt,
@@ -1439,6 +1440,29 @@ impl StateStore {
                 quest_id: q.id.clone(),
                 reason: format!("{e:#}"),
             })?;
+
+        let key = obb_judge::receipt_auth::load_receipt_key(Some(&self.state_dir), repo_root)
+            .map_err(|e| StateRefusal::TamperedReceipt {
+                quest_id: q.id.clone(),
+                reason: format!("{e:#}"),
+            })?;
+        if let Some(key) = key {
+            receipt
+                .verify_authenticated(&key)
+                .map_err(|e| StateRefusal::TamperedReceipt {
+                    quest_id: q.id.clone(),
+                    reason: format!("{e:#}"),
+                })?;
+        }
+        if guard_name == "Q5"
+            && (q.proposed_head_sha.as_deref() != Some(receipt.head_sha.as_str())
+                || q.verified_receipt_hash.as_deref() != Some(receipt.receipt_hash.as_str()))
+        {
+            return Err(StateRefusal::GuardFailed {
+                guard: guard_name.into(),
+                reason: "land receipt does not match proposed (candidate_sha, receipt_hash); propose it first".into(),
+            });
+        }
 
         if !receipt.all_passed {
             let failed_cells: Vec<String> = receipt
@@ -1950,18 +1974,44 @@ impl StateStore {
                     repo_root,
                     artifacts,
                 } => {
-                    if artifacts.is_empty() {
+                    // A committed deletion is a real artifact even though its old path is absent.
+                    let deleted_files = if let Some(base) = &q.base_sha {
+                        run_git_ro(
+                            repo_root,
+                            &[
+                                "diff",
+                                "--name-only",
+                                "--diff-filter=D",
+                                "--no-renames",
+                                "-z",
+                                base,
+                                "HEAD",
+                                "--",
+                            ],
+                        )
+                        .map_err(|e| StateRefusal::GuardFailed {
+                            guard: guard_name.into(),
+                            reason: format!("reading candidate deletions: {e:#}"),
+                        })?
+                        .split('\0')
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    if artifacts.is_empty() && deleted_files.is_empty() {
                         return Err(StateRefusal::GuardFailed {
                             guard: guard_name.into(),
                             reason: format!(
-                                "{guard_name} requires at least one real artifact path"
+                                "{guard_name} requires at least one real artifact path or committed deletion"
                             ),
                         });
                     }
                     let mut violating = Vec::new();
-                    for rel in artifacts {
+                    for rel in artifacts.iter().chain(&deleted_files) {
                         let p = repo_root.join(rel);
-                        if !p.exists() {
+                        if !p.exists() && !deleted_files.contains(rel) {
                             return Err(StateRefusal::GuardFailed {
                                 guard: guard_name.into(),
                                 reason: format!(
@@ -2025,7 +2075,7 @@ impl StateStore {
                     repo_root,
                     trunk_branch,
                 } => {
-                    let changed = Self::verify_candidate_receipt(
+                    let changed = self.verify_candidate_receipt(
                         &q,
                         "Q4",
                         receipt,
@@ -2071,7 +2121,7 @@ impl StateStore {
                             ),
                         });
                     }
-                    let changed = Self::verify_candidate_receipt(
+                    let changed = self.verify_candidate_receipt(
                         &q,
                         "Q5",
                         receipt,
@@ -2149,7 +2199,7 @@ impl StateStore {
                             ),
                         });
                     }
-                    let changed = Self::verify_candidate_receipt(
+                    let changed = self.verify_candidate_receipt(
                         &q,
                         "Q6",
                         receipt,
@@ -2358,7 +2408,7 @@ impl StateStore {
 
         // Pre-verify full candidate receipt BEFORE advancing intermediate states (`Built`, `Wired`)
         let changed_paths =
-            Self::verify_candidate_receipt(&cur, "Q4", receipt, repo_root, trunk_branch, false)?;
+            self.verify_candidate_receipt(&cur, "Q4", receipt, repo_root, trunk_branch, false)?;
         let outside = Self::paths_outside_lease(&cur, &changed_paths);
         let cur = if outside.is_empty() {
             cur
@@ -2395,18 +2445,6 @@ impl StateStore {
                 .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
             return Ok(updated);
         }
-
-        // A candidate may delete files; only paths still present are artifacts to check on disk.
-        let present: Vec<String> = changed_paths
-            .iter()
-            .filter(|p| repo_root.join(p).exists())
-            .cloned()
-            .collect();
-        let changed_paths = if present.is_empty() {
-            changed_paths
-        } else {
-            present
-        };
 
         if cur.state == "Scoped" {
             self.transition_quest(
@@ -2516,7 +2554,7 @@ impl StateStore {
 
         // Checked before the fast-forward: a refusal here must not leave trunk already moved.
         let changed =
-            Self::verify_candidate_receipt(&cur, "Q5", receipt, repo_root, trunk_branch, true)?;
+            self.verify_candidate_receipt(&cur, "Q5", receipt, repo_root, trunk_branch, true)?;
         Self::enforce_lease(&cur, &changed)?;
 
         // Fast-forward `trunk_branch` to `receipt.head_sha` and remove merged side branch if any
@@ -3426,20 +3464,19 @@ impl StateStore {
         configure_hermetic_git(&mut status_cmd)
             .args(["--no-optional-locks", "-C"])
             .arg(repo_root)
-            .args(["status", "--porcelain"]);
+            .args(["status", "--porcelain", "-z", "--untracked-files=all"]);
         let status_out = status_cmd
             .output()
             .context("failed to run `git status --porcelain`")?;
+        if !status_out.status.success() {
+            bail!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&status_out.stderr)
+            );
+        }
         let modified_paths: Vec<String> = String::from_utf8_lossy(&status_out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| {
-                if l.is_empty() {
-                    return false;
-                }
-                let path_part = l.get(3..).unwrap_or(l).trim();
-                !(path_part == ".obb-state" || path_part.starts_with(".obb-state/"))
-            })
+            .split('\0')
+            .filter(|entry| !entry.is_empty() && !obb_judge::is_runtime_status_entry(entry))
             .map(str::to_string)
             .collect();
 

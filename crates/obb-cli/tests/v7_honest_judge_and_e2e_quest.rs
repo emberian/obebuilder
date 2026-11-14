@@ -90,6 +90,8 @@ fn git_cmd(repo: &Path, args: &[&str]) -> String {
 fn init_git_repo_on_main(repo: &Path) {
     git_cmd(repo, &["init", "--quiet"]);
     git_cmd(repo, &["checkout", "-B", "main"]);
+    write_rel(repo, ".gitignore", "/.obb/\n");
+    git_cmd(repo, &["add", ".gitignore"]);
 }
 
 fn run_obb(args: &[&str]) -> Output {
@@ -166,6 +168,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
     // missing-search-snippet tooth (`INVALID_TOOTH`), and failing positive check (`POSITIVE_FAILED`).
     let specs = vec![
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-bit".into(),
             description: "Flipping > 0 to >= -999 breaks negative clamping assertion".into(),
             build_cmd: Some("python3 -m py_compile src/calc.py tests/test_calc.py".into()),
@@ -180,6 +183,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-vacuous".into(),
             description: "Mutating untested `unused_helper` leaves test suite exiting 0".into(),
             build_cmd: Some("python3 -m py_compile src/calc.py tests/test_calc.py".into()),
@@ -194,6 +198,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-invalid-syntax".into(),
             description:
                 "Breaking Python syntax fails `build_cmd` / parser rather than behavioral check"
@@ -210,6 +215,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-invalid-zero-tests".into(),
             description: "Runner reporting `ran 0 tests` is rejected as INVALID_TOOTH".into(),
             build_cmd: None,
@@ -222,6 +228,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-invalid-wrong-assertion".into(),
             description: "Failing with wrong error message misses `expect_failure_substring`"
                 .into(),
@@ -237,6 +244,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-invalid-missing-search".into(),
             description: "Search string absent in target file".into(),
             build_cmd: None,
@@ -251,6 +259,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
             timeout_ms: 10_000,
         },
         ToothSpec {
+            inputs: Vec::new(),
             id: "tooth-positive-failed".into(),
             description: "Positive check already broken before mutation".into(),
             build_cmd: None,
@@ -875,6 +884,7 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
         "import sys\nsys.path.insert(0, 'src')\nfrom calc import safe_div\nassert safe_div(10, 2) == 5\ntry:\n    safe_div(1, 0)\n    raise SystemExit('expected ValueError')\nexcept ValueError:\n    pass\nprint('ran 2 tests ok')\n",
     );
     let biting_spec = vec![ToothSpec {
+        inputs: Vec::new(),
         id: "div-zero-tooth".into(),
         description: "Removing b == 0 guard lets b=0 reach floor division or wrong path".into(),
         build_cmd: Some("python3 -m py_compile src/calc.py tests/test_calc.py".into()),
@@ -907,11 +917,17 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
     );
     let q_refused = store.get_quest("Q-e2e").unwrap().unwrap();
     assert_eq!(q_refused.state, "Scoped");
-    assert!(!q_refused.footprint_lease.iter().any(|p| p.starts_with("docs")));
+    assert!(
+        !q_refused
+            .footprint_lease
+            .iter()
+            .any(|p| p.starts_with("docs"))
+    );
 
     // 5. Reset to `main` and commit an in-footprint candidate whose tooth is VACUOUS (`VACUOUS` caught!)
     git_cmd(&repo, &["reset", "--hard", "main"]);
     let vacuous_spec = vec![ToothSpec {
+        inputs: Vec::new(),
         id: "div-zero-vacuous".into(),
         description: "Mutating safe_div(1, 0) when test never calls b=0 is VACUOUS".into(),
         build_cmd: Some("python3 -m py_compile src/calc.py tests/test_calc.py".into()),
@@ -1397,10 +1413,7 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
             .filter(|q| q.id != "Q-docs")
             .all(|q| q.state == "Recorded")
     );
-    assert_eq!(
-        store.get_quest("Q-docs").unwrap().unwrap().state,
-        "Scoped"
-    );
+    assert_eq!(store.get_quest("Q-docs").unwrap().unwrap().state, "Scoped");
     assert!(StateStore::probe_git_q5(&repo).unwrap().q5_passed);
     assert!(git_cmd(&repo, &["status", "--porcelain"]).trim().is_empty());
     cli_ok(&["ledger", "--state-dir", state, "verify"]);
@@ -1895,7 +1908,11 @@ pub const Q: char = '\'';
 async fn runtime_case() {}
 "#,
     );
-    write_rel(tmp.path(), "src/inner.rs", "#![cfg(test)]\nfn helper() {}\n");
+    write_rel(
+        tmp.path(),
+        "src/inner.rs",
+        "#![cfg(test)]\nfn helper() {}\n",
+    );
     write_rel(
         tmp.path(),
         "src/lib.ts",
@@ -1904,12 +1921,11 @@ class Probe { test(value: string) { return value; } }
 it.only('focused', () => {});
 "#,
     );
-    let mut got: Vec<(String, usize)> =
-        obb_lint::test_in_library::scan_test_in_library(tmp.path())
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.path, f.line))
-            .collect();
+    let mut got: Vec<(String, usize)> = obb_lint::test_in_library::scan_test_in_library(tmp.path())
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.path, f.line))
+        .collect();
     got.sort();
     assert_eq!(
         got,
@@ -1930,11 +1946,591 @@ fn construction_clock_defers_teeth_and_revert_floors_and_never_exceeds_attested(
     assert_eq!(report.clock, JudgeClock::Construction);
     assert_eq!(report.achieved_regime, Regime::Attested);
     assert_eq!(report.teeth_report.total, 0);
-    assert!(report.deferred_floors.iter().any(|f| f.starts_with("home ")));
+    assert!(
+        report
+            .deferred_floors
+            .iter()
+            .any(|f| f.starts_with("home "))
+    );
     assert!(
         report
             .evaluations
             .iter()
             .all(|e| e.cell != "home_revert_clean" && e.cell != "planted_fault_red")
     );
+}
+
+// Wave 2: authenticated evidence, input cones, exact proposals, deletion-only candidates.
+
+fn wave2_repo(root: &Path) -> (PathBuf, Gate) {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo_on_main(&repo);
+    let command_floor: Floor = serde_json::from_value(serde_json::json!({
+        "floor": "value_is_good",
+        "inputs": ["src/**/*.txt"],
+        "command": "test \"$(cat src/value.txt)\" = good"
+    }))
+    .unwrap();
+    let tooth: ToothSpec = serde_json::from_value(serde_json::json!({
+        "id": "value-tooth",
+        "inputs": ["src/"],
+        "check_cmd": "test \"$(cat src/value.txt)\" = good || { echo incorrect-value; exit 1; }",
+        "mutation": {"kind": "replace", "file": "src/value.txt", "search": "good", "replace": "bad"},
+        "expect_failure_substring": "incorrect-value"
+    })).unwrap();
+    let gate = build_gate(
+        "wave2",
+        vec![
+            (
+                Floor::Home(1),
+                Method::Eval(TrustBase::External("git-merge-tree".into())),
+            ),
+            (
+                command_floor,
+                Method::Eval(TrustBase::External("shell".into())),
+            ),
+            (
+                Floor::Named("planted_fault_red".into()),
+                Method::Eval(TrustBase::Compiled),
+            ),
+        ],
+        vec![
+            TrustBase::External("git-merge-tree".into()),
+            TrustBase::External("shell".into()),
+            TrustBase::Compiled,
+        ],
+        vec![tooth],
+    );
+    write_rel(&repo, "src/value.txt", "good\n");
+    write_rel(&repo, "dead.txt", "obsolete\n");
+    write_rel(
+        &repo,
+        "judge.json",
+        &serde_json::to_string_pretty(&gate).unwrap(),
+    );
+    git_cmd(&repo, &["add", "."]);
+    git_cmd(&repo, &["commit", "-m", "baseline"]);
+    (repo, gate)
+}
+
+fn wave2_take(repo: &Path, state: &Path) -> StateStore {
+    let store = StateStore::open_with_state_dir(repo, Some(state)).unwrap();
+    store
+        .create_campaign(
+            "C",
+            "Wave 2",
+            "Exercise receipt boundaries",
+            repo.to_str().unwrap(),
+        )
+        .unwrap();
+    store
+        .create_quest("Q", "C", "Candidate", "worker", "decided")
+        .unwrap();
+    store
+        .take_quest(
+            "Q",
+            "worker",
+            "Deliver candidate",
+            vec!["src/".into(), "dead.txt".into(), "NOTES.txt".into()],
+            1.0,
+            repo,
+            "main",
+        )
+        .unwrap();
+    git_cmd(repo, &["checkout", "-b", "candidate"]);
+    store
+}
+
+#[test]
+fn wave2_hmac_vectors_and_recomputed_forgery_are_rejected() {
+    use obb_judge::receipt_auth::hmac_sha256;
+    let hex = |bytes: [u8; 32]| -> String {
+        use std::fmt::Write;
+        bytes
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                write!(output, "{byte:02x}").unwrap();
+                output
+            })
+    };
+    assert_eq!(
+        hex(hmac_sha256(&[0x0b; 20], b"Hi There")),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+    assert_eq!(
+        hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    assert_eq!(
+        hex(hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        )),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+    );
+
+    let tmp = temp_in_private_tmp("obb-wave2-auth-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    let store = wave2_take(&repo, &tmp.path().join("state"));
+    write_rel(&repo, "NOTES.txt", "candidate\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "candidate"]);
+    let receipt = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    let key_path = repo.join(".obb/receipt.key");
+    let key = fs::read(&key_path).unwrap();
+    assert_eq!(key.len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    receipt.verify_authenticated(&key).unwrap();
+    assert!(receipt.verify_authenticated(b"wrong-key").is_err());
+    for remove_mac in [false, true] {
+        let mut forged = receipt.clone();
+        forged.evaluations[0].detail = "fabricated evidence".into();
+        forged.receipt_hash = forged.compute_hash().unwrap();
+        if remove_mac {
+            forged.receipt_mac = None;
+        }
+        forged.verify_integrity().unwrap();
+        let error = store
+            .propose_quest("Q", "worker", &forged, &repo, "main")
+            .unwrap_err();
+        assert!(
+            matches!(error, StateRefusal::TamperedReceipt { ref reason, .. } if reason.contains("receipt_mac")),
+            "{error:?}"
+        );
+        assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Scoped");
+    }
+    store
+        .propose_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+    let mut forged = receipt.clone();
+    forged.receipt_mac = Some("0".repeat(64));
+    assert!(matches!(
+        store.land_quest("Q", "worker", &forged, &repo, "main"),
+        Err(StateRefusal::TamperedReceipt { .. })
+    ));
+    assert_eq!(
+        git_cmd(&repo, &["rev-parse", "main"]).trim(),
+        receipt.base_sha
+    );
+    store
+        .land_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+}
+
+#[test]
+fn wave2_cli_uses_selected_state_key_or_environment_key_for_receipts_and_cache() {
+    for environment_key in [None, Some("wave2-external-signing-key")] {
+        let tmp = temp_in_private_tmp("obb-wave2-cli-key-");
+        let (repo, _gate) = wave2_repo(tmp.path());
+        let state = tmp.path().join("vault");
+        let store = wave2_take(&repo, &state);
+        write_rel(&repo, "NOTES.txt", "candidate\n");
+        git_cmd(&repo, &["add", "NOTES.txt"]);
+        git_cmd(&repo, &["commit", "-m", "candidate"]);
+        let output = tmp.path().join("receipt.json");
+        let judge_args = [
+            "--workspace",
+            repo.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "judge",
+            "check",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "main",
+            "--emit-receipt",
+            output.to_str().unwrap(),
+        ];
+        let mut command = Command::new(obb_bin());
+        command.args(judge_args).env_remove("OBB_RECEIPT_KEY");
+        if let Some(key) = environment_key {
+            command.env("OBB_RECEIPT_KEY", key);
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let receipt = JudgeReceipt::load_from_path(&output).unwrap();
+        let key = environment_key
+            .map(|k| k.as_bytes().to_vec())
+            .unwrap_or_else(|| fs::read(state.join(".obb/receipt.key")).unwrap());
+        receipt.verify_authenticated(&key).unwrap();
+        assert!(
+            !repo.join(".obb/receipt.key").exists(),
+            "receipt caching must use the selected signing key"
+        );
+
+        if environment_key.is_none() {
+            // A repo-key-authenticated cache entry is not sufficient when signing with a vault key.
+            write_rel(&repo, ".obb/receipt.key", "different-local-key");
+            let local = Command::new(obb_bin())
+                .args([
+                    "--workspace",
+                    repo.to_str().unwrap(),
+                    "judge",
+                    "check",
+                    "--repo",
+                    repo.to_str().unwrap(),
+                    "--json",
+                ])
+                .env_remove("OBB_RECEIPT_KEY")
+                .output()
+                .unwrap();
+            assert!(local.status.success());
+            let local: obb_judge::JudgeCheckReport = serde_json::from_slice(&local.stdout).unwrap();
+            assert!(!local.teeth_report.results[0].reused_from_cache);
+            let result = command.output().unwrap();
+            assert!(result.status.success());
+            let vault_receipt = JudgeReceipt::load_from_path(&output).unwrap();
+            assert!(!vault_receipt.teeth_report.results[0].reused_from_cache);
+            vault_receipt.verify_authenticated(&key).unwrap();
+        }
+        let mut propose = Command::new(obb_bin());
+        propose
+            .args([
+                "--workspace",
+                repo.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "state",
+                "propose",
+                "Q",
+                "--actor",
+                "worker",
+                "--repo",
+                repo.to_str().unwrap(),
+                "--trunk",
+                "main",
+                "--receipt",
+                output.to_str().unwrap(),
+            ])
+            .env_remove("OBB_RECEIPT_KEY");
+        if let Some(key) = environment_key {
+            propose.env("OBB_RECEIPT_KEY", key);
+        }
+        let result = propose.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
+        if environment_key.is_some() {
+            let result = propose
+                .env("OBB_RECEIPT_KEY", "wrong-key")
+                .output()
+                .unwrap();
+            assert!(!result.status.success());
+            assert!(String::from_utf8_lossy(&result.stderr).contains("receipt_mac"));
+        }
+    }
+}
+
+#[test]
+fn wave2_cones_reuse_and_invalidate_on_inputs_commands_mutations_and_cache_tampering() {
+    for definition in [
+        serde_json::json!({"kind": "cap", "cell": "no_sorry_ax", "max": 0, "inputs": ["src/"]}),
+        serde_json::json!({"kind": "home", "commits": 1, "inputs": ["src/"]}),
+        serde_json::json!({"name": "no_sorry_ax", "inputs": ["src/"]}),
+    ] {
+        let floor: Floor = serde_json::from_value(definition).unwrap();
+        assert_eq!(floor.inputs(), ["src/"]);
+        assert_eq!(
+            serde_json::from_value::<Floor>(serde_json::to_value(&floor).unwrap()).unwrap(),
+            floor
+        );
+    }
+    let tmp = temp_in_private_tmp("obb-wave2-cones-");
+    let (repo, mut gate) = wave2_repo(tmp.path());
+    let floor = |report: &obb_judge::JudgeCheckReport| {
+        report
+            .evaluations
+            .iter()
+            .find(|e| e.cell == "value_is_good")
+            .unwrap()
+            .reused_from_cache
+    };
+    let first = evaluate_gate(&gate, &repo).unwrap();
+    assert!(first.all_passed);
+    assert!(!floor(&first));
+    assert!(!first.teeth_report.results[0].reused_from_cache);
+    let second = evaluate_gate(&gate, &repo).unwrap();
+    assert!(floor(&second));
+    assert!(second.teeth_report.results[0].reused_from_cache);
+    assert_eq!(first.achieved_regime, second.achieved_regime);
+
+    write_rel(&repo, "NOTES.txt", "outside both cones\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "unrelated"]);
+    let unrelated = evaluate_gate(&gate, &repo).unwrap();
+    assert!(floor(&unrelated));
+    assert!(unrelated.teeth_report.results[0].reused_from_cache);
+
+    // Dirty input content must never be evaluated by looking only at HEAD's cached tree.
+    write_rel(&repo, "src/value.txt", "bad\n");
+    let dirty = evaluate_gate(&gate, &repo).unwrap();
+    assert!(!dirty.all_passed);
+    assert!(!floor(&dirty));
+    assert!(!dirty.teeth_report.results[0].reused_from_cache);
+    write_rel(&repo, "src/value.txt", "good\n\n");
+    git_cmd(&repo, &["add", "src/value.txt"]);
+    git_cmd(&repo, &["commit", "-m", "input edited"]);
+    let changed = evaluate_gate(&gate, &repo).unwrap();
+    assert!(changed.all_passed);
+    assert!(!floor(&changed));
+    assert!(!changed.teeth_report.results[0].reused_from_cache);
+
+    // A glob must also notice additions nested below its literal directory prefix.
+    write_rel(&repo, "src/nested/new.txt", "new input\n");
+    git_cmd(&repo, &["add", "src/nested/new.txt"]);
+    git_cmd(&repo, &["commit", "-m", "new input"]);
+    let added = evaluate_gate(&gate, &repo).unwrap();
+    assert!(!floor(&added));
+    assert!(!added.teeth_report.results[0].reused_from_cache);
+
+    for entry in fs::read_dir(repo.join(".obb/cache/cones")).unwrap() {
+        let path = entry.unwrap().path();
+        let mut cached: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        cached["mac"] = serde_json::json!("0".repeat(64));
+        fs::write(path, serde_json::to_vec(&cached).unwrap()).unwrap();
+    }
+    let tampered = evaluate_gate(&gate, &repo).unwrap();
+    assert!(tampered.all_passed);
+    assert!(!floor(&tampered));
+    assert!(!tampered.teeth_report.results[0].reused_from_cache);
+
+    if let Floor::Configured { command, .. } = &mut gate.floors[1] {
+        *command = Some("exit 1".into());
+    }
+    if let ToothMutation::Replace { replace, .. } = &mut gate.teeth[0].mutation {
+        *replace = "good".into();
+    }
+    let changed_checks = evaluate_gate(&gate, &repo).unwrap();
+    assert!(!changed_checks.all_passed);
+    assert!(!floor(&changed_checks));
+    assert!(!changed_checks.teeth_report.results[0].reused_from_cache);
+    assert_eq!(
+        changed_checks.teeth_report.results[0].verdict,
+        ToothVerdict::InvalidTooth
+    );
+    let failed_cached = evaluate_gate(&gate, &repo).unwrap();
+    assert!(!failed_cached.all_passed);
+    assert!(floor(&failed_cached));
+    assert!(failed_cached.teeth_report.results[0].reused_from_cache);
+}
+
+#[test]
+fn wave2_land_rejects_unproposed_receipt_and_candidate_before_moving_trunk() {
+    let tmp = temp_in_private_tmp("obb-wave2-binding-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    let store = wave2_take(&repo, &tmp.path().join("state"));
+    write_rel(&repo, "NOTES.txt", "first\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "first candidate"]);
+    let proposed = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    let quest = store
+        .propose_quest("Q", "worker", &proposed, &repo, "main")
+        .unwrap();
+    assert_eq!(
+        quest.proposed_head_sha.as_deref(),
+        Some(proposed.head_sha.as_str())
+    );
+    assert_eq!(
+        quest.verified_receipt_hash.as_deref(),
+        Some(proposed.receipt_hash.as_str())
+    );
+    for change_candidate in [false, true] {
+        if change_candidate {
+            write_rel(&repo, "NOTES.txt", "second\n");
+            git_cmd(&repo, &["add", "NOTES.txt"]);
+            git_cmd(&repo, &["commit", "-m", "unproposed candidate"]);
+        }
+        let swapped = issue_judge_receipt(&gate, &repo, "main").unwrap();
+        assert_ne!(proposed.receipt_hash, swapped.receipt_hash);
+        let error = store
+            .land_quest("Q", "worker", &swapped, &repo, "main")
+            .unwrap_err();
+        assert!(
+            matches!(error, StateRefusal::GuardFailed { ref reason, .. } if reason.contains("proposed")),
+            "{error:?}"
+        );
+        // The direct state transition has the same guard as the composite land verb.
+        let direct = store
+            .transition_quest(
+                "Q",
+                "Landed",
+                "worker",
+                None,
+                QuestGuardEvidence::Receipt {
+                    receipt: Box::new(swapped),
+                    repo_root: repo.clone(),
+                    trunk_branch: "main".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(direct, StateRefusal::GuardFailed { ref reason, .. } if reason.contains("proposed"))
+        );
+        assert_eq!(
+            git_cmd(&repo, &["rev-parse", "main"]).trim(),
+            proposed.base_sha
+        );
+        assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
+    }
+    let updated = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    store
+        .propose_quest("Q", "worker", &updated, &repo, "main")
+        .unwrap();
+    store
+        .land_quest("Q", "worker", &updated, &repo, "main")
+        .unwrap();
+}
+
+#[test]
+fn wave2_pure_deletion_quest_reaches_recorded_and_missing_files_are_not_evidence() {
+    let tmp = temp_in_private_tmp("obb-wave2-deletion-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    let store = wave2_take(&repo, &tmp.path().join("state"));
+    for artifacts in [vec![], vec!["never-existed.txt".into()]] {
+        assert!(
+            store
+                .transition_quest(
+                    "Q",
+                    "Built",
+                    "worker",
+                    None,
+                    QuestGuardEvidence::RepoCheck {
+                        repo_root: repo.clone(),
+                        artifacts,
+                    }
+                )
+                .is_err()
+        );
+    }
+    fs::remove_file(repo.join("dead.txt")).unwrap();
+    assert!(
+        store
+            .transition_quest(
+                "Q",
+                "Built",
+                "worker",
+                None,
+                QuestGuardEvidence::RepoCheck {
+                    repo_root: repo.clone(),
+                    artifacts: vec!["dead.txt".into()],
+                }
+            )
+            .is_err(),
+        "uncommitted disappearance is not a candidate deletion"
+    );
+    git_cmd(&repo, &["add", "-u"]);
+    git_cmd(&repo, &["commit", "-m", "delete obsolete file"]);
+    let receipt = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    assert_eq!(receipt.changed_paths, ["dead.txt"]);
+    assert!(receipt.all_passed);
+    store
+        .propose_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+    store
+        .land_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+    store
+        .transition_quest(
+            "Q",
+            "Claimed",
+            "worker",
+            None,
+            QuestGuardEvidence::Receipt {
+                receipt: Box::new(receipt),
+                repo_root: repo.clone(),
+                trunk_branch: "main".into(),
+            },
+        )
+        .unwrap();
+    let recorded = store
+        .transition_quest(
+            "Q",
+            "Recorded",
+            "worker",
+            None,
+            QuestGuardEvidence::RecordCheck {
+                repo_root: repo.clone(),
+                summary: "Removed the obsolete file and checked retained behavior".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(recorded.state, "Recorded");
+    assert!(!repo.join("dead.txt").exists());
+    assert!(!recorded.merged_ungated);
+    store.verify_ledger_chain().unwrap();
+}
+
+#[tokio::test]
+async fn wave2_lints_scan_live_target_and_report_baseline_delta() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use obb_cli::serve::{ServeConfig, build_router};
+    use tower::ServiceExt;
+    let tmp = temp_in_private_tmp("obb-wave2-live-lints-");
+    let repo = tmp.path().join("live-repo");
+    fs::create_dir_all(&repo).unwrap();
+    let baseline = obb_lint::run_repo_lints(&repo).unwrap();
+    write_rel(
+        &repo,
+        "reports/obend-baseline.json",
+        &serde_json::to_string(&baseline).unwrap(),
+    );
+    let app = build_router(
+        ServeConfig::new(tmp.path().into(), repo.clone(), repo.join("judge.json"))
+            .with_bearer_token("secret"),
+    );
+    for add_fault in [false, true, false] {
+        write_rel(
+            &repo,
+            "lean/Live.lean",
+            if add_fault {
+                "theorem live : True := by sorry\n"
+            } else {
+                "theorem live : True := by trivial\n"
+            },
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/lints")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(json["source"], "live");
+        assert!(json["scanned_at"].as_str().is_some());
+        assert_eq!(json["scanned_at"], json["generated_at"]);
+        assert_eq!(
+            json["delta"]["baseline_generated_at"],
+            baseline.generated_at
+        );
+        let count = json["by_rule"]["lean/sorry-or-axiom"].as_u64().unwrap_or(0);
+        assert_eq!(count > 0, add_fault, "{json}");
+        assert_eq!(json["delta"]["total_findings"], json["total_findings"]);
+    }
 }

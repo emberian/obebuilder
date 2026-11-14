@@ -17,7 +17,10 @@
 //! - `issue_judge_receipt` binds evaluation results cryptographically to `(gate_sha256, base_sha,
 //!   head_sha, tree_oid)` for `obb-state` transition verification.
 
+mod cone_cache;
 pub mod pipeline;
+pub mod receipt_auth;
+pub use cone_cache::is_runtime_status_entry;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -32,6 +35,10 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
 
 pub const REVERT_FORMAT: &str = "revert@1";
 pub const RECEIPT_VERSION: u32 = 1;
@@ -200,6 +207,13 @@ pub enum Floor {
     Cap { cell: String, max: u64 },
     /// Named invariant without numeric parameter.
     Named(String),
+    /// Optional declared input cone and a shell check for a custom named floor.
+    Configured {
+        floor: Box<Floor>,
+        inputs: Vec<String>,
+        command: Option<String>,
+        timeout_ms: u64,
+    },
 }
 
 impl Floor {
@@ -235,8 +249,36 @@ impl Floor {
         Ok(Self::Named(trimmed.to_string()))
     }
 
+    pub fn core(&self) -> &Self {
+        match self {
+            Self::Configured { floor, .. } => floor.core(),
+            _ => self,
+        }
+    }
+
+    pub fn inputs(&self) -> &[String] {
+        match self {
+            Self::Configured { inputs, .. } => inputs,
+            _ => &[],
+        }
+    }
+
+    fn with_inputs(self, inputs: Vec<String>) -> Self {
+        if inputs.is_empty() {
+            self
+        } else {
+            Self::Configured {
+                floor: Box::new(self),
+                inputs,
+                command: None,
+                timeout_ms: default_tooth_timeout_ms(),
+            }
+        }
+    }
+
     pub fn to_wire(&self) -> String {
         match self {
+            Self::Configured { floor, .. } => floor.to_wire(),
             Self::Home(n) => format!("home {n}"),
             Self::Cap { cell, max } => format!("{cell} <= {max}"),
             Self::Named(s) => s.clone(),
@@ -245,6 +287,7 @@ impl Floor {
 
     pub fn cell_key(&self) -> &str {
         match self {
+            Self::Configured { floor, .. } => floor.cell_key(),
             Self::Home(_) => "home_revert_clean",
             Self::Cap { cell, .. } => cell.as_str(),
             Self::Named(s) => s.as_str(),
@@ -260,31 +303,92 @@ impl fmt::Display for Floor {
 
 impl Serialize for Floor {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_wire())
+        if let Self::Configured {
+            floor,
+            inputs,
+            command,
+            timeout_ms,
+        } = self
+        {
+            serde_json::json!({"floor": floor, "inputs": inputs, "command": command, "timeout_ms": timeout_ms}).serialize(serializer)
+        } else {
+            serializer.serialize_str(&self.to_wire())
+        }
     }
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum FloorRepr {
+    Configured {
+        floor: Box<Floor>,
+        #[serde(default)]
+        inputs: Vec<String>,
+        #[serde(default, alias = "check_cmd")]
+        command: Option<String>,
+        #[serde(default = "default_tooth_timeout_ms")]
+        timeout_ms: u64,
+    },
     Wire(String),
-    StructuredHome { kind: String, commits: u64 },
-    StructuredCap { cell: String, max: u64 },
+    StructuredHome {
+        kind: String,
+        commits: u64,
+        #[serde(default)]
+        inputs: Vec<String>,
+    },
+    StructuredCap {
+        cell: String,
+        max: u64,
+        #[serde(default)]
+        inputs: Vec<String>,
+    },
+    StructuredNamed {
+        name: String,
+        #[serde(default)]
+        inputs: Vec<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for Floor {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         match FloorRepr::deserialize(deserializer)? {
+            FloorRepr::Configured {
+                floor,
+                inputs,
+                command,
+                timeout_ms,
+            } => {
+                if matches!(*floor, Self::Configured { .. }) {
+                    return Err(serde::de::Error::custom(
+                        "nested floor configurations are not supported",
+                    ));
+                }
+                Ok(Self::Configured {
+                    floor,
+                    inputs,
+                    command,
+                    timeout_ms,
+                })
+            }
             FloorRepr::Wire(s) => Self::parse_wire(&s).map_err(serde::de::Error::custom),
-            FloorRepr::StructuredHome { kind, commits } => {
+            FloorRepr::StructuredHome {
+                kind,
+                commits,
+                inputs,
+            } => {
                 if kind != "home" || commits == 0 {
                     return Err(serde::de::Error::custom(
                         "structured home floor requires `kind == \"home\"` and `commits >= 1`",
                     ));
                 }
-                Ok(Self::Home(commits))
+                Ok(Self::Home(commits).with_inputs(inputs))
             }
-            FloorRepr::StructuredCap { cell, max } => Ok(Self::Cap { cell, max }),
+            FloorRepr::StructuredCap { cell, max, inputs } => {
+                Ok(Self::Cap { cell, max }.with_inputs(inputs))
+            }
+            FloorRepr::StructuredNamed { name, inputs } => Self::parse_wire(&name)
+                .map(|floor| floor.with_inputs(inputs))
+                .map_err(serde::de::Error::custom),
         }
     }
 }
@@ -317,6 +421,8 @@ pub enum ToothMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToothSpec {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
     #[serde(default)]
     pub description: String,
     /// Optional build/syntax preflight command run BEFORE `check_cmd` on both positive and mutated
@@ -370,6 +476,8 @@ impl fmt::Display for ToothVerdict {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToothExecutionResult {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reused_from_cache: bool,
     pub id: String,
     pub verdict: ToothVerdict,
     pub positive_exit: Option<i32>,
@@ -448,21 +556,21 @@ impl Gate {
     pub fn method_for(&self, format: &str, floor: &Floor) -> Option<&Method> {
         self.methods
             .iter()
-            .find(|m| m.format == format && &m.floor == floor)
+            .find(|m| m.format == format && m.floor.core() == floor.core())
             .map(|m| &m.method)
     }
 
     pub fn has_home_bedrock(&self) -> bool {
         self.floors
             .iter()
-            .any(|fl| matches!(fl, Floor::Home(n) if *n >= 1))
+            .any(|fl| matches!(fl.core(), Floor::Home(n) if *n >= 1))
     }
 
     /// Returns `true` if any `(format, floor)` binding for `floor` claims `eval:kernel`.
     pub fn floor_claims_kernel(&self, floor: &Floor) -> bool {
         self.methods
             .iter()
-            .any(|m| &m.floor == floor && m.method == Method::Eval(TrustBase::Kernel))
+            .any(|m| m.floor.core() == floor.core() && m.method == Method::Eval(TrustBase::Kernel))
     }
 
     /// Deterministic SHA-256 over the canonical serialized `Gate` value.
@@ -593,9 +701,10 @@ pub fn check_succeed(
 
     // 1. Every floor in `old` must still exist in `new` and must not be loosened!
     for old_fl in &old.floors {
-        match old_fl {
+        match old_fl.core() {
+            Floor::Configured { .. } => unreachable!("core unwraps configurations"),
             Floor::Home(old_n) => {
-                let new_home = new.floors.iter().find_map(|f| match f {
+                let new_home = new.floors.iter().find_map(|f| match f.core() {
                     Floor::Home(n) => Some(*n),
                     _ => None,
                 });
@@ -615,7 +724,7 @@ pub fn check_succeed(
                 }
             }
             Floor::Cap { cell, max: old_max } => {
-                let matching_cap = new.floors.iter().find_map(|f| match f {
+                let matching_cap = new.floors.iter().find_map(|f| match f.core() {
                     Floor::Cap {
                         cell: c2,
                         max: new_max,
@@ -641,7 +750,7 @@ pub fn check_succeed(
                 let present = new
                     .floors
                     .iter()
-                    .any(|f| matches!(f, Floor::Named(n2) if n2 == name));
+                    .any(|f| matches!(f.core(), Floor::Named(n2) if n2 == name));
                 if !present {
                     return Err(Refusal::DropsFloor(old_fl.to_wire()));
                 }
@@ -894,6 +1003,8 @@ pub enum FloorDiagnostic {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FloorEvaluation {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reused_from_cache: bool,
     pub floor: String,
     pub cell: String,
     pub measured: u64,
@@ -942,10 +1053,9 @@ pub enum JudgeClock {
 
 /// Content-addressed candidate evaluation receipt consumed by `obb-state` transitions.
 ///
-/// `receipt_hash` is an unkeyed SHA-256 over the other fields: it detects edits to a receipt and
-/// binds it to `(gate_sha256, base_sha, head_sha, tree_oid)`, but it does not authenticate who
-/// produced it. `obb-state` independently re-checks the git facts; the floor and tooth verdicts
-/// are taken from the receipt.
+/// `receipt_hash` identifies the canonical payload; `receipt_mac` authenticates that hash
+/// with HMAC-SHA256. `obb-state` requires authentication whenever a key is configured and
+/// independently checks git facts plus the exact proposed candidate and receipt identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeReceipt {
     pub receipt_version: u32,
@@ -964,6 +1074,8 @@ pub struct JudgeReceipt {
     pub teeth_report: TeethReport,
     pub evaluations: Vec<FloorEvaluation>,
     pub receipt_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_mac: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1007,6 +1119,25 @@ impl JudgeReceipt {
         let bytes =
             serde_json::to_vec(&signable).context("failed to serialize JudgeReceiptSignable")?;
         Ok(sha256_hex(&bytes))
+    }
+
+    /// Authenticate the content hash; the hash itself covers every evaluation field.
+    pub fn authenticate(&mut self, key: &[u8]) -> Result<()> {
+        self.receipt_hash = self.compute_hash()?;
+        self.receipt_mac = Some(receipt_auth::mac_hex(key, self.receipt_hash.as_bytes()));
+        Ok(())
+    }
+
+    pub fn verify_authenticated(&self, key: &[u8]) -> Result<()> {
+        self.verify_integrity()?;
+        if !self
+            .receipt_mac
+            .as_deref()
+            .is_some_and(|mac| receipt_auth::verify_mac(key, self.receipt_hash.as_bytes(), mac))
+        {
+            bail!("JudgeReceipt receipt_mac is missing or invalid");
+        }
+        Ok(())
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
@@ -1098,6 +1229,10 @@ fn should_skip_sandbox_entry(name: &str) -> bool {
     )
 }
 
+fn entry_relative_metadata<'a>(path: &'a Path, repo: &Path) -> Option<&'a str> {
+    path.strip_prefix(repo.join(".obb")).ok()?.to_str()
+}
+
 fn copy_repo_to_sandbox(repo_root: &Path, dst_root: &Path) -> Result<()> {
     std::fs::create_dir_all(dst_root)?;
     let walker = walkdir::WalkDir::new(repo_root)
@@ -1108,6 +1243,10 @@ fn copy_repo_to_sandbox(repo_root: &Path, dst_root: &Path) -> Result<()> {
             }
             let name = e.file_name().to_string_lossy();
             !should_skip_sandbox_entry(&name)
+                && !matches!(
+                    entry_relative_metadata(e.path(), repo_root),
+                    Some("receipt.key" | "cache")
+                )
         });
 
     for entry in walker {
@@ -1192,6 +1331,7 @@ fn run_sandboxed_shell_cmd(
         .arg(cmd_str)
         .current_dir(work_dir)
         .env("GIT_CEILING_DIRECTORIES", work_dir)
+        .env_remove("OBB_RECEIPT_KEY")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1393,6 +1533,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
 
     if spec.check_cmd.trim().is_empty() {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: None,
@@ -1408,6 +1549,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
             .is_some_and(command_invokes_forbidden_macos_lean)
     {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: None,
@@ -1432,6 +1574,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
             run_sandboxed_shell_cmd(&pos_dir, bcmd, None, env_key_to_unset, spec.timeout_ms)?;
         if bout.timed_out || bout.exit_code != Some(0) {
             return Ok(ToothExecutionResult {
+                reused_from_cache: false,
                 id: spec.id.clone(),
                 verdict: ToothVerdict::PositiveFailed,
                 positive_exit: bout.exit_code,
@@ -1457,6 +1600,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
     let pos_combined = pos_out.combined();
     if pos_out.timed_out || pos_out.exit_code != Some(0) {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::PositiveFailed,
             positive_exit: pos_out.exit_code,
@@ -1472,6 +1616,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
     }
     if output_ran_zero_tests(&pos_combined) {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: pos_out.exit_code,
@@ -1490,6 +1635,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
         Ok(ov) => ov,
         Err(reason) => {
             return Ok(ToothExecutionResult {
+                reused_from_cache: false,
                 id: spec.id.clone(),
                 verdict: ToothVerdict::InvalidTooth,
                 positive_exit: pos_out.exit_code,
@@ -1504,6 +1650,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
         let bout = run_sandboxed_shell_cmd(&neg_dir, bcmd, env_override, None, spec.timeout_ms)?;
         if bout.timed_out || bout.exit_code != Some(0) {
             return Ok(ToothExecutionResult {
+                reused_from_cache: false,
                 id: spec.id.clone(),
                 verdict: ToothVerdict::InvalidTooth,
                 positive_exit: pos_out.exit_code,
@@ -1531,6 +1678,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
 
     if neg_out.timed_out {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: pos_out.exit_code,
@@ -1545,6 +1693,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
 
     if neg_out.exit_code == Some(0) {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::Vacuous,
             positive_exit: pos_out.exit_code,
@@ -1557,6 +1706,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
 
     if output_is_non_behavioral_build_or_syntax_error(neg_out.exit_code, &neg_combined) {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: pos_out.exit_code,
@@ -1575,6 +1725,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
         && !neg_combined.contains(expected.as_str())
     {
         return Ok(ToothExecutionResult {
+            reused_from_cache: false,
             id: spec.id.clone(),
             verdict: ToothVerdict::InvalidTooth,
             positive_exit: pos_out.exit_code,
@@ -1589,6 +1740,7 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
     }
 
     Ok(ToothExecutionResult {
+        reused_from_cache: false,
         id: spec.id.clone(),
         verdict: ToothVerdict::Bit,
         positive_exit: pos_out.exit_code,
@@ -1604,14 +1756,36 @@ pub fn execute_single_tooth(repo_root: &Path, spec: &ToothSpec) -> Result<ToothE
 
 /// Execute all `#tooth` specifications in isolated disposable sandboxes and summarize verdicts.
 pub fn evaluate_teeth(repo_root: &Path, specs: &[ToothSpec]) -> Result<TeethReport> {
+    evaluate_teeth_with_key(repo_root, specs, None)
+}
+
+fn evaluate_teeth_with_key(
+    repo_root: &Path,
+    specs: &[ToothSpec],
+    signing_key: Option<&[u8]>,
+) -> Result<TeethReport> {
     let mut results = Vec::with_capacity(specs.len());
     let mut bit_count = 0usize;
     let mut vacuous_count = 0usize;
     let mut invalid_count = 0usize;
     let mut positive_failed_count = 0usize;
 
+    let cache = cone_cache::ConeCache::open(
+        repo_root,
+        specs.iter().any(|s| !s.inputs.is_empty()),
+        signing_key,
+    )?;
     for spec in specs {
-        let res = execute_single_tooth(repo_root, spec)?;
+        let digest = cache.digest(&spec.inputs, spec, &[])?;
+        let res = if let Some(mut cached) = cache.read::<ToothExecutionResult>(digest.as_deref())? {
+            cached.reused_from_cache = true;
+            cached
+        } else {
+            let result = execute_single_tooth(repo_root, spec)?;
+            cache.write(digest.as_deref(), &result)?;
+            result
+        };
+        // Duration on a reused entry records the original execution, not cache lookup time.
         match res.verdict {
             ToothVerdict::Bit => bit_count += 1,
             ToothVerdict::Vacuous => vacuous_count += 1,
@@ -1635,7 +1809,7 @@ pub fn evaluate_teeth(repo_root: &Path, specs: &[ToothSpec]) -> Result<TeethRepo
     })
 }
 
-/// Evaluate all floors of `gate` against `repo_root` (100% read-only on `repo_root`).
+/// Evaluate all floors of `gate`; opted-in convergence checks may write `.obb` cache metadata.
 pub fn evaluate_gate(gate: &Gate, repo_root: &Path) -> Result<JudgeCheckReport> {
     evaluate_gate_on(gate, repo_root, JudgeClock::Convergence)
 }
@@ -1646,6 +1820,15 @@ pub fn evaluate_gate_on(
     repo_root: &Path,
     clock: JudgeClock,
 ) -> Result<JudgeCheckReport> {
+    evaluate_gate_with_key(gate, repo_root, clock, None)
+}
+
+fn evaluate_gate_with_key(
+    gate: &Gate,
+    repo_root: &Path,
+    clock: JudgeClock,
+    signing_key: Option<&[u8]>,
+) -> Result<JudgeCheckReport> {
     check_well_formed(gate).context("judge failed WellFormed check")?;
     let fast = clock == JudgeClock::Construction;
     let mut deferred_floors = Vec::new();
@@ -1654,23 +1837,76 @@ pub fn evaluate_gate_on(
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
 
+    let cache = cone_cache::ConeCache::open(
+        &canon,
+        !fast && gate.floors.iter().any(|f| !f.inputs().is_empty()),
+        signing_key,
+    )?;
+    let mut floor_cache = Vec::with_capacity(gate.floors.len());
+    for floor in &gate.floors {
+        // These consume untracked measurements or already-cached teeth, not just tree inputs.
+        let cacheable = !fast
+            && !gate.floor_claims_kernel(floor)
+            && !matches!(
+                floor.cell_key(),
+                "planted_fault_red"
+                    | "tier1_module_sec_cap"
+                    | "spec_insensitive_decls"
+                    | "lean/spec-insensitive-change"
+            );
+        let extra = if !fast && !floor.inputs().is_empty() && matches!(floor.core(), Floor::Home(_))
+        {
+            vec![
+                run_git_ro(&canon, &["rev-parse", "HEAD"])?
+                    .trim()
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        };
+        let digest = if cacheable {
+            cache.digest(floor.inputs(), &(floor, &gate.methods, &gate.basis), &extra)?
+        } else {
+            None
+        };
+        let cached = cache.read::<FloorEvaluation>(digest.as_deref())?;
+        floor_cache.push((digest, cached));
+    }
+    let needs_scan = gate
+        .floors
+        .iter()
+        .zip(&floor_cache)
+        .any(|(floor, (_, cached))| {
+            cached.is_none()
+                && !matches!(floor.core(), Floor::Home(_))
+                && floor.cell_key() != "planted_fault_red"
+        });
+
     let gate_mentions_test_in_library = gate
         .floors
         .iter()
         .any(|fl| fl.cell_key().ends_with("test-in-library"));
-    let lint_report = run_repo_lints_with_options(
-        &canon,
-        RepoLintOptions {
-            strict_tests: gate_mentions_test_in_library,
-            ..Default::default()
-        },
-    )?;
-    let lean_idx = build_lean_index(&canon);
+    let lint_report = if needs_scan {
+        Some(run_repo_lints_with_options(
+            &canon,
+            RepoLintOptions {
+                strict_tests: gate_mentions_test_in_library,
+                ..Default::default()
+            },
+        )?)
+    } else {
+        None
+    };
+    let lean_idx = if needs_scan {
+        build_lean_index(&canon)
+    } else {
+        Default::default()
+    };
 
     let count_rule = |rule_id: &str| -> u64 {
         lint_report
-            .findings
             .iter()
+            .flat_map(|r| &r.findings)
             .filter(|f| f.rule_id == rule_id)
             .count() as u64
     };
@@ -1683,8 +1919,8 @@ pub fn evaluate_gate_on(
         .count() as u64;
 
     let sorry_sites = lint_report
-        .findings
         .iter()
+        .flat_map(|r| &r.findings)
         .filter(|f| {
             f.rule_id == "lean/sorry-or-axiom"
                 && f.symbol.as_deref() != Some("axiom")
@@ -1710,7 +1946,7 @@ pub fn evaluate_gate_on(
         .any(|fl| fl.cell_key() == "planted_fault_red");
     let teeth_specs = load_repo_teeth(gate, &canon)?;
     let teeth_report = if !fast && (gate_needs_teeth || !teeth_specs.is_empty()) {
-        evaluate_teeth(&canon, &teeth_specs)?
+        evaluate_teeth_with_key(&canon, &teeth_specs, signing_key)?
     } else {
         TeethReport::default()
     };
@@ -1719,16 +1955,33 @@ pub fn evaluate_gate_on(
     let mut compiled_or_external_passed = false;
     let mut evaluations = Vec::new();
 
-    for fl in &gate.floors {
-        if fast && matches!(fl.cell_key(), "home_revert_clean" | "planted_fault_red") {
+    for (fl, (digest, cached)) in gate.floors.iter().zip(floor_cache) {
+        if fast
+            && (matches!(fl.cell_key(), "home_revert_clean" | "planted_fault_red")
+                || matches!(
+                    fl,
+                    Floor::Configured {
+                        command: Some(_),
+                        ..
+                    }
+                ))
+        {
             deferred_floors.push(fl.to_wire());
             continue;
         }
+        if let Some(mut cached) = cached {
+            compiled_or_external_passed |= cached.passed && cached.regime == Regime::Certified;
+            cached.reused_from_cache = true;
+            evaluations.push(cached);
+            continue;
+        }
         let claims_kernel = gate.floor_claims_kernel(fl);
-        match fl {
+        match fl.core() {
+            Floor::Configured { .. } => unreachable!("core unwraps configurations"),
             Floor::Home(n) => {
                 if claims_kernel {
                     evaluations.push(FloorEvaluation {
+                        reused_from_cache: false,
                         floor: fl.to_wire(),
                         cell: "home_revert_clean".to_string(),
                         measured: 1,
@@ -1751,6 +2004,7 @@ pub fn evaluate_gate_on(
                     compiled_or_external_passed = true;
                 }
                 evaluations.push(FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: "home_revert_clean".to_string(),
                     measured: conflicts,
@@ -1811,6 +2065,32 @@ pub fn evaluate_gate_on(
                 evaluations.push(eval);
             }
         }
+        if let Some(eval) = evaluations.last_mut() {
+            if let Floor::Configured {
+                command: Some(command),
+                timeout_ms,
+                ..
+            } = fl
+            {
+                // Commands discharge custom named floors only; never override registered checks.
+                if !matches!(eval.diagnostic, Some(FloorDiagnostic::UnknownFloor { .. }))
+                    || claims_kernel
+                    || !matches!(fl.core(), Floor::Named(_))
+                    || !gate.methods.iter().any(|binding| {
+                        binding.floor.core() == fl.core()
+                            && binding.method == Method::Eval(TrustBase::External("shell".into()))
+                    })
+                {
+                    bail!(
+                        "command requires a custom named floor with eval:external:shell and no kernel claim: {}",
+                        fl.to_wire()
+                    );
+                }
+                *eval = evaluate_command_floor(fl, &canon, command, *timeout_ms)?;
+                compiled_or_external_passed |= eval.passed;
+            }
+            cache.write(digest.as_deref(), eval)?;
+        }
     }
 
     let all_passed = evaluations.iter().all(|e| e.passed);
@@ -1842,6 +2122,42 @@ pub fn evaluate_gate_on(
         evaluations,
         clock,
         deferred_floors,
+    })
+}
+
+fn evaluate_command_floor(
+    fl: &Floor,
+    repo: &Path,
+    command: &str,
+    timeout_ms: u64,
+) -> Result<FloorEvaluation> {
+    if command.trim().is_empty() || command_invokes_forbidden_macos_lean(command) {
+        bail!("empty or forbidden floor command for {}", fl.to_wire());
+    }
+    let sandbox = create_isolated_tempdir("obb-floor-")?;
+    copy_repo_to_sandbox(repo, sandbox.path())?;
+    let output = run_sandboxed_shell_cmd(sandbox.path(), command, None, None, timeout_ms)?;
+    let passed = output.exit_code == Some(0) && !output.timed_out;
+    Ok(FloorEvaluation {
+        reused_from_cache: false,
+        floor: fl.to_wire(),
+        cell: fl.cell_key().into(),
+        measured: u64::from(!passed),
+        bound: "exit == 0".into(),
+        passed,
+        detail: format!(
+            "command exit {:?}, timed_out={}: {}",
+            output.exit_code,
+            output.timed_out,
+            summarize_cmd_snippet(&output.combined())
+        ),
+        regime: if passed {
+            Regime::Certified
+        } else {
+            Regime::Attested
+        },
+        evaluator_kind: "external:shell".into(),
+        diagnostic: None,
     })
 }
 
@@ -1932,6 +2248,7 @@ where
                             *kernel_verified_any = true;
                         }
                         FloorEvaluation {
+                            reused_from_cache: false,
                             floor: fl.to_wire(),
                             cell: cell.to_string(),
                             measured,
@@ -1951,6 +2268,7 @@ where
                         }
                     }
                     Err(diag) => FloorEvaluation {
+                        reused_from_cache: false,
                         floor: fl.to_wire(),
                         cell: cell.to_string(),
                         measured: max.saturating_add(1),
@@ -1967,6 +2285,7 @@ where
             } else {
                 let passed = sorry_sites <= max;
                 FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: sorry_sites,
@@ -1991,6 +2310,7 @@ where
                             *kernel_verified_any = true;
                         }
                         FloorEvaluation {
+                            reused_from_cache: false,
                             floor: fl.to_wire(),
                             cell: cell.to_string(),
                             measured,
@@ -2010,6 +2330,7 @@ where
                         }
                     }
                     Err(diag) => FloorEvaluation {
+                        reused_from_cache: false,
                         floor: fl.to_wire(),
                         cell: cell.to_string(),
                         measured: max.saturating_add(1),
@@ -2026,6 +2347,7 @@ where
             } else {
                 let passed = declared_axioms <= max;
                 FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: declared_axioms,
@@ -2043,6 +2365,7 @@ where
         "tier1_module_sec_cap" => {
             if claims_kernel {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2065,6 +2388,7 @@ where
                 .any(|f| obb_lint::lean_rules::is_tier1_library_lean_path(&f.rel_path))
             {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: 0,
@@ -2078,6 +2402,7 @@ where
             }
             let Some(measured_max_sec) = measured_max_sec_opt else {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2102,6 +2427,7 @@ where
                 *compiled_or_external_passed = true;
             }
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: eff,
@@ -2122,6 +2448,7 @@ where
         "spec_insensitive_decls" | "lean/spec-insensitive-change" => {
             if claims_kernel {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2138,6 +2465,7 @@ where
             }
             let Some((insens_count, summary)) = read_spec_insensitive_measurement(canon) else {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2157,6 +2485,7 @@ where
                 *compiled_or_external_passed = true;
             }
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: insens_count,
@@ -2181,6 +2510,7 @@ where
             let bad_ctors = count_rule("markdown/hallucinated-constructor");
             let tot = missing_files + missing_syms + bad_ctors;
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: tot,
@@ -2200,6 +2530,7 @@ where
             }
             let c = count_rule("lean/tautological-judge-meaning");
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: c,
@@ -2219,6 +2550,7 @@ where
             }
             let c = count_rule("lean/discarded-tactic-binding");
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: c,
@@ -2238,6 +2570,7 @@ where
             }
             let c = count_rule("lean/native-decide-in-proof");
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: c,
@@ -2257,6 +2590,7 @@ where
             }
             let c = count_rule("lean/narrow-digest-weld");
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: c,
@@ -2283,6 +2617,7 @@ where
                 || canon.join("tests/teeth.json").is_file();
             let failures = if has_structural_witness { 0 } else { 1 };
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: failures,
@@ -2301,6 +2636,7 @@ where
         "planted_fault_red" => {
             if claims_kernel {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2317,6 +2653,7 @@ where
             }
             if teeth_report.total == 0 {
                 return FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: cell.to_string(),
                     measured: max.saturating_add(1),
@@ -2345,6 +2682,7 @@ where
                 *compiled_or_external_passed = true;
             }
             FloorEvaluation {
+                reused_from_cache: false,
                 floor: fl.to_wire(),
                 cell: cell.to_string(),
                 measured: non_bit,
@@ -2381,6 +2719,7 @@ where
             if is_known_static_lint_rule_id(other) {
                 let c = count_rule(other);
                 FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: other.to_string(),
                     measured: c,
@@ -2393,6 +2732,7 @@ where
                 }
             } else {
                 FloorEvaluation {
+                    reused_from_cache: false,
                     floor: fl.to_wire(),
                     cell: other.to_string(),
                     measured: max.saturating_add(1),
@@ -2419,6 +2759,7 @@ fn unverified_lexical_kernel_eval(
     bound_label: String,
 ) -> FloorEvaluation {
     FloorEvaluation {
+        reused_from_cache: false,
         floor: fl.to_wire(),
         cell: cell.to_string(),
         measured: max.saturating_add(1),
@@ -2439,9 +2780,21 @@ fn unverified_lexical_kernel_eval(
 /// Evaluate `gate` against git repository `repo_root` and issue a SHA-bound `JudgeReceipt`
 /// against `base_rev` (`(base_sha, head_sha, tree_oid)`).
 pub fn issue_judge_receipt(gate: &Gate, repo_root: &Path, base_rev: &str) -> Result<JudgeReceipt> {
+    issue_judge_receipt_with_state_dir(gate, repo_root, base_rev, None)
+}
+
+/// Issue with the selected state vault's key, falling back to the repo key.
+pub fn issue_judge_receipt_with_state_dir(
+    gate: &Gate,
+    repo_root: &Path,
+    base_rev: &str,
+    state_dir: Option<&Path>,
+) -> Result<JudgeReceipt> {
     let canon = repo_root
         .canonicalize()
         .with_context(|| format!("repo path does not exist: {}", repo_root.display()))?;
+
+    let key = receipt_auth::ensure_receipt_key(state_dir, &canon)?;
 
     let base_sha = run_git_ro(
         &canon,
@@ -2463,23 +2816,7 @@ pub fn issue_judge_receipt(gate: &Gate, repo_root: &Path, base_rev: &str) -> Res
         .trim()
         .to_string();
 
-    let status_raw = run_git_ro(
-        &canon,
-        &["status", "--porcelain", "--untracked-files=normal"],
-    )?;
-    let dirty_entries: Vec<&str> = status_raw
-        .lines()
-        .map(str::trim)
-        .filter(|l| {
-            if l.is_empty() {
-                return false;
-            }
-            // Ignore `.obb-state/` vault directory if co-located inside workspace root
-            let path_part = l.get(3..).unwrap_or(l).trim();
-            !(path_part == ".obb-state" || path_part.starts_with(".obb-state/"))
-        })
-        .collect();
-    let clean_working_tree = dirty_entries.is_empty();
+    let clean_working_tree = cone_cache::clean_for_cache(&canon)?;
 
     let diff_raw = run_git_ro(&canon, &["diff", "--name-only", &base_sha, &head_sha])?;
     let changed_paths: Vec<String> = diff_raw
@@ -2489,7 +2826,10 @@ pub fn issue_judge_receipt(gate: &Gate, repo_root: &Path, base_rev: &str) -> Res
         .map(str::to_string)
         .collect();
 
-    let report = evaluate_gate(gate, &canon)?;
+    let report = evaluate_gate_with_key(gate, &canon, JudgeClock::Convergence, Some(&key))?;
+    let clean_working_tree = clean_working_tree
+        && cone_cache::clean_for_cache(&canon)?
+        && run_git_ro(&canon, &["rev-parse", "HEAD^{commit}"])?.trim() == head_sha;
     let gate_sha256 = gate.canonical_sha256()?;
 
     let mut receipt = JudgeReceipt {
@@ -2509,8 +2849,9 @@ pub fn issue_judge_receipt(gate: &Gate, repo_root: &Path, base_rev: &str) -> Res
         teeth_report: report.teeth_report,
         evaluations: report.evaluations,
         receipt_hash: String::new(),
+        receipt_mac: None,
     };
-    receipt.receipt_hash = receipt.compute_hash()?;
+    receipt.authenticate(&key)?;
     Ok(receipt)
 }
 
@@ -2720,6 +3061,7 @@ pub fn evaluate_with_planted_fault_tooth(id: &str) -> Result<ToothExecutionResul
         std::fs::write(file, positive)?;
     }
     Ok(ToothExecutionResult {
+        reused_from_cache: false,
         id: id.into(),
         verdict,
         positive_exit: None,

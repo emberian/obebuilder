@@ -36,11 +36,10 @@ process (`PROCESS.md`), what `obb v7` (`0.7.0`) enforces mechanically, and which
   - `planted_fault_red` executes positive (`exit == 0`) and mutated negative (`exit != 0`) controls inside disposable `/private/tmp` sandboxes without touching the candidate working tree; static/index presence is segregated under `tooth_structural_presence` (`eval:lexical`, `attested`).
   - `home N` corrigibility (`obb judge check-revert`) runs 3-way `git merge-tree --write-tree` in a scratch bare repo via read-only `objects/info/alternates`.
   - `obb judge succeed` enforces G4 floor/cap non-regression and persists `LobCost` succession records to the SHA-256 hash-chained ledger (`obb ledger verify`).
-  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans. The receipt hash is unkeyed SHA-256: it makes a receipt tamper-evident and binds it to one tree, and `obb-state` re-derives the git facts itself, but it does not prove who ran the judge. Floor and tooth verdicts are read from the receipt.
+  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans. The SHA-256 `receipt_hash` identifies the evaluation; `receipt_mac` authenticates it with HMAC-SHA256. State verifies the MAC whenever a key is configured, independently re-derives the git facts, and requires the exact proposed `(head_sha, receipt_hash)` before landing. Pure deletions count as artifacts at both `Built` and `Wired` when git confirms them against the quest’s base.
   - Two clocks. `obb judge check --fast` is the construction clock: static floors and recorded measurements only, executed `#tooth` runs and `home N` revert merges listed as `deferred_floors`, result at most `attested`, no receipt (`--fast` conflicts with `--emit-receipt`). Plain `obb judge check` is the convergence clock and runs everything. `obb serve` polls on the construction clock.
+  - Input-cone reuse skips unchanged opted-in floors and teeth during convergence. Authenticated verdict entries live in `.obb/cache/cones/<digest>.json`; reused results carry `reused_from_cache: true`.
 - **What does not exist yet**:
-  - Input-cone receipt reuse. Floors do not declare their inputs, so every convergence check re-runs every tooth even when the change is outside what the tooth reads. A receipt keyed on `(check id, tree hashes of declared inputs, runner digest)` is the intended shape.
-  - Authenticated receipts (a keyed MAC or signature held outside the agent's reach).
   - The Lean `Habitat.State` instance over git (`(commit, ledger)`, `step` as applying a landed diff, and machine-checked Lean proofs of `Method.lemma` floor preservation for `revert@1` and path-disjoint edits in `~/dev/obend/lean/Obend/Judge/Genealogy.lean`).
   - Workstream 9's landing condition: self-modification of `obb` and `obend`'s kernel judged directly inside a proved Lean git habitat.
 
@@ -67,3 +66,52 @@ bedrock tooth checks the gate before and after removing its revert format. Both 
 `judge.json`; ignored `.obb/` artifacts are optional. A tier-1 Lean timing floor is explicitly
 not applicable when there are no tier-1 Lean modules; with such modules present, missing
 measurements still fail closed.
+
+
+### Receipt keys and input cones
+
+`OBB_RECEIPT_KEY` supplies literal UTF-8 key bytes (an empty value is an error). Otherwise,
+receipt issuance reads `<state-dir>/.obb/receipt.key` when `--state-dir` is supplied, then
+`<repo>/.obb/receipt.key`. If neither exists, it generates 32 random bytes in the selected
+state directory, or in the repository when no state directory was selected. Creation is
+atomic with mode `0600`; an existing key is never overwritten. Use the same state directory
+for `judge check`, `state propose`, and `state land`, and ignore `.obb/` in git.
+State uses the same precedence, requiring a constant-time MAC check when any key exists.
+Legacy hash-only receipts remain usable only where no key is configured. Key rotation
+invalidates prior receipts and cache entries.
+
+The MAC covers `receipt_hash`, which hashes the canonical receipt payload, excluding the
+hash and MAC fields themselves. Recomputing an unkeyed hash after editing a verdict does
+not produce a valid MAC. This authenticates possession of the key: mode `0600` does not
+isolate processes running as the same OS user. A hostile agent must not be allowed to read
+or replace the key or invoke an unrestricted signer. Sandbox copies omit the repository
+key and cone cache, and check subprocesses do not inherit `OBB_RECEIPT_KEY`.
+
+Floors accept a configured wrapper around the existing floor syntax:
+
+```json
+{"floor": "no_sorry_ax", "inputs": ["lean/"]}
+```
+
+The existing structured home/cap objects also accept `inputs`; named floors can use
+`{"name": "no_sorry_ax", "inputs": ["lean/"]}`. Teeth accept `inputs` alongside their existing `check_cmd`, `build_cmd`, and mutation.
+Literal paths match the path and its descendants; globs support `*`, `?`, and recursive
+`**` (including zero directories in `src/**/*.rs`). An empty or omitted list disables
+reuse. Input declarations must include every source, test, configuration, and script the
+check reads. A custom named floor can also declare a `command` and `timeout_ms` (default
+15000); it runs in a disposable copy, passes only on exit zero, and is at most `certified`.
+Use `eval:external:shell` and declare `external:shell` in the gate basis. A command cannot
+override a registered floor or claim kernel verification. Commands are deferred on the
+construction clock.
+
+Cone digests bind sorted git tree entries (paths, modes, blob/tree OIDs), the input patterns,
+the evaluator definition (including commands, timeout, and mutation patch), and the running
+executable digest. New, deleted, and changed matching paths invalidate the cone; unrelated
+commits do not. Dirty worktrees bypass reuse and cache writes. `home N` additionally binds
+HEAD because it depends on history; kernel and external measurement floors are rechecked.
+Reused verdicts preserve their original execution duration and epistemic regime. Cache
+entries are authenticated with the receipt signing key when issuing a receipt, so a weaker
+repository key cannot authorize evidence for a vault-key-signed receipt. Malformed or
+tampered entries are treated as misses. This
+is declared-dependency reuse, not proof of cone completeness: external tools, environment,
+and network state must be held fixed, or reuse must be disabled for that check.

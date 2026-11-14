@@ -9,7 +9,7 @@ use obb_cli::serve::run_server_with_options;
 use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
     Gate, JudgeClock, JudgeReceipt, TrustBase, check_revert_clean, check_succeed,
-    check_well_formed, evaluate_gate_on, issue_judge_receipt,
+    check_well_formed, evaluate_gate_on, issue_judge_receipt_with_state_dir,
 };
 use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
@@ -450,7 +450,7 @@ enum QuarrySubcommand {
 
 #[derive(Subcommand, Debug)]
 enum JudgeSubcommand {
-    /// Evaluate current `judge.json` floors against `--repo` (read-only, with isolated `#tooth` execution)
+    /// Evaluate current `judge.json` floors against `--repo` (isolated checks with opt-in cone caching)
     Check {
         #[arg(long)]
         judge: Option<PathBuf>,
@@ -1214,7 +1214,12 @@ async fn run() -> Result<ExitCode> {
                 }
                 if let Some(ref out_path) = emit_receipt {
                     let base_rev = base.as_deref().unwrap_or("main");
-                    let receipt = issue_judge_receipt(&gate, &repo, base_rev)?;
+                    let receipt = issue_judge_receipt_with_state_dir(
+                        &gate,
+                        &repo,
+                        base_rev,
+                        cli.state_dir.as_deref(),
+                    )?;
                     if let Some(parent) = out_path.parent()
                         && !parent.as_os_str().is_empty()
                     {

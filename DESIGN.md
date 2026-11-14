@@ -134,16 +134,25 @@ Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-q
    `/private/tmp` `#tooth` (`planted_fault_red`) negative-control execution (`BIT`, `VACUOUS`,
    `INVALID_TOOTH`, `POSITIVE_FAILED`), fail-closed `UnknownFloor` / `MissingMeasurement`
    diagnostics, honest `eval:lexical` (*attested*) vs `HEAD`-bound `KernelReceipt` (`eval:kernel`,
-   *decided*) regimes, and SHA-bound `JudgeReceipt` issuance (`--base`, `--emit-receipt`).
+   *decided*) regimes, and HMAC-authenticated, SHA-bound `JudgeReceipt` issuance (`--base`,
+   `--emit-receipt`). Opt-in floor/tooth input cones reuse authenticated verdicts from
+   `.obb/cache/cones/`, keyed by git input OIDs, check definitions, and the evaluator executable.
+   Dirty trees bypass reuse; history and external evidence retain their own freshness checks.
+   Key selection and the declared-dependency trust boundary are specified in `JUDGE.md`.
 4. **`obb quarry` (`obb-quarry`, `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
    synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
 5. **`obb broker`, `obb state`, `obb seg`, `obb ledger` & `obb serve` (`obb-broker`, `obb-state`)**:
    ZFS-ARC-aware SSH probe and CoW/reflink (`cp -R --reflink=auto`) `.lake/build` seed-pool router
    across `bb2` and `hbox` with `0700` per-invocation worktrees, hard wall-clock and RSS reapers,
    receipt-verified quest lifecycle (`take` with non-overlapping footprint leases, `propose`,
-   `land` with TOCTOU `StaleBaseSha` enforcement, and `AttestedOverride` emergency bypass logging),
+   `land` with TOCTOU `StaleBaseSha` enforcement and exact proposed candidate/receipt binding,
+   and `AttestedOverride` emergency bypass logging). Committed pure deletions are valid
+   `Built`/`Wired` artifacts; missing or uncommitted files are not deletion evidence. The supervisor also provides a
    segment handoff-tax & pressure statechart, SHA-256 hash-chained JSONL ledger, and live SSE
-   dashboard.
+   dashboard. `/api/lints` runs the target repository scanner in `spawn_blocking` on each
+   request, including local edits and untracked files. Responses expose `source: "live"`,
+   `scanned_at`, and count deltas against a matching repository baseline when present;
+   a committed baseline is never served as a current scan.
 6. **Multi-family Mixture-of-Agents (`Principles 3 & 4`)**: Parallel Round-1 population drafts
    across Gemini (`agy`), GPT-6-Astra (`codex exec`), and Claude-Fable-5.2 (`claude -p`) armed with
    `~/swarm/research.py` and `~/paperbin`, followed by Round-2 cross-family synthesis before Wave
