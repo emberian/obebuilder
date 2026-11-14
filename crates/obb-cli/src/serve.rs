@@ -323,16 +323,27 @@ async fn api_lints(State(cfg): State<ServeConfig>) -> impl IntoResponse {
 /// executed teeth and revert merges listed under `deferred_floors` instead of re-run per poll.
 async fn api_judge(State(cfg): State<ServeConfig>) -> impl IntoResponse {
     blocking_json(move || match Gate::load_from_path(&cfg.judge_path) {
-        Ok(gate) => match evaluate_gate_on(&gate, &cfg.workspace_root, JudgeClock::Construction) {
-            Ok(eval) => serde_json::json!({
-                "gate": gate,
-                "evaluation": eval,
-            }),
-            Err(e) => serde_json::json!({
-                "gate": gate,
-                "evaluation_error": e.to_string(),
-            }),
-        },
+        Ok(gate) => {
+            if !cfg.target_repo.is_dir() {
+                return serde_json::json!({
+                    "gate": gate,
+                    "evaluation_error": format!(
+                        "judge target directory is unavailable: {}",
+                        cfg.target_repo.display()
+                    ),
+                });
+            }
+            match evaluate_gate_on(&gate, &cfg.target_repo, JudgeClock::Construction) {
+                Ok(eval) => serde_json::json!({
+                    "gate": gate,
+                    "evaluation": eval,
+                }),
+                Err(e) => serde_json::json!({
+                    "gate": gate,
+                    "evaluation_error": e.to_string(),
+                }),
+            }
+        }
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     })
     .await
@@ -518,7 +529,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const deferredNote = deferred.length
           ? `<div class="muted" style="margin-bottom:8px">Not run here (convergence only, <code>obb judge check</code>): <code>${esc(deferred.join(', '))}</code></div>`
           : '';
-        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Achieved: <span class="badge info">${esc(jd.evaluation.achieved_regime)}</span> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` + deferredNote +
+        jb.innerHTML = `<div style="margin-bottom:8px">Gate <b>${esc(jd.gate.name)}</b> | Target: <code>${esc(jd.evaluation.repo_root)}</code> | Achieved: <span class="badge info">${esc(jd.evaluation.achieved_regime)}</span> | Basis: <code>${esc(jd.gate.basis.join(', '))}</code></div>` + deferredNote +
           '<table><tr><th>Floor</th><th>Regime</th><th>Measured</th><th>Bound</th><th>Pass</th></tr>' +
           jd.evaluation.evaluations.map(ev =>
             `<tr><td><code>${esc(ev.floor)}</code></td><td><span class="badge info">${esc(ev.regime)}</span></td><td>${ev.measured}</td><td>${esc(ev.bound)}</td><td><span class="badge ${ev.passed ? 'ok' : 'err'}">${ev.passed ? 'PASS' : 'FAIL'}</span></td></tr>`

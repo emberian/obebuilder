@@ -11,7 +11,7 @@ fn key_path(root: &Path) -> PathBuf {
 }
 
 /// Environment keys take precedence, then the selected state vault, then the candidate repo.
-/// Missing keys permit legacy hash-only receipts; unreadable or empty keys fail closed.
+/// Unreadable or empty keys fail closed; callers that verify candidate receipts require `Some(key)`.
 pub fn load_receipt_key(state_dir: Option<&Path>, repo: &Path) -> Result<Option<Vec<u8>>> {
     match std::env::var("OBB_RECEIPT_KEY") {
         Ok(value) => return nonempty(value.into_bytes()).map(Some),

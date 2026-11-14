@@ -643,10 +643,25 @@ pub enum Refusal {
 pub struct SuccessionRecord {
     pub old_name: String,
     pub new_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_gate_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_gate_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_strict_gate_sha256: Option<String>,
     pub added_floors: Vec<String>,
     pub tightened_floors: Vec<String>,
     pub lob_cost: Vec<TrustBase>,
     pub decided_at: String,
+}
+
+/// Compute `(exact_gate_sha256, strict_tests_gate_sha256)` for a configured `Gate`.
+pub fn configured_gate_digests(gate: &Gate) -> Result<(String, String)> {
+    let exact = gate.canonical_sha256()?;
+    let mut strict = gate.clone();
+    strict.require_strict_tests();
+    let strict_sha = strict.canonical_sha256()?;
+    Ok((exact, strict_sha))
 }
 
 /// Check `WellFormed` (`Genealogy.lean:87-105`) on a single `Gate`.
@@ -783,9 +798,18 @@ pub fn check_succeed(
         .map(|f| f.to_wire())
         .collect();
 
+    let old_gate_sha256 = old.canonical_sha256().ok();
+    let (new_gate_sha256, new_strict_gate_sha256) = match configured_gate_digests(new) {
+        Ok((exact, strict)) => (Some(exact), Some(strict)),
+        Err(_) => (None, None),
+    };
+
     Ok(SuccessionRecord {
         old_name: old.name.clone(),
         new_name: new.name.clone(),
+        old_gate_sha256,
+        new_gate_sha256,
+        new_strict_gate_sha256,
         added_floors,
         tightened_floors,
         lob_cost: label_set.into_iter().collect(),
@@ -1051,17 +1075,65 @@ pub enum JudgeClock {
     Construction,
 }
 
+/// Canonical working-tree toplevel and shared `.git` common directory for a git checkout.
+///
+/// Linked `git worktree`s share `common_dir` while having distinct `toplevel`s; unrelated
+/// checkouts, separate clones, and `cp -R` copies have distinct `toplevel` AND `common_dir`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepoIdentity {
+    pub toplevel: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+/// Resolve the canonical git working-tree toplevel and canonical git common directory for `repo_root`.
+pub fn resolve_git_repo_identity(repo_root: &Path) -> Result<GitRepoIdentity> {
+    let canon = repo_root
+        .canonicalize()
+        .with_context(|| format!("repo path does not exist: {}", repo_root.display()))?;
+    let toplevel_raw = run_git_ro(&canon, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("`{}` is not inside a git working tree", canon.display()))?;
+    let toplevel = Path::new(toplevel_raw.trim())
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "failed to canonicalize git toplevel `{}`",
+                toplevel_raw.trim()
+            )
+        })?;
+    let common_raw = run_git_ro(&canon, &["rev-parse", "--git-common-dir"])
+        .with_context(|| format!("failed to resolve git common dir in `{}`", canon.display()))?;
+    let common_trimmed = common_raw.trim();
+    let common_joined = if Path::new(common_trimmed).is_absolute() {
+        PathBuf::from(common_trimmed)
+    } else {
+        canon.join(common_trimmed)
+    };
+    let common_dir = common_joined.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize git common dir `{}`",
+            common_joined.display()
+        )
+    })?;
+    Ok(GitRepoIdentity {
+        toplevel,
+        common_dir,
+    })
+}
+
 /// Content-addressed candidate evaluation receipt consumed by `obb-state` transitions.
 ///
 /// `receipt_hash` identifies the canonical payload; `receipt_mac` authenticates that hash
-/// with HMAC-SHA256. `obb-state` requires authentication whenever a key is configured and
-/// independently checks git facts plus the exact proposed candidate and receipt identity.
+/// with HMAC-SHA256. `obb-state` requires authentication, binds `gate_sha256` to the
+/// campaign's configured gate, binds `(repo_root, repo_git_common_dir)` to repository identity,
+/// and independently checks git facts plus the exact proposed candidate and receipt identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeReceipt {
     pub receipt_version: u32,
     pub judge_name: String,
     pub gate_sha256: String,
     pub repo_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_git_common_dir: Option<String>,
     pub base_sha: String,
     pub head_sha: String,
     pub tree_oid: String,
@@ -1084,6 +1156,8 @@ struct JudgeReceiptSignable<'a> {
     judge_name: &'a str,
     gate_sha256: &'a str,
     repo_root: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_git_common_dir: Option<&'a str>,
     base_sha: &'a str,
     head_sha: &'a str,
     tree_oid: &'a str,
@@ -1104,6 +1178,7 @@ impl JudgeReceipt {
             judge_name: &self.judge_name,
             gate_sha256: &self.gate_sha256,
             repo_root: &self.repo_root,
+            repo_git_common_dir: self.repo_git_common_dir.as_deref(),
             base_sha: &self.base_sha,
             head_sha: &self.head_sha,
             tree_oid: &self.tree_oid,
@@ -1842,7 +1917,10 @@ fn evaluate_gate_with_key(
 
     let canon = repo_root
         .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+        .with_context(|| format!("repo path does not exist: {}", repo_root.display()))?;
+    if !canon.is_dir() {
+        bail!("repo path is not a directory: {}", canon.display());
+    }
 
     let cache = cone_cache::ConeCache::open(
         &canon,
@@ -2797,9 +2875,8 @@ pub fn issue_judge_receipt_with_state_dir(
     base_rev: &str,
     state_dir: Option<&Path>,
 ) -> Result<JudgeReceipt> {
-    let canon = repo_root
-        .canonicalize()
-        .with_context(|| format!("repo path does not exist: {}", repo_root.display()))?;
+    let repo_id = resolve_git_repo_identity(repo_root)?;
+    let canon = repo_id.toplevel;
 
     let key = receipt_auth::ensure_receipt_key(state_dir, &canon)?;
 
@@ -2844,6 +2921,7 @@ pub fn issue_judge_receipt_with_state_dir(
         judge_name: report.judge_name,
         gate_sha256,
         repo_root: canon.to_string_lossy().to_string(),
+        repo_git_common_dir: Some(repo_id.common_dir.to_string_lossy().to_string()),
         base_sha,
         head_sha,
         tree_oid,

@@ -18,7 +18,10 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use obb_core::{ProcessSpec, Regime, Sink, sha256_hex};
-use obb_judge::{Gate, JudgeReceipt, SuccessionRecord, check_well_formed};
+use obb_judge::{
+    Gate, GitRepoIdentity, JudgeReceipt, SuccessionRecord, TrustBase, check_succeed,
+    check_well_formed, configured_gate_digests, resolve_git_repo_identity,
+};
 use obb_lint::run_repo_lints;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -189,6 +192,20 @@ pub enum StateRefusal {
     TamperedReceipt { quest_id: String, reason: String },
 
     #[error(
+        "GateMismatch: quest `{quest_id}` (campaign `{campaign_id}`) requires configured gate digest `{expected_gate_sha256}`, receipt carried `{receipt_gate_sha256}` ({reason})"
+    )]
+    GateMismatch {
+        quest_id: String,
+        campaign_id: String,
+        expected_gate_sha256: String,
+        receipt_gate_sha256: String,
+        reason: String,
+    },
+
+    #[error("RepoMismatch: quest `{quest_id}` rejected repository mismatch: {reason}")]
+    RepoMismatch { quest_id: String, reason: String },
+
+    #[error(
         "StaleBaseSha: quest `{quest_id}` receipt base `{receipt_base_sha}` does not match live `{trunk_branch}` tip `{current_trunk_sha}` (rebase and re-run `obb judge`)"
     )]
     StaleBaseSha {
@@ -335,6 +352,12 @@ pub struct CampaignRow {
     pub state: String,
     pub aim_statement: String,
     pub target_repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_gate_sha256: Option<String>,
     #[serde(default = "default_live_origin")]
     pub origin: String,
     pub updated_at: String,
@@ -366,6 +389,8 @@ pub struct QuestRow {
     pub landed_sha: Option<String>,
     #[serde(default)]
     pub verified_receipt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_gate_sha256: Option<String>,
     pub tooth_witness: Option<String>,
     pub updated_at: String,
 }
@@ -608,6 +633,11 @@ impl StateStore {
                 state TEXT NOT NULL,
                 aim_statement TEXT NOT NULL,
                 target_repo TEXT NOT NULL,
+                judge_path TEXT,
+                gate_sha256 TEXT,
+                strict_gate_sha256 TEXT,
+                gate_json TEXT,
+                lob_allowance_json TEXT NOT NULL DEFAULT '[]',
                 origin TEXT NOT NULL DEFAULT 'live',
                 updated_at TEXT NOT NULL
             );
@@ -628,6 +658,7 @@ impl StateStore {
                 proposed_head_sha TEXT,
                 landed_sha TEXT,
                 verified_receipt_hash TEXT,
+                verified_gate_sha256 TEXT,
                 tooth_witness TEXT,
                 updated_at TEXT NOT NULL
             );
@@ -670,6 +701,11 @@ impl StateStore {
         // Safe schema migration for any pre-v7 SQLite DBs
         for (table, col_ddl) in [
             ("campaigns", "origin TEXT NOT NULL DEFAULT 'live'"),
+            ("campaigns", "judge_path TEXT"),
+            ("campaigns", "gate_sha256 TEXT"),
+            ("campaigns", "strict_gate_sha256 TEXT"),
+            ("campaigns", "gate_json TEXT"),
+            ("campaigns", "lob_allowance_json TEXT NOT NULL DEFAULT '[]'"),
             (
                 "quests",
                 "effective_regime TEXT NOT NULL DEFAULT 'attested'",
@@ -681,6 +717,7 @@ impl StateStore {
             ("quests", "proposed_head_sha TEXT"),
             ("quests", "landed_sha TEXT"),
             ("quests", "verified_receipt_hash TEXT"),
+            ("quests", "verified_gate_sha256 TEXT"),
             ("segments", "origin TEXT NOT NULL DEFAULT 'live'"),
         ] {
             let col_name = col_ddl.split_whitespace().next().unwrap_or("");
@@ -952,6 +989,77 @@ impl StateStore {
     }
 
     pub fn record_lob_succession(&self, rec: &SuccessionRecord) -> Result<LedgerEvent> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        if let (Some(old_sha), Some(new_sha)) = (
+            rec.old_gate_sha256.as_deref(),
+            rec.new_gate_sha256.as_deref(),
+        ) {
+            let strict_sha = rec.new_strict_gate_sha256.as_deref().unwrap_or(new_sha);
+            let lob_json = serde_json::to_string(&rec.lob_cost)?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE campaigns
+                 SET gate_sha256 = ?1, strict_gate_sha256 = ?2, gate_json = NULL, lob_allowance_json = ?3, updated_at = ?4
+                 WHERE origin = ?5 AND gate_sha256 = ?6",
+                params![new_sha, strict_sha, lob_json, now, ORIGIN_LIVE, old_sha],
+            )?;
+        }
+        let ev = self.append_lob_ledger_entry(rec)?;
+        tx.commit()?;
+        Ok(ev)
+    }
+
+    /// Record a verified `SuccessionRecord` and atomically advance any live campaigns bound to
+    /// `rec.old_gate_sha256` onto `new_gate` after re-checking `check_succeed`.
+    pub fn record_lob_succession_with_gate(
+        &self,
+        rec: &SuccessionRecord,
+        new_gate: &Gate,
+    ) -> Result<LedgerEvent> {
+        check_well_formed(new_gate)
+            .map_err(|e| anyhow::anyhow!("succeeded gate is not WellFormed: {e}"))?;
+        let (new_sha, new_strict_sha) = configured_gate_digests(new_gate)?;
+        let new_gate_json = serde_json::to_string(new_gate)?;
+        let now = Utc::now().to_rfc3339();
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        if let Some(old_sha) = rec.old_gate_sha256.as_deref() {
+            let mut stmt = tx.prepare(
+                "SELECT id, gate_json FROM campaigns WHERE origin = ?1 AND gate_sha256 = ?2",
+            )?;
+            let matching: Vec<(String, Option<String>)> = stmt
+                .query_map(params![ORIGIN_LIVE, old_sha], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+
+            for (cid, old_json_opt) in matching {
+                if let Some(old_json) = old_json_opt {
+                    let old_gate: Gate = serde_json::from_str(&old_json)
+                        .with_context(|| format!("corrupt stored gate_json on campaign `{cid}`"))?;
+                    check_succeed(&old_gate, new_gate, &rec.lob_cost).map_err(|e| {
+                        anyhow::anyhow!(
+                            "campaign `{cid}` refused non-monotone judge succession: {e}"
+                        )
+                    })?;
+                }
+                tx.execute(
+                    "UPDATE campaigns
+                     SET gate_sha256 = ?1, strict_gate_sha256 = ?2, gate_json = ?3, lob_allowance_json = '[]', updated_at = ?4
+                     WHERE id = ?5",
+                    params![new_sha, new_strict_sha, new_gate_json, now, cid],
+                )?;
+            }
+        }
+        let ev = self.append_lob_ledger_entry(rec)?;
+        tx.commit()?;
+        Ok(ev)
+    }
+
+    fn append_lob_ledger_entry(&self, rec: &SuccessionRecord) -> Result<LedgerEvent> {
         let summary = if rec.lob_cost.is_empty() {
             format!(
                 "Judge succession {} -> {} (conservatively stronger, 0 new trust)",
@@ -978,6 +1086,47 @@ impl StateStore {
     // Campaign & Quest State Machines (`spec/process.json`)
     // -------------------------------------------------------------------------
 
+    fn resolve_repo_path(&self, raw_repo: &str) -> PathBuf {
+        let p = Path::new(raw_repo);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.workspace_root.join(p)
+        }
+    }
+
+    fn map_campaign_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CampaignRow> {
+        Ok(CampaignRow {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            state: r.get(2)?,
+            aim_statement: r.get(3)?,
+            target_repo: r.get(4)?,
+            judge_path: r.get(5)?,
+            gate_sha256: r.get(6)?,
+            strict_gate_sha256: r.get(7)?,
+            origin: r.get(8)?,
+            updated_at: r.get(9)?,
+        })
+    }
+
+    pub fn get_campaign(&self, id: &str) -> Result<Option<CampaignRow>> {
+        let conn = self.conn()?;
+        Self::load_campaign_in_conn(&conn, id)
+    }
+
+    fn load_campaign_in_conn(conn: &Connection, id: &str) -> Result<Option<CampaignRow>> {
+        conn.query_row(
+            "SELECT id, title, state, aim_statement, target_repo, judge_path, gate_sha256,
+                    strict_gate_sha256, origin, updated_at
+             FROM campaigns WHERE id = ?1",
+            params![id],
+            Self::map_campaign_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn create_campaign(
         &self,
         id: &str,
@@ -987,12 +1136,50 @@ impl StateStore {
     ) -> Result<CampaignRow> {
         let now = Utc::now().to_rfc3339();
         let initial = self.spec.machines.campaign.initial.clone();
+        let repo_path = self.resolve_repo_path(target_repo);
+        let default_jpath = repo_path.join("judge.json");
+        let (judge_path, gate_sha256, strict_gate_sha256, gate_json) = if default_jpath.is_file() {
+            match Gate::load_from_path(&default_jpath) {
+                Ok(gate) if check_well_formed(&gate).is_ok() => {
+                    let (exact, strict) = configured_gate_digests(&gate)?;
+                    let canon_jpath = default_jpath
+                        .canonicalize()
+                        .unwrap_or_else(|_| default_jpath.clone())
+                        .to_string_lossy()
+                        .to_string();
+                    (
+                        Some(canon_jpath),
+                        Some(exact),
+                        Some(strict),
+                        Some(serde_json::to_string(&gate)?),
+                    )
+                }
+                _ => (None, None, None, None),
+            }
+        } else {
+            (None, None, None, None)
+        };
+
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO campaigns (id, title, state, aim_statement, target_repo, origin, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, title, initial, aim_statement, target_repo, ORIGIN_LIVE, now],
+            "INSERT OR REPLACE INTO campaigns
+             (id, title, state, aim_statement, target_repo, judge_path, gate_sha256, strict_gate_sha256,
+              gate_json, lob_allowance_json, origin, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]', ?10, ?11)",
+            params![
+                id,
+                title,
+                initial,
+                aim_statement,
+                target_repo,
+                judge_path,
+                gate_sha256,
+                strict_gate_sha256,
+                gate_json,
+                ORIGIN_LIVE,
+                now
+            ],
         )?;
         let row = CampaignRow {
             id: id.to_string(),
@@ -1000,6 +1187,9 @@ impl StateStore {
             state: initial.clone(),
             aim_statement: aim_statement.to_string(),
             target_repo: target_repo.to_string(),
+            judge_path,
+            gate_sha256,
+            strict_gate_sha256,
             origin: ORIGIN_LIVE.to_string(),
             updated_at: now,
         };
@@ -1025,16 +1215,10 @@ impl StateStore {
         let tx = conn
             .transaction()
             .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
-        let cur: Option<(String, String, String, String, String)> = tx
-            .query_row(
-                "SELECT title, state, aim_statement, target_repo, origin FROM campaigns WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()
-            .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+        let cur = Self::load_campaign_in_conn(&tx, id)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
 
-        let Some((title, from_state, aim_statement, target_repo, origin)) = cur else {
+        let Some(cur_row) = cur else {
             return Err(StateRefusal::IllegalTransition {
                 machine: "campaign".into(),
                 id: id.into(),
@@ -1042,6 +1226,8 @@ impl StateStore {
                 to: to_state.into(),
             });
         };
+        let from_state = cur_row.state.clone();
+        let origin = cur_row.origin.clone();
 
         let Some(tr) = self.spec.find_campaign_transition(&from_state, to_state) else {
             return Err(StateRefusal::IllegalTransition {
@@ -1054,11 +1240,10 @@ impl StateStore {
 
         let (evidence_note, is_override) = self.evaluate_campaign_guard(
             &tx,
-            id,
+            &cur_row,
             &from_state,
             to_state,
             tr.guard.as_deref(),
-            &target_repo,
             &evidence,
         )?;
 
@@ -1069,15 +1254,9 @@ impl StateStore {
         )
         .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
 
-        let updated = CampaignRow {
-            id: id.to_string(),
-            title,
-            state: to_state.to_string(),
-            aim_statement,
-            target_repo,
-            origin: origin.clone(),
-            updated_at: now,
-        };
+        let updated = Self::load_campaign_in_conn(&tx, id)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?
+            .ok_or_else(|| StateRefusal::StorageError(format!("campaign `{id}` disappeared")))?;
         let event_type = if is_override {
             "campaign.override_transition"
         } else {
@@ -1093,6 +1272,7 @@ impl StateStore {
                 "origin": origin,
                 "regime": if is_override { REGIME_ATTESTED_OVERRIDE } else { "verified_guard" },
                 "merged_ungated": is_override,
+                "gate_sha256": updated.gate_sha256,
                 "evidence": evidence,
             }),
         )?;
@@ -1101,17 +1281,17 @@ impl StateStore {
         Ok(updated)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_campaign_guard(
         &self,
         tx: &rusqlite::Transaction<'_>,
-        id: &str,
+        campaign: &CampaignRow,
         from_state: &str,
         to_state: &str,
         guard_name: Option<&str>,
-        target_repo: &str,
         evidence: &CampaignGuardEvidence,
     ) -> std::result::Result<(String, bool), StateRefusal> {
+        let id = campaign.id.as_str();
+        let target_repo = campaign.target_repo.as_str();
         if let CampaignGuardEvidence::AttestedOverride { operator, reason } = evidence {
             if operator.trim().is_empty() || reason.trim().is_empty() {
                 return Err(StateRefusal::GuardFailed {
@@ -1166,7 +1346,7 @@ impl StateStore {
                             reason: "G1 requires at least one named foundation file".into(),
                         });
                     }
-                    let repo_p = Path::new(target_repo);
+                    let repo_p = self.resolve_repo_path(target_repo);
                     for rel in foundation_files {
                         let p = if Path::new(rel).is_absolute() {
                             PathBuf::from(rel)
@@ -1214,8 +1394,91 @@ impl StateStore {
                         guard: "G2".into(),
                         reason: format!("G2 active judge `{}` is not WellFormed: {e}", gate.name),
                     })?;
+                    let (new_sha, new_strict_sha) =
+                        configured_gate_digests(&gate).map_err(|e| StateRefusal::GuardFailed {
+                            guard: "G2".into(),
+                            reason: format!("G2 failed to compute canonical gate digest: {e:#}"),
+                        })?;
+
+                    let stored_meta: (Option<String>, String) = tx
+                        .query_row(
+                            "SELECT gate_json, lob_allowance_json FROM campaigns WHERE id = ?1",
+                            params![id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+
+                    if let Some(old_json) = stored_meta.0 {
+                        let old_gate: Gate = serde_json::from_str(&old_json).map_err(|e| {
+                            StateRefusal::GuardFailed {
+                                guard: "G2".into(),
+                                reason: format!("corrupt stored campaign gate JSON: {e}"),
+                            }
+                        })?;
+                        let old_sha = old_gate.canonical_sha256().unwrap_or_default();
+                        if new_sha != old_sha {
+                            let allowed_lobs: Vec<TrustBase> =
+                                serde_json::from_str(&stored_meta.1).unwrap_or_default();
+                            let needed_lobs: Vec<TrustBase> = gate
+                                .basis
+                                .iter()
+                                .filter(|tb| !old_gate.basis.contains(tb))
+                                .cloned()
+                                .collect();
+                            for tb in &needed_lobs {
+                                if !allowed_lobs.contains(tb) {
+                                    return Err(StateRefusal::GuardFailed {
+                                        guard: "G2".into(),
+                                        reason: format!(
+                                            "G2 candidate judge `{}` adds trust `{}` without prior `G4` `JudgeSuccession` authorization",
+                                            gate.name, tb
+                                        ),
+                                    });
+                                }
+                            }
+                            check_succeed(&old_gate, &gate, &needed_lobs).map_err(|e| {
+                                StateRefusal::GuardFailed {
+                                    guard: "G2".into(),
+                                    reason: format!(
+                                        "G2 cannot brief campaign `{id}` with a weaker/regressed judge `{}`: {e}",
+                                        gate.name
+                                    ),
+                                }
+                            })?;
+                        }
+                    } else if let Some(ref prev_sha) = campaign.gate_sha256
+                        && &new_sha != prev_sha
+                    {
+                        return Err(StateRefusal::GuardFailed {
+                            guard: "G2".into(),
+                            reason: format!(
+                                "G2 judge digest `{new_sha}` does not match succeeded campaign gate digest `{prev_sha}`"
+                            ),
+                        });
+                    }
+
+                    let canon_jpath = judge_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| judge_path.clone())
+                        .to_string_lossy()
+                        .to_string();
+                    let new_gate_json = serde_json::to_string(&gate)
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+                    tx.execute(
+                        "UPDATE campaigns
+                         SET judge_path = ?1, gate_sha256 = ?2, strict_gate_sha256 = ?3,
+                             gate_json = ?4, lob_allowance_json = '[]'
+                         WHERE id = ?5",
+                        params![canon_jpath, new_sha, new_strict_sha, new_gate_json, id],
+                    )
+                    .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+
                     Ok((
-                        format!("G2 verified WellFormed judge `{}` ({note})", gate.name),
+                        format!(
+                            "G2 verified WellFormed judge `{}` [gate_sha256={}] ({note})",
+                            gate.name,
+                            &new_sha[..12.min(new_sha.len())]
+                        ),
                         false,
                     ))
                 }
@@ -1241,6 +1504,47 @@ impl StateStore {
                 CampaignGuardEvidence::JudgeSuccession { record }
                     if !record.old_name.is_empty() && !record.new_name.is_empty() =>
                 {
+                    if let (Some(cur_sha), Some(rec_old)) = (
+                        campaign.gate_sha256.as_deref(),
+                        record.old_gate_sha256.as_deref(),
+                    ) && cur_sha != rec_old
+                        && record.new_gate_sha256.as_deref() != Some(cur_sha)
+                    {
+                        return Err(StateRefusal::GuardFailed {
+                            guard: "G4".into(),
+                            reason: format!(
+                                "G4 succession record old_gate_sha256 `{rec_old}` does not match campaign `{id}` gate_sha256 `{cur_sha}`"
+                            ),
+                        });
+                    }
+                    let lob_json = serde_json::to_string(&record.lob_cost)
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+                    let has_gate_json: Option<String> = tx
+                        .query_row(
+                            "SELECT gate_json FROM campaigns WHERE id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+                    if has_gate_json.is_some() {
+                        tx.execute(
+                            "UPDATE campaigns SET lob_allowance_json = ?1 WHERE id = ?2",
+                            params![lob_json, id],
+                        )
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+                    } else if let Some(ref new_sha) = record.new_gate_sha256 {
+                        let strict_sha = record
+                            .new_strict_gate_sha256
+                            .as_deref()
+                            .unwrap_or(new_sha.as_str());
+                        tx.execute(
+                            "UPDATE campaigns
+                             SET gate_sha256 = ?1, strict_gate_sha256 = ?2, lob_allowance_json = ?3
+                             WHERE id = ?4",
+                            params![new_sha, strict_sha, lob_json, id],
+                        )
+                        .map_err(|e| StateRefusal::StorageError(e.to_string()))?;
+                    }
                     Ok((
                         format!("G4 succession `{} -> {}`", record.old_name, record.new_name),
                         false,
@@ -1280,8 +1584,8 @@ impl StateStore {
             "INSERT OR REPLACE INTO quests
              (id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime,
               effective_regime, merged_ungated, origin, footprint_json, base_sha, proposed_head_sha,
-              landed_sha, verified_receipt_hash, tooth_witness, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6, 'attested', 0, ?7, '[]', NULL, NULL, NULL, NULL, NULL, ?8)",
+              landed_sha, verified_receipt_hash, verified_gate_sha256, tooth_witness, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6, 'attested', 0, ?7, '[]', NULL, NULL, NULL, NULL, NULL, NULL, ?8)",
             params![
                 id,
                 campaign_id,
@@ -1310,6 +1614,7 @@ impl StateStore {
             proposed_head_sha: None,
             landed_sha: None,
             verified_receipt_hash: None,
+            verified_gate_sha256: None,
             tooth_witness: None,
             updated_at: now,
         };
@@ -1332,7 +1637,8 @@ impl StateStore {
         conn.query_row(
             "SELECT id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime,
                     effective_regime, merged_ungated, origin, footprint_json, base_sha,
-                    proposed_head_sha, landed_sha, verified_receipt_hash, tooth_witness, updated_at
+                    proposed_head_sha, landed_sha, verified_receipt_hash, verified_gate_sha256,
+                    tooth_witness, updated_at
              FROM quests WHERE id = ?1",
             params![id],
             Self::map_quest_row,
@@ -1361,8 +1667,9 @@ impl StateStore {
             proposed_head_sha: r.get(13)?,
             landed_sha: r.get(14)?,
             verified_receipt_hash: r.get(15)?,
-            tooth_witness: r.get(16)?,
-            updated_at: r.get(17)?,
+            verified_gate_sha256: r.get(16)?,
+            tooth_witness: r.get(17)?,
+            updated_at: r.get(18)?,
         })
     }
 
@@ -1376,8 +1683,8 @@ impl StateStore {
             "INSERT OR REPLACE INTO quests
              (id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime,
               effective_regime, merged_ungated, origin, footprint_json, base_sha, proposed_head_sha,
-              landed_sha, verified_receipt_hash, tooth_witness, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+              landed_sha, verified_receipt_hash, verified_gate_sha256, tooth_witness, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 q.id,
                 q.campaign_id,
@@ -1395,6 +1702,7 @@ impl StateStore {
                 q.proposed_head_sha,
                 q.landed_sha,
                 q.verified_receipt_hash,
+                q.verified_gate_sha256,
                 q.tooth_witness,
                 q.updated_at,
             ],
@@ -1445,7 +1753,104 @@ impl StateStore {
         Ok(())
     }
 
-    /// Verify a `JudgeReceipt` against live git state, trunk SHA freshness, `#tooth` execution,
+    /// Verify that `repo_root` is a valid git checkout belonging to the same canonical repository
+    /// (`git-common-dir`) as the quest's configured `campaign.target_repo`.
+    fn verify_quest_repo(
+        &self,
+        quest_id: &str,
+        campaign_id: &str,
+        repo_root: &Path,
+    ) -> std::result::Result<(CampaignRow, GitRepoIdentity), StateRefusal> {
+        let live_repo =
+            resolve_git_repo_identity(repo_root).map_err(|e| StateRefusal::RepoMismatch {
+                quest_id: quest_id.to_string(),
+                reason: format!(
+                    "`{}` is not a valid git checkout: {e:#}",
+                    repo_root.display()
+                ),
+            })?;
+        let campaign = self
+            .get_campaign(campaign_id)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?
+            .ok_or_else(|| StateRefusal::GuardFailed {
+                guard: "campaign".into(),
+                reason: format!("quest `{quest_id}` references missing campaign `{campaign_id}`"),
+            })?;
+        if !campaign.target_repo.trim().is_empty() {
+            let target_path = self.resolve_repo_path(&campaign.target_repo);
+            let campaign_repo = resolve_git_repo_identity(&target_path).map_err(|e| {
+                StateRefusal::RepoMismatch {
+                    quest_id: quest_id.to_string(),
+                    reason: format!(
+                        "campaign `{campaign_id}` target_repo `{}` is not a valid git checkout: {e:#}",
+                        target_path.display()
+                    ),
+                }
+            })?;
+            if live_repo.common_dir != campaign_repo.common_dir {
+                return Err(StateRefusal::RepoMismatch {
+                    quest_id: quest_id.to_string(),
+                    reason: format!(
+                        "`--repo` `{}` (git common dir `{}`) does not belong to campaign `{campaign_id}` target repository `{}` (git common dir `{}`)",
+                        live_repo.toplevel.display(),
+                        live_repo.common_dir.display(),
+                        campaign_repo.toplevel.display(),
+                        campaign_repo.common_dir.display()
+                    ),
+                });
+            }
+        }
+        Ok((campaign, live_repo))
+    }
+
+    fn resolve_campaign_gate_digests(
+        &self,
+        quest_id: &str,
+        campaign: &CampaignRow,
+    ) -> std::result::Result<(String, String), StateRefusal> {
+        if let Some(ref exact) = campaign.gate_sha256 {
+            let strict = campaign
+                .strict_gate_sha256
+                .clone()
+                .unwrap_or_else(|| exact.clone());
+            return Ok((exact.clone(), strict));
+        }
+        let fallback_jpath = self
+            .resolve_repo_path(&campaign.target_repo)
+            .join("judge.json");
+        let gate = Gate::load_from_path(&fallback_jpath).map_err(|e| StateRefusal::GateMismatch {
+            quest_id: quest_id.to_string(),
+            campaign_id: campaign.id.clone(),
+            expected_gate_sha256: "<unconfigured>".into(),
+            receipt_gate_sha256: String::new(),
+            reason: format!(
+                "campaign `{}` has no configured gate digest and `{}` could not be loaded: {e:#}",
+                campaign.id,
+                fallback_jpath.display()
+            ),
+        })?;
+        check_well_formed(&gate).map_err(|e| StateRefusal::GateMismatch {
+            quest_id: quest_id.to_string(),
+            campaign_id: campaign.id.clone(),
+            expected_gate_sha256: "<malformed>".into(),
+            receipt_gate_sha256: String::new(),
+            reason: format!(
+                "campaign `{}` judge `{}` failed WellFormed check: {e}",
+                campaign.id,
+                fallback_jpath.display()
+            ),
+        })?;
+        configured_gate_digests(&gate).map_err(|e| StateRefusal::GateMismatch {
+            quest_id: quest_id.to_string(),
+            campaign_id: campaign.id.clone(),
+            expected_gate_sha256: "<digest-error>".into(),
+            receipt_gate_sha256: String::new(),
+            reason: format!("{e:#}"),
+        })
+    }
+
+    /// Verify a `JudgeReceipt` against repository identity, HMAC receipt authentication, campaign
+    /// `gate_sha256` provenance, live git state, trunk SHA freshness, `#tooth` execution,
     /// footprint lease, and `target_regime`.
     fn verify_candidate_receipt(
         &self,
@@ -1463,19 +1868,84 @@ impl StateStore {
                 reason: format!("{e:#}"),
             })?;
 
-        let key = obb_judge::receipt_auth::load_receipt_key(Some(&self.state_dir), repo_root)
+        let (campaign, live_repo) = self.verify_quest_repo(&q.id, &q.campaign_id, repo_root)?;
+
+        // Bind receipt to canonical repository identity (`repo_root` + `repo_git_common_dir`) so
+        // receipts cannot be transplanted across unrelated checkouts, clones, or `cp -R` copies.
+        let receipt_toplevel = Path::new(&receipt.repo_root)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&receipt.repo_root));
+        if let Some(ref r_common) = receipt.repo_git_common_dir {
+            let receipt_common = Path::new(r_common)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(r_common));
+            if receipt_common != live_repo.common_dir {
+                return Err(StateRefusal::RepoMismatch {
+                    quest_id: q.id.clone(),
+                    reason: format!(
+                        "JudgeReceipt was issued for git repository `{}` (worktree `{}`), cannot transplant into `{}` (git common dir `{}`)",
+                        receipt_common.display(),
+                        receipt_toplevel.display(),
+                        live_repo.toplevel.display(),
+                        live_repo.common_dir.display()
+                    ),
+                });
+            }
+            if !allow_already_fast_forwarded && receipt_toplevel != live_repo.toplevel {
+                return Err(StateRefusal::RepoMismatch {
+                    quest_id: q.id.clone(),
+                    reason: format!(
+                        "JudgeReceipt was issued in worktree `{}`, but propose `--repo` is `{}`",
+                        receipt_toplevel.display(),
+                        live_repo.toplevel.display()
+                    ),
+                });
+            }
+        } else if receipt_toplevel != live_repo.toplevel {
+            return Err(StateRefusal::RepoMismatch {
+                quest_id: q.id.clone(),
+                reason: format!(
+                    "JudgeReceipt `repo_root` `{}` does not match canonical target checkout `{}`",
+                    receipt_toplevel.display(),
+                    live_repo.toplevel.display()
+                ),
+            });
+        }
+
+        // Authenticate `receipt_mac` fail-closed using only trusted vault/repository keys.
+        let mut key =
+            obb_judge::receipt_auth::load_receipt_key(Some(&self.state_dir), &live_repo.toplevel)
+                .map_err(|e| StateRefusal::TamperedReceipt {
+                quest_id: q.id.clone(),
+                reason: format!("{e:#}"),
+            })?;
+        if key.is_none()
+            && allow_already_fast_forwarded
+            && receipt_toplevel != live_repo.toplevel
+            && resolve_git_repo_identity(&receipt_toplevel)
+                .map(|id| id.common_dir == live_repo.common_dir)
+                .unwrap_or(false)
+        {
+            key = obb_judge::receipt_auth::load_receipt_key(None, &receipt_toplevel).map_err(
+                |e| StateRefusal::TamperedReceipt {
+                    quest_id: q.id.clone(),
+                    reason: format!("{e:#}"),
+                },
+            )?;
+        }
+        let Some(key) = key else {
+            return Err(StateRefusal::TamperedReceipt {
+                quest_id: q.id.clone(),
+                reason: "JudgeReceipt receipt_mac cannot be verified: no authentication key found in state vault or target repository".into(),
+            });
+        };
+        receipt
+            .verify_authenticated(&key)
             .map_err(|e| StateRefusal::TamperedReceipt {
                 quest_id: q.id.clone(),
                 reason: format!("{e:#}"),
             })?;
-        if let Some(key) = key {
-            receipt
-                .verify_authenticated(&key)
-                .map_err(|e| StateRefusal::TamperedReceipt {
-                    quest_id: q.id.clone(),
-                    reason: format!("{e:#}"),
-                })?;
-        }
+
         let same_receipt =
             q.verified_receipt_hash.as_deref() == Some(receipt.receipt_hash.as_str());
         if guard_name == "Q5"
@@ -1496,6 +1966,35 @@ impl StateStore {
                 reason: "claim receipt does not match the landed (head_sha, receipt_hash)".into(),
             });
         }
+
+        // Bind `receipt.gate_sha256` to the campaign's configured gate digest (or the landed
+        // quest's `verified_gate_sha256` at `Q6` if the campaign gate was subsequently strengthened).
+        if guard_name == "Q6"
+            && let Some(ref landed_gate_sha) = q.verified_gate_sha256
+        {
+            if &receipt.gate_sha256 != landed_gate_sha {
+                return Err(StateRefusal::GateMismatch {
+                    quest_id: q.id.clone(),
+                    campaign_id: campaign.id,
+                    expected_gate_sha256: landed_gate_sha.clone(),
+                    receipt_gate_sha256: receipt.gate_sha256.clone(),
+                    reason: "claim receipt gate_sha256 does not match landed gate digest".into(),
+                });
+            }
+        } else {
+            let (expected_sha, expected_strict_sha) =
+                self.resolve_campaign_gate_digests(&q.id, &campaign)?;
+            if receipt.gate_sha256 != expected_sha && receipt.gate_sha256 != expected_strict_sha {
+                return Err(StateRefusal::GateMismatch {
+                    quest_id: q.id.clone(),
+                    campaign_id: campaign.id,
+                    expected_gate_sha256: expected_sha,
+                    receipt_gate_sha256: receipt.gate_sha256.clone(),
+                    reason: "JudgeReceipt was earned under an unapproved or weaker judge.json than the campaign's configured gate; re-evaluate with the campaign's judge.json, succeed the judge via G4, or take an explicit AttestedOverride".into(),
+                });
+            }
+        }
+        let repo_root = live_repo.toplevel.as_path();
 
         if !receipt.all_passed {
             let failed_cells: Vec<String> = receipt
@@ -2007,6 +2506,9 @@ impl StateStore {
                     repo_root,
                     artifacts,
                 } => {
+                    let (_, live_repo) =
+                        self.verify_quest_repo(&q.id, &q.campaign_id, repo_root)?;
+                    let repo_root = &live_repo.toplevel;
                     // A committed deletion is a real artifact even though its old path is absent.
                     let deleted_files = if let Some(base) = &q.base_sha {
                         run_git_ro(
@@ -2139,6 +2641,7 @@ impl StateStore {
                     q.base_sha = Some(receipt.base_sha.clone());
                     q.proposed_head_sha = Some(receipt.head_sha.clone());
                     q.verified_receipt_hash = Some(receipt.receipt_hash.clone());
+                    q.verified_gate_sha256 = Some(receipt.gate_sha256.clone());
                 }
                 _ => {
                     return Err(StateRefusal::GuardFailed {
@@ -2212,6 +2715,7 @@ impl StateStore {
                     }
                     q.landed_sha = Some(receipt.head_sha.clone());
                     q.verified_receipt_hash = Some(receipt.receipt_hash.clone());
+                    q.verified_gate_sha256 = Some(receipt.gate_sha256.clone());
                     q.effective_regime = receipt.achieved_regime.as_str().to_string();
                 }
                 _ => {
@@ -2303,6 +2807,9 @@ impl StateStore {
                             ),
                         });
                     }
+                    let (_, live_repo) =
+                        self.verify_quest_repo(&q.id, &q.campaign_id, repo_root)?;
+                    let repo_root = &live_repo.toplevel;
                     if summary.trim().is_empty() {
                         return Err(StateRefusal::GuardFailed {
                             guard: "Q7".into(),
@@ -2386,8 +2893,18 @@ impl StateStore {
         repo_root: &Path,
         trunk_branch: &str,
     ) -> std::result::Result<QuestRow, StateRefusal> {
+        let cur = self
+            .get_quest(quest_id)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?
+            .ok_or_else(|| StateRefusal::IllegalTransition {
+                machine: "quest".into(),
+                id: quest_id.into(),
+                from: "<missing>".into(),
+                to: "Scoped".into(),
+            })?;
+        let (_, live_repo) = self.verify_quest_repo(quest_id, &cur.campaign_id, repo_root)?;
         let base_sha = run_git_ro(
-            repo_root,
+            &live_repo.toplevel,
             &[
                 "rev-parse",
                 "--verify",
@@ -2398,7 +2915,7 @@ impl StateStore {
             guard: "Q1".into(),
             reason: format!(
                 "failed to resolve trunk `{trunk_branch}` in `{}`: {e:#}",
-                repo_root.display()
+                live_repo.toplevel.display()
             ),
         })?
         .trim()
@@ -2471,6 +2988,7 @@ impl StateStore {
             updated.base_sha = Some(receipt.base_sha.clone());
             updated.proposed_head_sha = Some(receipt.head_sha.clone());
             updated.verified_receipt_hash = Some(receipt.receipt_hash.clone());
+            updated.verified_gate_sha256 = Some(receipt.gate_sha256.clone());
             updated.updated_at = Utc::now().to_rfc3339();
             Self::upsert_quest_in_tx(&tx, &updated)?;
             self.append_ledger_or_refuse(
@@ -3580,26 +4098,19 @@ impl StateStore {
         let conn = self.conn()?;
 
         let mut c_stmt = conn.prepare(
-            "SELECT id, title, state, aim_statement, target_repo, origin, updated_at FROM campaigns ORDER BY id",
+            "SELECT id, title, state, aim_statement, target_repo, judge_path, gate_sha256,
+                    strict_gate_sha256, origin, updated_at
+             FROM campaigns ORDER BY id",
         )?;
         let campaigns: Vec<CampaignRow> = c_stmt
-            .query_map([], |r| {
-                Ok(CampaignRow {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    state: r.get(2)?,
-                    aim_statement: r.get(3)?,
-                    target_repo: r.get(4)?,
-                    origin: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            })?
+            .query_map([], Self::map_campaign_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut q_stmt = conn.prepare(
             "SELECT id, campaign_id, title, state, is_sink, prior_state, holder_agent, target_regime,
                     effective_regime, merged_ungated, origin, footprint_json, base_sha,
-                    proposed_head_sha, landed_sha, verified_receipt_hash, tooth_witness, updated_at
+                    proposed_head_sha, landed_sha, verified_receipt_hash, verified_gate_sha256,
+                    tooth_witness, updated_at
              FROM quests ORDER BY id",
         )?;
         let quests: Vec<QuestRow> = q_stmt
@@ -3742,6 +4253,9 @@ impl StateStore {
             state: "Running".into(),
             aim_statement: "Every load-bearing Obend claim has a tooth, an independent spec, and zero cross-language mirrors.".into(),
             target_repo: obend_repo.to_string_lossy().to_string(),
+            judge_path: None,
+            gate_sha256: None,
+            strict_gate_sha256: None,
             origin: ORIGIN_DEMO_SEED.into(),
             updated_at: now.clone(),
         };
@@ -3858,6 +4372,7 @@ impl StateStore {
                 proposed_head_sha: None,
                 landed_sha: None,
                 verified_receipt_hash: None,
+                verified_gate_sha256: None,
                 tooth_witness: if *qid == "W1-B" {
                     Some("demo-seed-unexecuted".into())
                 } else {

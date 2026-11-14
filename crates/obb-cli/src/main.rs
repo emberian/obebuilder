@@ -1,6 +1,6 @@
 //! `obb` — Process Supervisor, Mechanical Anti-Slop Linter & Non-Regression Judge (`DESIGN.md` §6).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use obb_broker::{
     BuildPlanOptions, HostChoice, SshExecutor, plan_build as broker_plan_build, probe_hosts,
@@ -8,7 +8,7 @@ use obb_broker::{
 use obb_cli::serve::run_server_with_options;
 use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
-    Gate, JudgeClock, JudgeReceipt, TrustBase, check_revert_clean, check_succeed,
+    Gate, JudgeClock, JudgeReceipt, SuccessionRecord, TrustBase, check_revert_clean, check_succeed,
     check_well_formed, evaluate_gate_on, issue_judge_receipt_with_state_dir,
 };
 use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
@@ -171,9 +171,13 @@ enum Commands {
         #[arg(long, default_value_t = 7878)]
         port: u16,
 
-        /// Target repository for live `obb lint` inspection (read-only)
+        /// Target repository for live `obb lint` and `obb judge` inspection (read-only)
         #[arg(long, default_value = "/Users/ember/dev/obend")]
         repo: PathBuf,
+
+        /// Explicit `judge.json` path (defaults to `<repo>/judge.json` if present, else `<workspace>/judge.json`)
+        #[arg(long)]
+        judge: Option<PathBuf>,
 
         /// Explicitly populate an empty state vault with `demo_seed` fixture rows for UI preview
         #[arg(long)]
@@ -553,6 +557,8 @@ enum StateSubcommand {
         foundation_files: Vec<String>,
         #[arg(long)]
         judge: Option<PathBuf>,
+        #[arg(long)]
+        succession_record: Option<PathBuf>,
         #[arg(long)]
         override_operator: Option<String>,
         #[arg(long)]
@@ -1312,7 +1318,7 @@ async fn run() -> Result<ExitCode> {
                                 &cli.workspace,
                                 cli.state_dir.as_deref(),
                             )?;
-                            store.record_lob_succession(&rec)?;
+                            store.record_lob_succession_with_gate(&rec, &new_gate)?;
                             let formatted = serde_json::to_string_pretty(&new_gate)?;
                             std::fs::write(&jpath, format!("{formatted}\n"))?;
                         }
@@ -1468,10 +1474,12 @@ async fn run() -> Result<ExitCode> {
                     evidence,
                     foundation_files,
                     judge,
+                    succession_record,
                     override_operator,
                     override_reason,
                 } => {
                     if let Some(target) = to {
+                        let cur_camp = store.get_campaign(&id)?;
                         let ev = if let (Some(op), Some(reason)) =
                             (override_operator, override_reason)
                         {
@@ -1484,19 +1492,69 @@ async fn run() -> Result<ExitCode> {
                                 foundation_files,
                                 note: evidence,
                             }
-                        } else if target == "Running"
-                            && !foundation_files.is_empty()
-                            && judge.is_none()
-                        {
-                            CampaignGuardEvidence::Unconditional { note: evidence }
                         } else if target == "Running" {
-                            let jpath = resolve_judge_path(&cli.workspace, judge);
+                            let jpath = match judge {
+                                Some(explicit) => explicit,
+                                None => cur_camp
+                                    .as_ref()
+                                    .map(|c| {
+                                        let rp = Path::new(&c.target_repo);
+                                        if rp.is_absolute() {
+                                            rp.join("judge.json")
+                                        } else {
+                                            cli.workspace.join(rp).join("judge.json")
+                                        }
+                                    })
+                                    .filter(|p| p.is_file())
+                                    .unwrap_or_else(|| resolve_judge_path(&cli.workspace, None)),
+                            };
                             CampaignGuardEvidence::Briefed {
                                 judge_path: jpath,
                                 note: evidence,
                             }
                         } else if target == "Reground" {
                             CampaignGuardEvidence::RegroundTrigger { trigger: evidence }
+                        } else if target == "Aim"
+                            && cur_camp.as_ref().map(|c| c.state.as_str()) == Some("Reground")
+                        {
+                            let record: Option<SuccessionRecord> = if let Some(ref rec_path) =
+                                succession_record
+                            {
+                                let raw = std::fs::read_to_string(rec_path).with_context(|| {
+                                    format!(
+                                        "failed to read succession record {}",
+                                        rec_path.display()
+                                    )
+                                })?;
+                                let val: serde_json::Value = serde_json::from_str(&raw)?;
+                                if let Some(inner) = val.get("record") {
+                                    Some(serde_json::from_value(inner.clone())?)
+                                } else {
+                                    Some(serde_json::from_value(val)?)
+                                }
+                            } else {
+                                let camp_sha =
+                                    cur_camp.as_ref().and_then(|c| c.gate_sha256.as_deref());
+                                store
+                                    .read_ledger()?
+                                    .into_iter()
+                                    .rev()
+                                    .filter(|e| e.event_type == "judge.lob_cost")
+                                    .filter_map(|e| {
+                                        serde_json::from_value::<SuccessionRecord>(e.payload).ok()
+                                    })
+                                    .find(|rec| match camp_sha {
+                                        Some(sha) => {
+                                            rec.old_gate_sha256.as_deref() == Some(sha)
+                                                || rec.new_gate_sha256.as_deref() == Some(sha)
+                                        }
+                                        None => true,
+                                    })
+                            };
+                            match record {
+                                Some(record) => CampaignGuardEvidence::JudgeSuccession { record },
+                                None => CampaignGuardEvidence::Unconditional { note: evidence },
+                            }
                         } else {
                             CampaignGuardEvidence::Unconditional { note: evidence }
                         };
@@ -1898,9 +1956,20 @@ async fn run() -> Result<ExitCode> {
             host,
             port,
             repo,
+            judge,
             seed_demo,
         } => {
-            let jpath = resolve_judge_path(&cli.workspace, None);
+            let jpath = match judge {
+                Some(explicit) => explicit,
+                None => {
+                    let target_judge = repo.join("judge.json");
+                    if target_judge.is_file() {
+                        target_judge
+                    } else {
+                        resolve_judge_path(&cli.workspace, None)
+                    }
+                }
+            };
             if !jpath.is_file() {
                 bail!("judge.json not found at {}", jpath.display());
             }

@@ -19,13 +19,13 @@
 
 use obb_core::Regime;
 use obb_judge::{
-    Floor, FloorDiagnostic, Gate, JudgeReceipt, KernelReceipt, Method, MethodBinding,
-    ToothMutation, ToothSpec, ToothVerdict, TrustBase, evaluate_gate, evaluate_teeth,
-    issue_judge_receipt,
+    Floor, FloorDiagnostic, Gate, JudgeClock, JudgeReceipt, KernelReceipt, Method, MethodBinding,
+    ToothMutation, ToothSpec, ToothVerdict, TrustBase, check_succeed, evaluate_gate,
+    evaluate_gate_on, evaluate_teeth, issue_judge_receipt, issue_judge_receipt_with_state_dir,
 };
 use obb_state::{
-    ORIGIN_DEMO_SEED, ORIGIN_LIVE, QuestGuardEvidence, REGIME_ATTESTED_OVERRIDE, StateRefusal,
-    StateStore,
+    CampaignGuardEvidence, ORIGIN_DEMO_SEED, ORIGIN_LIVE, QuestGuardEvidence,
+    REGIME_ATTESTED_OVERRIDE, StateRefusal, StateStore,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -2459,7 +2459,11 @@ fn wave3_cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
     // An ignored file inside the cone reaches the sandbox copy but is in no tree entry, and
     // `git status` stays clean.
     write_rel(&repo, ".git/info/exclude", "src/local.txt\n");
-    write_rel(&repo, "src/local.txt", "ignored, yet readable by the check\n");
+    write_rel(
+        &repo,
+        "src/local.txt",
+        "ignored, yet readable by the check\n",
+    );
     for _ in 0..2 {
         assert_eq!(run(&gate), (true, false, false));
     }
@@ -2478,11 +2482,7 @@ fn wave3_cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
             .unwrap()
             .clean_working_tree
     );
-    assert!(
-        !StateStore::probe_git_q5(&repo)
-            .unwrap()
-            .clean_working_tree
-    );
+    assert!(!StateStore::probe_git_q5(&repo).unwrap().clean_working_tree);
 }
 
 #[test]
@@ -2639,4 +2639,584 @@ async fn wave2_lints_scan_live_target_and_report_baseline_delta() {
         assert_eq!(count > 0, add_fault, "{json}");
         assert_eq!(json["delta"]["total_findings"], json["total_findings"]);
     }
+}
+
+#[test]
+fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
+    let tmp = temp_in_private_tmp("obb-wave2-gate-bind-");
+    let (repo, strong_gate) = wave2_repo(tmp.path());
+    let state = tmp.path().join("state");
+    let store = wave2_take(&repo, &state);
+
+    let strong_sha = strong_gate.canonical_sha256().unwrap();
+    let camp0 = store.get_campaign("C").unwrap().unwrap();
+    assert_eq!(camp0.gate_sha256.as_deref(), Some(strong_sha.as_str()));
+
+    // Construct a weaker gate (drops `value_is_good` floor) that still passes WellFormed + teeth.
+    let mut weak_gate = strong_gate.clone();
+    weak_gate.name = "wave2-weakened".into();
+    weak_gate
+        .floors
+        .retain(|fl| fl.cell_key() != "value_is_good");
+    weak_gate
+        .methods
+        .retain(|m| m.floor.cell_key() != "value_is_good");
+    let weak_judge_path = tmp.path().join("weak-judge.json");
+    fs::write(
+        &weak_judge_path,
+        serde_json::to_string_pretty(&weak_gate).unwrap(),
+    )
+    .unwrap();
+
+    // Even if `C` steps `Aim -> Grounded` (G1) and attempts `G2` (`Briefed`) with `weak-judge.json`,
+    // `G2` MUST refuse weakening the campaign's configured gate!
+    store
+        .transition_campaign(
+            "C",
+            "Grounded",
+            CampaignGuardEvidence::WholeRead {
+                foundation_files: vec!["judge.json".into()],
+                note: "G1 read".into(),
+            },
+        )
+        .unwrap();
+    let g2_weak_err = store
+        .transition_campaign(
+            "C",
+            "Running",
+            CampaignGuardEvidence::Briefed {
+                judge_path: weak_judge_path.clone(),
+                note: "try weaker judge".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(g2_weak_err, StateRefusal::GuardFailed { ref guard, .. } if guard == "G2"),
+        "expected G2 regression refusal, got: {g2_weak_err:?}"
+    );
+    store
+        .transition_campaign(
+            "C",
+            "Running",
+            CampaignGuardEvidence::Briefed {
+                judge_path: repo.join("judge.json"),
+                note: "brief configured strong gate".into(),
+            },
+        )
+        .unwrap();
+
+    // Candidate commit: earn a genuinely MAC-authenticated receipt under `weak_gate`.
+    write_rel(&repo, "NOTES.txt", "candidate under weak gate\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "candidate"]);
+
+    let weak_receipt =
+        issue_judge_receipt_with_state_dir(&weak_gate, &repo, "main", Some(&state)).unwrap();
+    assert!(weak_receipt.all_passed);
+    assert!(weak_receipt.receipt_mac.is_some());
+
+    // `propose_quest` (and `obb state propose` CLI) MUST reject `weak_receipt` with `GateMismatch`!
+    let prop_err = store
+        .propose_quest("Q", "worker", &weak_receipt, &repo, "main")
+        .unwrap_err();
+    assert!(
+        matches!(
+            prop_err,
+            StateRefusal::GateMismatch {
+                ref quest_id,
+                ref campaign_id,
+                ref expected_gate_sha256,
+                ref receipt_gate_sha256,
+                ..
+            } if quest_id == "Q"
+                && campaign_id == "C"
+                && expected_gate_sha256 == &strong_sha
+                && receipt_gate_sha256 == &weak_receipt.gate_sha256
+        ),
+        "expected GateMismatch, got: {prop_err:?}"
+    );
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Scoped");
+
+    let weak_receipt_file = tmp.path().join("weak-receipt.json");
+    fs::write(
+        &weak_receipt_file,
+        serde_json::to_string_pretty(&weak_receipt).unwrap(),
+    )
+    .unwrap();
+    let cli_prop = run_obb(&[
+        "--workspace",
+        repo.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "state",
+        "propose",
+        "Q",
+        "--actor",
+        "worker",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--receipt",
+        weak_receipt_file.to_str().unwrap(),
+    ]);
+    assert!(!cli_prop.status.success());
+    assert!(
+        String::from_utf8_lossy(&cli_prop.stderr).contains("GateMismatch"),
+        "expected GateMismatch in stderr, got: {}",
+        String::from_utf8_lossy(&cli_prop.stderr)
+    );
+
+    // Issue receipt under the campaign's configured `strong_gate` -> `propose_quest` succeeds.
+    let strong_receipt =
+        issue_judge_receipt_with_state_dir(&strong_gate, &repo, "main", Some(&state)).unwrap();
+    store
+        .propose_quest("Q", "worker", &strong_receipt, &repo, "main")
+        .unwrap();
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
+
+    // Monotonically strengthen the campaign gate (`wave2 -> wave2-v2`, adding `no_sorry_ax`) BEFORE landing `Q`.
+    let mut stronger_gate = strong_gate.clone();
+    stronger_gate.name = "wave2-v2".into();
+    stronger_gate
+        .floors
+        .push(Floor::Named("no_sorry_ax".into()));
+    stronger_gate.basis.push(TrustBase::Lexical);
+    for fmt in &stronger_gate.formats {
+        stronger_gate.methods.push(MethodBinding {
+            format: fmt.clone(),
+            floor: Floor::Named("no_sorry_ax".into()),
+            method: if fmt == "revert@1" {
+                Method::Lemma
+            } else {
+                Method::Eval(TrustBase::Lexical)
+            },
+        });
+    }
+    let rec = check_succeed(&strong_gate, &stronger_gate, &[TrustBase::Lexical]).unwrap();
+    store
+        .record_lob_succession_with_gate(&rec, &stronger_gate)
+        .unwrap();
+    let stronger_sha = stronger_gate.canonical_sha256().unwrap();
+    assert_eq!(
+        store
+            .get_campaign("C")
+            .unwrap()
+            .unwrap()
+            .gate_sha256
+            .as_deref(),
+        Some(stronger_sha.as_str())
+    );
+
+    // Attempting to `land_quest` with the pre-succession `strong_receipt` MUST fail closed (`GateMismatch`)
+    // without moving `main`!
+    let stale_gate_land = store
+        .land_quest("Q", "worker", &strong_receipt, &repo, "main")
+        .unwrap_err();
+    assert!(
+        matches!(stale_gate_land, StateRefusal::GateMismatch { .. }),
+        "expected GateMismatch on stale-gate land, got: {stale_gate_land:?}"
+    );
+    assert_eq!(
+        git_cmd(&repo, &["rev-parse", "main"]).trim(),
+        strong_receipt.base_sha
+    );
+
+    // Re-evaluate candidate under `stronger_gate`, re-propose `Q`, and land cleanly.
+    let stronger_receipt =
+        issue_judge_receipt_with_state_dir(&stronger_gate, &repo, "main", Some(&state)).unwrap();
+    store
+        .propose_quest("Q", "worker", &stronger_receipt, &repo, "main")
+        .unwrap();
+    store
+        .land_quest("Q", "worker", &stronger_receipt, &repo, "main")
+        .unwrap();
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Landed");
+
+    // Strengthening the campaign gate AGAIN (`wave2-v3`) AFTER `Q` has already landed must NOT brick
+    // claiming/recording `Q` on its landed evidence!
+    let mut v3_gate = stronger_gate.clone();
+    v3_gate.name = "wave2-v3".into();
+    v3_gate
+        .floors
+        .push(Floor::Named("no_declared_axiom".into()));
+    for fmt in &v3_gate.formats {
+        v3_gate.methods.push(MethodBinding {
+            format: fmt.clone(),
+            floor: Floor::Named("no_declared_axiom".into()),
+            method: if fmt == "revert@1" {
+                Method::Lemma
+            } else {
+                Method::Eval(TrustBase::Lexical)
+            },
+        });
+    }
+    let rec_v3 = check_succeed(&stronger_gate, &v3_gate, &[]).unwrap();
+    store
+        .record_lob_succession_with_gate(&rec_v3, &v3_gate)
+        .unwrap();
+
+    store
+        .transition_quest(
+            "Q",
+            "Claimed",
+            "worker",
+            None,
+            QuestGuardEvidence::Receipt {
+                receipt: Box::new(stronger_receipt),
+                repo_root: repo.clone(),
+                trunk_branch: "main".into(),
+            },
+        )
+        .unwrap();
+    let recorded = store
+        .transition_quest(
+            "Q",
+            "Recorded",
+            "worker",
+            None,
+            QuestGuardEvidence::RecordCheck {
+                repo_root: repo.clone(),
+                summary: "Landed under succeeded gate".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(recorded.state, "Recorded");
+
+    // Emergency override (`land_quest_ungated`) remains available as an explicit, non-certifying escape hatch.
+    store
+        .create_quest("Q-emerg", "C", "Hotfix", "worker", "decided")
+        .unwrap();
+    git_cmd(&repo, &["checkout", "-b", "hotfix"]);
+    write_rel(&repo, "NOTES.txt", "emergency hotfix\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "emergency hotfix"]);
+    let emerg = store
+        .land_quest_ungated(
+            "Q-emerg",
+            "ember",
+            "emergency production hotfix",
+            &repo,
+            "main",
+            "hotfix",
+        )
+        .unwrap();
+    assert_eq!(emerg.state, "Landed");
+    assert!(emerg.merged_ungated);
+    assert_eq!(emerg.effective_regime, REGIME_ATTESTED_OVERRIDE);
+    store.verify_ledger_chain().unwrap();
+}
+
+#[test]
+fn wave2_convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_linked_worktrees() {
+    fn copy_dir_all(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            let dest_path = dst.join(entry.file_name());
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dest_path);
+            } else {
+                fs::copy(entry.path(), dest_path).unwrap();
+            }
+        }
+    }
+
+    let tmp = temp_in_private_tmp("obb-wave2-repo-id-");
+    let (repo_a, gate) = wave2_repo(tmp.path());
+    let state = tmp.path().join("state");
+    let store = wave2_take(&repo_a, &state);
+
+    write_rel(&repo_a, "NOTES.txt", "candidate commit\n");
+    git_cmd(&repo_a, &["add", "NOTES.txt"]);
+    git_cmd(&repo_a, &["commit", "-m", "candidate"]);
+
+    // 1. Virgin-vault forgery check: before ANY key exists in `state` or `repo_a`, a hand-crafted
+    // receipt with `receipt_mac: None` MUST fail closed (`TamperedReceipt`), never bypass HMAC!
+    let fake_id = obb_judge::resolve_git_repo_identity(&repo_a).unwrap();
+    let head_sha = git_cmd(&repo_a, &["rev-parse", "HEAD"]).trim().to_string();
+    let base_sha = git_cmd(&repo_a, &["rev-parse", "main"]).trim().to_string();
+    let tree_oid = git_cmd(&repo_a, &["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+    let mut unkeyed_forged = JudgeReceipt {
+        receipt_version: obb_judge::RECEIPT_VERSION,
+        judge_name: gate.name.clone(),
+        gate_sha256: gate.canonical_sha256().unwrap(),
+        repo_root: fake_id.toplevel.to_string_lossy().to_string(),
+        repo_git_common_dir: Some(fake_id.common_dir.to_string_lossy().to_string()),
+        base_sha,
+        head_sha,
+        tree_oid,
+        clean_working_tree: true,
+        changed_paths: vec!["NOTES.txt".into()],
+        checked_at: "2026-11-14T00:00:00Z".into(),
+        all_passed: true,
+        achieved_regime: Regime::Decided,
+        kernel_verified: false,
+        teeth_report: obb_judge::TeethReport {
+            total: 1,
+            bit_count: 1,
+            vacuous_count: 0,
+            invalid_count: 0,
+            positive_failed_count: 0,
+            all_bit: true,
+            results: Vec::new(),
+        },
+        evaluations: Vec::new(),
+        receipt_hash: String::new(),
+        receipt_mac: None,
+    };
+    unkeyed_forged.receipt_hash = unkeyed_forged.compute_hash().unwrap();
+    let virgin_err = store
+        .propose_quest("Q", "worker", &unkeyed_forged, &repo_a, "main")
+        .unwrap_err();
+    assert!(
+        matches!(virgin_err, StateRefusal::TamperedReceipt { .. }),
+        "unauthenticated receipt on virgin vault must fail closed, got: {virgin_err:?}"
+    );
+
+    // 2. Create BOTH a separate `git clone` AND a byte-for-byte recursive copy (`cp -R`) of `repo_a`
+    // sharing the exact same commits, branches, tree OIDs, `gate_sha256`, and vault HMAC key!
+    let repo_clone = tmp.path().join("repo-clone");
+    git_cmd(
+        tmp.path(),
+        &[
+            "clone",
+            "--no-local",
+            repo_a.to_str().unwrap(),
+            repo_clone.to_str().unwrap(),
+        ],
+    );
+    git_cmd(&repo_clone, &["branch", "-f", "main", "origin/main"]);
+
+    let repo_copy = tmp.path().join("repo-copy");
+    copy_dir_all(&repo_a, &repo_copy);
+
+    let clone_receipt =
+        issue_judge_receipt_with_state_dir(&gate, &repo_clone, "main", Some(&state)).unwrap();
+    let copy_receipt =
+        issue_judge_receipt_with_state_dir(&gate, &repo_copy, "main", Some(&state)).unwrap();
+    assert!(clone_receipt.all_passed && copy_receipt.all_passed);
+    assert_eq!(clone_receipt.head_sha, copy_receipt.head_sha);
+
+    // Transplanting either receipt onto `repo_a` MUST fail closed with `RepoMismatch`!
+    for transplanted in [&clone_receipt, &copy_receipt] {
+        let err = store
+            .propose_quest("Q", "worker", transplanted, &repo_a, "main")
+            .unwrap_err();
+        assert!(
+            matches!(err, StateRefusal::RepoMismatch { .. }),
+            "expected RepoMismatch on cross-checkout receipt transplant, got: {err:?}"
+        );
+    }
+
+    // Passing `--repo repo_clone` directly to `propose_quest` or `RepoCheck` on a quest whose
+    // campaign targets `repo_a` MUST ALSO fail closed with `RepoMismatch`!
+    let wrong_repo_prop = store
+        .propose_quest("Q", "worker", &clone_receipt, &repo_clone, "main")
+        .unwrap_err();
+    assert!(
+        matches!(wrong_repo_prop, StateRefusal::RepoMismatch { .. }),
+        "expected RepoMismatch when passing clone `--repo`, got: {wrong_repo_prop:?}"
+    );
+    let wrong_repo_q2 = store
+        .transition_quest(
+            "Q",
+            "Built",
+            "worker",
+            None,
+            QuestGuardEvidence::RepoCheck {
+                repo_root: repo_clone.clone(),
+                artifacts: vec!["NOTES.txt".into()],
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(wrong_repo_q2, StateRefusal::RepoMismatch { .. }),
+        "expected RepoMismatch on Q2 RepoCheck against unrelated repo, got: {wrong_repo_q2:?}"
+    );
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Scoped");
+
+    // 3. Linked `git worktree` of `repo_a` (sharing canonical `git-common-dir` with `repo_a`):
+    // proposing in the linked worktree and landing onto `main` in `repo_a` MUST succeed!
+    git_cmd(&repo_a, &["checkout", "main"]);
+    git_cmd(&repo_a, &["branch", "-D", "candidate"]);
+    let wt = tmp.path().join("linked-wt");
+    git_cmd(
+        &repo_a,
+        &["worktree", "add", "--detach", wt.to_str().unwrap(), "main"],
+    );
+    write_rel(&wt, "NOTES.txt", "worktree candidate\n");
+    git_cmd(&wt, &["add", "NOTES.txt"]);
+    git_cmd(&wt, &["commit", "-m", "worktree candidate"]);
+
+    let wt_receipt = issue_judge_receipt_with_state_dir(&gate, &wt, "main", Some(&state)).unwrap();
+    assert!(wt_receipt.all_passed);
+
+    // Proposing with `--repo repo_a` while receipt was earned in `wt` is refused (wrong worktree at Q4),
+    // while proposing with `--repo wt` succeeds!
+    assert!(matches!(
+        store.propose_quest("Q", "worker", &wt_receipt, &repo_a, "main"),
+        Err(StateRefusal::RepoMismatch { .. })
+    ));
+    store
+        .propose_quest("Q", "worker", &wt_receipt, &wt, "main")
+        .unwrap();
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
+
+    git_cmd(&repo_a, &["worktree", "remove", wt.to_str().unwrap()]);
+    let landed = store
+        .land_quest("Q", "worker", &wt_receipt, &repo_a, "main")
+        .unwrap();
+    assert_eq!(landed.state, "Landed");
+    assert_eq!(
+        git_cmd(&repo_a, &["rev-parse", "main"]).trim(),
+        wt_receipt.head_sha
+    );
+}
+
+#[tokio::test]
+async fn wave2_convergence_serve_api_judge_evaluates_target_repo_not_workspace_root() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use obb_cli::serve::{ServeConfig, build_router};
+    use tower::ServiceExt;
+
+    let tmp = temp_in_private_tmp("obb-wave2-serve-judge-");
+    let workspace = tmp.path().join("workspace");
+    let target_repo = tmp.path().join("target-repo");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&target_repo).unwrap();
+
+    let gate = build_gate(
+        "serve-target-gate",
+        vec![
+            (
+                Floor::Home(1),
+                Method::Eval(TrustBase::External("git-merge-tree".into())),
+            ),
+            (
+                Floor::Named("no_sorry_ax".into()),
+                Method::Eval(TrustBase::Lexical),
+            ),
+        ],
+        vec![
+            TrustBase::External("git-merge-tree".into()),
+            TrustBase::Lexical,
+        ],
+        Vec::new(),
+    );
+    let judge_path = workspace.join("judge.json");
+    write_rel(
+        &workspace,
+        "judge.json",
+        &serde_json::to_string_pretty(&gate).unwrap(),
+    );
+
+    let app = build_router(
+        ServeConfig::new(workspace.clone(), target_repo.clone(), judge_path.clone())
+            .with_bearer_token("secret"),
+    );
+
+    // 1. Clean `workspace_root` + faulty `target_repo` -> `/api/judge` MUST report FAIL on `target_repo`!
+    write_rel(
+        &workspace,
+        "lean/Clean.lean",
+        "theorem ok : True := by trivial\n",
+    );
+    write_rel(
+        &target_repo,
+        "lean/Bad.lean",
+        "theorem bad : True := by sorry\n",
+    );
+
+    let resp_fail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/judge")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json_fail: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp_fail.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let canon_target = target_repo.canonicalize().unwrap();
+    assert_eq!(
+        json_fail["evaluation"]["repo_root"],
+        canon_target.to_string_lossy().as_ref(),
+        "{json_fail}"
+    );
+    assert_eq!(
+        json_fail["evaluation"]["all_passed"],
+        serde_json::json!(false),
+        "fault in target_repo must fail /api/judge even when workspace_root is clean: {json_fail}"
+    );
+
+    // 2. Faulty `workspace_root` + clean `target_repo` -> `/api/judge` MUST report PASS on `target_repo`!
+    write_rel(
+        &workspace,
+        "lean/Clean.lean",
+        "theorem broken : True := by sorry\n",
+    );
+    write_rel(
+        &target_repo,
+        "lean/Bad.lean",
+        "theorem fixed : True := by trivial\n",
+    );
+
+    let resp_pass = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/judge")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json_pass: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp_pass.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        json_pass["evaluation"]["repo_root"],
+        canon_target.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        json_pass["evaluation"]["all_passed"],
+        serde_json::json!(true),
+        "clean target_repo must pass /api/judge regardless of workspace_root contents: {json_pass}"
+    );
+
+    // 3. Nonexistent `target_repo` fails closed on both `evaluate_gate_on` and `/api/judge` (never vacuous pass).
+    let missing_target = tmp.path().join("does-not-exist");
+    assert!(evaluate_gate_on(&gate, &missing_target, JudgeClock::Construction).is_err());
+    let missing_app = build_router(
+        ServeConfig::new(workspace, missing_target, judge_path).with_bearer_token("secret"),
+    );
+    let resp_missing = missing_app
+        .oneshot(
+            Request::builder()
+                .uri("/api/judge")
+                .header("authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json_missing: serde_json::Value = serde_json::from_slice(
+        &to_bytes(resp_missing.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        json_missing["evaluation"].is_null() && json_missing["evaluation_error"].is_string(),
+        "missing target_repo must report evaluation_error: {json_missing}"
+    );
 }
