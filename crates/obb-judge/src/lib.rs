@@ -20,7 +20,7 @@
 mod cone_cache;
 pub mod pipeline;
 pub mod receipt_auth;
-pub use cone_cache::is_runtime_status_entry;
+pub use cone_cache::{hidden_index_entries, is_runtime_status_entry};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -1124,17 +1124,24 @@ impl JudgeReceipt {
     /// Authenticate the content hash; the hash itself covers every evaluation field.
     pub fn authenticate(&mut self, key: &[u8]) -> Result<()> {
         self.receipt_hash = self.compute_hash()?;
-        self.receipt_mac = Some(receipt_auth::mac_hex(key, self.receipt_hash.as_bytes()));
+        self.receipt_mac = Some(receipt_auth::mac_hex(
+            key,
+            receipt_auth::RECEIPT_CONTEXT,
+            self.receipt_hash.as_bytes(),
+        ));
         Ok(())
     }
 
     pub fn verify_authenticated(&self, key: &[u8]) -> Result<()> {
         self.verify_integrity()?;
-        if !self
-            .receipt_mac
-            .as_deref()
-            .is_some_and(|mac| receipt_auth::verify_mac(key, self.receipt_hash.as_bytes(), mac))
-        {
+        if !self.receipt_mac.as_deref().is_some_and(|mac| {
+            receipt_auth::verify_mac(
+                key,
+                receipt_auth::RECEIPT_CONTEXT,
+                self.receipt_hash.as_bytes(),
+                mac,
+            )
+        }) {
             bail!("JudgeReceipt receipt_mac is missing or invalid");
         }
         Ok(())

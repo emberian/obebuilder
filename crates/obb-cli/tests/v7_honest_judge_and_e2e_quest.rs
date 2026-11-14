@@ -2396,6 +2396,93 @@ fn wave2_land_rejects_unproposed_receipt_and_candidate_before_moving_trunk() {
     store
         .land_quest("Q", "worker", &updated, &repo, "main")
         .unwrap();
+
+    // A later receipt for the landed commit is different evidence; only the landed one claims.
+    let later = issue_judge_receipt(&gate, &repo, &updated.base_sha).unwrap();
+    assert_eq!(later.head_sha, updated.head_sha);
+    assert_ne!(later.receipt_hash, updated.receipt_hash);
+    let claim = |receipt: &JudgeReceipt| {
+        store.transition_quest(
+            "Q",
+            "Claimed",
+            "worker",
+            None,
+            QuestGuardEvidence::Receipt {
+                receipt: Box::new(receipt.clone()),
+                repo_root: repo.clone(),
+                trunk_branch: "main".into(),
+            },
+        )
+    };
+    let refused = claim(&later).unwrap_err();
+    assert!(
+        matches!(refused, StateRefusal::GuardFailed { ref reason, .. } if reason.contains("landed")),
+        "{refused:?}"
+    );
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Landed");
+    claim(&updated).unwrap();
+}
+
+#[test]
+fn wave3_cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
+    let tmp = temp_in_private_tmp("obb-wave3-cones-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    // (all floors passed, command floor reused, tooth reused)
+    let run = |gate: &Gate| {
+        let report = evaluate_gate(gate, &repo).unwrap();
+        let floor = report
+            .evaluations
+            .iter()
+            .find(|e| e.cell == "value_is_good")
+            .unwrap()
+            .reused_from_cache;
+        (
+            report.all_passed,
+            floor,
+            report.teeth_report.results[0].reused_from_cache,
+        )
+    };
+    assert_eq!(run(&gate), (true, false, false));
+    assert_eq!(run(&gate), (true, true, true));
+
+    // A pattern selecting no committed path leaves nothing to bind the verdict to: without a
+    // refusal its digest would stay constant across every later edit.
+    let mut unbound = gate.clone();
+    unbound.teeth[0].inputs = vec!["no-such-dir/".into()];
+    if let Floor::Configured { inputs, .. } = &mut unbound.floors[1] {
+        *inputs = vec!["src/**/*.txt".into(), "typo/**".into()];
+    }
+    for _ in 0..2 {
+        assert_eq!(run(&unbound), (true, false, false));
+    }
+
+    // An ignored file inside the cone reaches the sandbox copy but is in no tree entry, and
+    // `git status` stays clean.
+    write_rel(&repo, ".git/info/exclude", "src/local.txt\n");
+    write_rel(&repo, "src/local.txt", "ignored, yet readable by the check\n");
+    for _ in 0..2 {
+        assert_eq!(run(&gate), (true, false, false));
+    }
+    fs::remove_file(repo.join("src/local.txt")).unwrap();
+    assert_eq!(run(&gate), (true, true, true));
+
+    // `assume-unchanged` hides a tracked edit from `git status`; the tree is still not HEAD.
+    git_cmd(
+        &repo,
+        &["update-index", "--assume-unchanged", "src/value.txt"],
+    );
+    write_rel(&repo, "src/value.txt", "bad\n");
+    assert_eq!(run(&gate), (false, false, false));
+    assert!(
+        !issue_judge_receipt(&gate, &repo, "main")
+            .unwrap()
+            .clean_working_tree
+    );
+    assert!(
+        !StateStore::probe_git_q5(&repo)
+            .unwrap()
+            .clean_working_tree
+    );
 }
 
 #[test]
@@ -2419,6 +2506,25 @@ fn wave2_pure_deletion_quest_reaches_recorded_and_missing_files_are_not_evidence
                 .is_err()
         );
     }
+    // An existing file outside the repository is not an artifact, even when its spelling
+    // starts inside the lease.
+    write_rel(tmp.path(), "outside.txt", "not part of the candidate\n");
+    let escape = store
+        .transition_quest(
+            "Q",
+            "Built",
+            "worker",
+            None,
+            QuestGuardEvidence::RepoCheck {
+                repo_root: repo.clone(),
+                artifacts: vec!["src/../../outside.txt".into()],
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(escape, StateRefusal::GuardFailed { ref reason, .. } if reason.contains("inside")),
+        "{escape:?}"
+    );
     fs::remove_file(repo.join("dead.txt")).unwrap();
     assert!(
         store

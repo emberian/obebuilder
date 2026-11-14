@@ -88,16 +88,31 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-pub(crate) fn mac_hex(key: &[u8], message: &[u8]) -> String {
+/// MAC domain of a `JudgeReceipt` (`receipt_mac` over `receipt_hash`).
+pub(crate) const RECEIPT_CONTEXT: &str = "obb-judge-receipt-v1";
+/// MAC domain of a cached cone verdict (`.obb/cache/cones/<digest>.json`).
+pub(crate) const CONE_CONTEXT: &str = "obb-cone-verdict-v1";
+
+/// One key signs receipts and cache entries. The NUL-terminated context keeps a tag made for
+/// one kind of message from ever verifying as the other, whatever the two encodings become.
+fn in_context(context: &str, message: &[u8]) -> Vec<u8> {
+    let mut tagged = Vec::with_capacity(context.len() + 1 + message.len());
+    tagged.extend_from_slice(context.as_bytes());
+    tagged.push(0);
+    tagged.extend_from_slice(message);
+    tagged
+}
+
+pub(crate) fn mac_hex(key: &[u8], context: &str, message: &[u8]) -> String {
     use std::fmt::Write;
     let mut output = String::with_capacity(64);
-    for byte in hmac_sha256(key, message) {
+    for byte in hmac_sha256(key, &in_context(context, message)) {
         write!(output, "{byte:02x}").expect("writing to String");
     }
     output
 }
 
-pub(crate) fn verify_mac(key: &[u8], message: &[u8], mac: &str) -> bool {
+pub(crate) fn verify_mac(key: &[u8], context: &str, message: &[u8], mac: &str) -> bool {
     // Length and decoding branches depend only on the supplied, public tag. Compare the
     // expected raw MAC in constant time, without formatting secret-dependent hex digits.
     if mac.len() != 64 {
@@ -115,5 +130,5 @@ pub(crate) fn verify_mac(key: &[u8], message: &[u8], mac: &str) -> bool {
         };
         *output = high << 4 | low;
     }
-    bool::from(hmac_sha256(key, message).ct_eq(&supplied))
+    bool::from(hmac_sha256(key, &in_context(context, message)).ct_eq(&supplied))
 }

@@ -17,6 +17,7 @@ use obb_state::StateStore;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio_stream::StreamExt;
@@ -29,6 +30,8 @@ pub struct ServeConfig {
     pub target_repo: PathBuf,
     pub judge_path: PathBuf,
     bearer_digest: Option<[u8; 32]>,
+    /// Held for the duration of a live lint scan; shared by every clone of the router state.
+    lint_scan: Arc<Mutex<()>>,
 }
 
 impl ServeConfig {
@@ -39,6 +42,7 @@ impl ServeConfig {
             target_repo,
             judge_path,
             bearer_digest: None,
+            lint_scan: Arc::default(),
         }
     }
 
@@ -252,6 +256,21 @@ async fn api_lints(State(cfg): State<ServeConfig>) -> impl IntoResponse {
         if !cfg.target_repo.is_dir() {
             return serde_json::json!({ "error": "lint target directory is unavailable", "source": "live" });
         }
+        // One scan at a time. The dashboard polls on a timer without waiting for the previous
+        // answer, so scans slower than the poll interval would otherwise stack up on the
+        // blocking pool, each walking the whole target. A request that arrives mid-scan is told
+        // so; it is not handed an older result.
+        let _scan = match cfg.lint_scan.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return serde_json::json!({
+                    "error": "a live lint scan is already running; retry shortly",
+                    "source": "live",
+                    "busy": true,
+                });
+            }
+        };
         // Scan the target on every request, including dirty/untracked files. The baseline is
         // comparison data only; neither a committed report nor an old scan substitutes for it.
         match run_repo_lints(&cfg.target_repo) {

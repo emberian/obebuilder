@@ -36,7 +36,7 @@ process (`PROCESS.md`), what `obb v7` (`0.7.0`) enforces mechanically, and which
   - `planted_fault_red` executes positive (`exit == 0`) and mutated negative (`exit != 0`) controls inside disposable `/private/tmp` sandboxes without touching the candidate working tree; static/index presence is segregated under `tooth_structural_presence` (`eval:lexical`, `attested`).
   - `home N` corrigibility (`obb judge check-revert`) runs 3-way `git merge-tree --write-tree` in a scratch bare repo via read-only `objects/info/alternates`.
   - `obb judge succeed` enforces G4 floor/cap non-regression and persists `LobCost` succession records to the SHA-256 hash-chained ledger (`obb ledger verify`).
-  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans. The SHA-256 `receipt_hash` identifies the evaluation; `receipt_mac` authenticates it with HMAC-SHA256. State verifies the MAC whenever a key is configured, independently re-derives the git facts, and requires the exact proposed `(head_sha, receipt_hash)` before landing. Pure deletions count as artifacts at both `Built` and `Wired` when git confirms them against the quest’s base.
+  - `obb state` (`take`, `propose`, `land`) requires verified `JudgeReceipt`s bound to `(base_sha, head_sha, tree_oid)` and non-overlapping footprint leases rather than caller booleans. The SHA-256 `receipt_hash` identifies the evaluation; `receipt_mac` authenticates it with HMAC-SHA256. State verifies the MAC whenever a key is configured, independently re-derives the git facts, and requires the exact proposed `(head_sha, receipt_hash)` before landing and the same landed pair at `Claimed`. Artifact paths must stay inside the repository (no `..`, absolute paths, or symlinked parents). Pure deletions count as artifacts at both `Built` and `Wired` when git confirms them against the quest’s base.
   - Two clocks. `obb judge check --fast` is the construction clock: static floors and recorded measurements only, executed `#tooth` runs and `home N` revert merges listed as `deferred_floors`, result at most `attested`, no receipt (`--fast` conflicts with `--emit-receipt`). Plain `obb judge check` is the convergence clock and runs everything. `obb serve` polls on the construction clock.
   - Input-cone reuse skips unchanged opted-in floors and teeth during convergence. Authenticated verdict entries live in `.obb/cache/cones/<digest>.json`; reused results carry `reused_from_cache: true`.
 - **What does not exist yet**:
@@ -81,7 +81,9 @@ Legacy hash-only receipts remain usable only where no key is configured. Key rot
 invalidates prior receipts and cache entries.
 
 The MAC covers `receipt_hash`, which hashes the canonical receipt payload, excluding the
-hash and MAC fields themselves. Recomputing an unkeyed hash after editing a verdict does
+hash and MAC fields themselves. The MAC input is domain-tagged: `obb-judge-receipt-v1`, a
+NUL byte, then the hash; cone cache entries use `obb-cone-verdict-v1` under the same key, so
+a tag for one kind of message never verifies as the other. Recomputing an unkeyed hash after editing a verdict does
 not produce a valid MAC. This authenticates possession of the key: mode `0600` does not
 isolate processes running as the same OS user. A hostile agent must not be allowed to read
 or replace the key or invoke an unrestricted signer. Sandbox copies omit the repository
@@ -107,7 +109,12 @@ construction clock.
 Cone digests bind sorted git tree entries (paths, modes, blob/tree OIDs), the input patterns,
 the evaluator definition (including commands, timeout, and mutation patch), and the running
 executable digest. New, deleted, and changed matching paths invalidate the cone; unrelated
-commits do not. Dirty worktrees bypass reuse and cache writes. `home N` additionally binds
+commits do not. Dirty worktrees bypass reuse and cache writes. "Clean" means `git status`
+(with `core.fsmonitor` forced off) reports nothing and no index entry is `assume-unchanged`
+or `skip-worktree`; the same test sets `clean_working_tree` in receipts and the Q5 probe.
+A cone is executed, never reused, when a pattern selects no committed path, when it selects
+a symlink or submodule, or when an ignored file or directory lies inside it (`.obb/` and
+the directories the sandbox copy skips are exempt). `home N` additionally binds
 HEAD because it depends on history; kernel and external measurement floors are rechecked.
 Reused verdicts preserve their original execution duration and epistemic regime. Cache
 entries are authenticated with the receipt signing key when issuing a receipt, so a weaker

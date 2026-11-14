@@ -127,6 +127,28 @@ fn path_within_footprint(changed_path: &str, footprint: &[String]) -> bool {
     })
 }
 
+/// Artifact evidence is a path inside the candidate repository. `src/../../x` passes a prefix
+/// comparison against a `src` lease while naming a file outside the repository, and so does a
+/// path that walks through a symlinked directory.
+fn artifact_stays_in_repo(repo_root: &Path, rel: &str) -> bool {
+    use std::path::Component;
+    if rel.is_empty()
+        || !Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return false;
+    }
+    match (
+        repo_root.canonicalize(),
+        repo_root.join(rel).parent().map(Path::canonicalize),
+    ) {
+        (Ok(root), Some(Ok(parent))) => parent.starts_with(root),
+        // A missing parent directory is reported by the caller as a missing artifact.
+        _ => true,
+    }
+}
+
 fn regime_satisfies_target(achieved: Regime, target_str: &str) -> bool {
     match target_str.trim().to_ascii_lowercase().as_str() {
         "decided" => achieved == Regime::Decided,
@@ -1454,13 +1476,24 @@ impl StateStore {
                     reason: format!("{e:#}"),
                 })?;
         }
+        let same_receipt =
+            q.verified_receipt_hash.as_deref() == Some(receipt.receipt_hash.as_str());
         if guard_name == "Q5"
-            && (q.proposed_head_sha.as_deref() != Some(receipt.head_sha.as_str())
-                || q.verified_receipt_hash.as_deref() != Some(receipt.receipt_hash.as_str()))
+            && (q.proposed_head_sha.as_deref() != Some(receipt.head_sha.as_str()) || !same_receipt)
         {
             return Err(StateRefusal::GuardFailed {
                 guard: guard_name.into(),
                 reason: "land receipt does not match proposed (candidate_sha, receipt_hash); propose it first".into(),
+            });
+        }
+        // The claim is made on the evidence that landed. Another receipt for the same commit
+        // (a different gate, a later run) was never proposed and is not that evidence.
+        if guard_name == "Q6"
+            && (q.landed_sha.as_deref() != Some(receipt.head_sha.as_str()) || !same_receipt)
+        {
+            return Err(StateRefusal::GuardFailed {
+                guard: guard_name.into(),
+                reason: "claim receipt does not match the landed (head_sha, receipt_hash)".into(),
             });
         }
 
@@ -2011,6 +2044,15 @@ impl StateStore {
                     let mut violating = Vec::new();
                     for rel in artifacts.iter().chain(&deleted_files) {
                         let p = repo_root.join(rel);
+                        if !deleted_files.contains(rel) && !artifact_stays_in_repo(repo_root, rel) {
+                            return Err(StateRefusal::GuardFailed {
+                                guard: guard_name.into(),
+                                reason: format!(
+                                    "{guard_name} artifact `{rel}` does not name a path inside `{}`",
+                                    repo_root.display()
+                                ),
+                            });
+                        }
                         if !p.exists() && !deleted_files.contains(rel) {
                             return Err(StateRefusal::GuardFailed {
                                 guard: guard_name.into(),
@@ -3474,11 +3516,13 @@ impl StateStore {
                 String::from_utf8_lossy(&status_out.stderr)
             );
         }
-        let modified_paths: Vec<String> = String::from_utf8_lossy(&status_out.stdout)
+        let mut modified_paths: Vec<String> = String::from_utf8_lossy(&status_out.stdout)
             .split('\0')
             .filter(|entry| !entry.is_empty() && !obb_judge::is_runtime_status_entry(entry))
             .map(str::to_string)
             .collect();
+        // `assume-unchanged` / `skip-worktree` entries are edits that status agrees not to see.
+        modified_paths.extend(obb_judge::hidden_index_entries(repo_root)?);
 
         let mut stash_cmd = Command::new("git");
         configure_hermetic_git(&mut stash_cmd)
