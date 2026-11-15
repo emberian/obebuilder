@@ -3286,3 +3286,17 @@ fn candidate_receipts_and_leases_preserve_quoted_and_whitespace_paths() {
         .land_quest("Q", "worker", &receipt, &repo, "main")
         .unwrap();
 }
+
+#[test]
+fn deeply_nested_javascript_templates_do_not_overflow_the_scanner_stack() {
+    let tmp = temp_in_private_tmp("obb-deep-template-");
+    let source = format!(
+        "const value = {}0{};\ntest('real', () => {{}});\n",
+        "`${".repeat(20_000),
+        "}`".repeat(20_000)
+    );
+    write_rel(tmp.path(), "src/deep.js", &source);
+    let findings = obb_lint::test_in_library::scan_test_in_library(tmp.path()).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].line, 2);
+}

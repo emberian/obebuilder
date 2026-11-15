@@ -18,50 +18,58 @@ struct Token {
 
 // Treat a template and its nested interpolation strings as one opaque literal.
 fn js_template_end(chars: &[char], start: usize) -> usize {
+    // Each entry is a template's interpolation brace depth; zero means literal text.
+    // Source-controlled nesting must not consume the process call stack.
+    let mut templates = vec![0usize];
     let mut i = start + 1;
     while i < chars.len() {
-        match chars[i] {
-            '\\' => i = (i + 2).min(chars.len()),
-            '`' => return i + 1,
-            '$' if chars.get(i + 1) == Some(&'{') => {
-                i += 2;
-                let mut depth = 1;
-                while i < chars.len() && depth > 0 {
-                    match chars[i] {
-                        '`' => {
-                            i = js_template_end(chars, i);
-                            continue;
-                        }
-                        '\'' | '"' => {
-                            let quote = chars[i];
-                            i += 1;
-                            while i < chars.len() && chars[i] != quote {
-                                i += if chars[i] == '\\' { 2 } else { 1 };
-                            }
-                        }
-                        '/' if chars.get(i + 1) == Some(&'/') => {
-                            while i < chars.len() && chars[i] != '\n' {
-                                i += 1;
-                            }
-                            continue;
-                        }
-                        '/' if chars.get(i + 1) == Some(&'*') => {
-                            i += 2;
-                            while i + 1 < chars.len() && !chars[i..].starts_with(&['*', '/']) {
-                                i += 1;
-                            }
-                            i = (i + 2).min(chars.len());
-                            continue;
-                        }
-                        '{' => depth += 1,
-                        '}' => depth -= 1,
-                        _ => {}
+        let top = templates.len() - 1;
+        if templates[top] == 0 {
+            match chars[i] {
+                '\\' => i = (i + 2).min(chars.len()),
+                '`' => {
+                    templates.pop();
+                    i += 1;
+                    if templates.is_empty() {
+                        return i;
                     }
-                    i = (i + 1).min(chars.len());
+                }
+                '$' if chars.get(i + 1) == Some(&'{') => {
+                    templates[top] = 1;
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        match chars[i] {
+            '`' => templates.push(0),
+            '\'' | '"' => {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != quote {
+                    i += if chars[i] == '\\' { 2 } else { 1 };
                 }
             }
-            _ => i += 1,
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < chars.len() && !chars[i..].starts_with(&['*', '/']) {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+                continue;
+            }
+            '{' => templates[top] += 1,
+            '}' => templates[top] -= 1,
+            _ => {}
         }
+        i = (i + 1).min(chars.len());
     }
     i
 }
@@ -273,13 +281,12 @@ fn javascript_test_call(ts: &[Token], i: usize) -> bool {
     {
         return false;
     }
-    let open = if text(i + 1) == "."
-        && matches!(text(i + 2), "only" | "skip" | "concurrent" | "todo")
-    {
-        i + 3
-    } else {
-        i + 1
-    };
+    let open =
+        if text(i + 1) == "." && matches!(text(i + 2), "only" | "skip" | "concurrent" | "todo") {
+            i + 3
+        } else {
+            i + 1
+        };
     text(open) == "(" && text(open + 1) == "<literal>"
 }
 
