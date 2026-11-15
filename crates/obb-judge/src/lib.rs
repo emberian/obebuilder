@@ -2902,10 +2902,9 @@ pub fn issue_judge_receipt_with_state_dir(
 
     let clean_working_tree = cone_cache::clean_for_cache(&canon)?;
 
-    let diff_raw = run_git_ro(&canon, &["diff", "--name-only", &base_sha, &head_sha])?;
+    let diff_raw = run_git_ro(&canon, &["diff", "--name-only", "-z", &base_sha, &head_sha])?;
     let changed_paths: Vec<String> = diff_raw
-        .lines()
-        .map(str::trim)
+        .split('\0')
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();

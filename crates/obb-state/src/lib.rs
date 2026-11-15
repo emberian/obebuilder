@@ -2159,15 +2159,20 @@ impl StateStore {
         // Compute the live git diff `base_sha..head_sha`; callers decide what the lease means for it
         let diff_raw = run_git_ro(
             repo_root,
-            &["diff", "--name-only", &receipt.base_sha, &receipt.head_sha],
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                &receipt.base_sha,
+                &receipt.head_sha,
+            ],
         )
         .map_err(|e| StateRefusal::GuardFailed {
             guard: guard_name.into(),
             reason: format!("git diff failed: {e:#}"),
         })?;
         let changed_paths: Vec<String> = diff_raw
-            .lines()
-            .map(str::trim)
+            .split('\0')
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect();
@@ -3117,6 +3122,22 @@ impl StateStore {
             self.verify_candidate_receipt(&cur, "Q5", receipt, repo_root, trunk_branch, true)?;
         Self::enforce_lease(&cur, &changed)?;
 
+        // Check Q5 before mutating refs: a dirty checkout, stash, or surviving merged branch
+        // must not turn a refused land into an already-moved trunk.
+        let preflight = Self::probe_git_q5(repo_root)
+            .map_err(|e| StateRefusal::StorageError(format!("{e:#}")))?;
+        if !preflight.q5_passed {
+            return Err(StateRefusal::GuardFailed {
+                guard: "Q5".into(),
+                reason: format!(
+                    "landing preflight failed: clean={}, stashes={}, merged side branches={:?}",
+                    preflight.clean_working_tree,
+                    preflight.stash_count,
+                    preflight.merged_side_branches
+                ),
+            });
+        }
+
         // Fast-forward `trunk_branch` to `receipt.head_sha` and remove merged side branch if any
         let current_branch = run_git_ro(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap_or_default()
@@ -4024,7 +4045,14 @@ impl StateStore {
         configure_hermetic_git(&mut status_cmd)
             .args(["--no-optional-locks", "-C"])
             .arg(repo_root)
-            .args(["status", "--porcelain", "-z", "--untracked-files=all"]);
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+            ]);
         let status_out = status_cmd
             .output()
             .context("failed to run `git status --porcelain`")?;

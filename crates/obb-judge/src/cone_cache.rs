@@ -269,8 +269,7 @@ impl<'a> ConeCache<'a> {
         // The verdict was computed from the working tree; it is recorded against `tree` only
         // if the two still agree after the check ran.
         if !clean_for_cache(self.repo)?
-            || run_git_ro(self.repo, &["rev-parse", "--verify", "HEAD^{tree}"])?.trim()
-                != self.tree
+            || run_git_ro(self.repo, &["rev-parse", "--verify", "HEAD^{tree}"])?.trim() != self.tree
             || ignored_paths(self.repo)? != self.ignored
         {
             return Ok(());

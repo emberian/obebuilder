@@ -3220,3 +3220,69 @@ async fn wave2_convergence_serve_api_judge_evaluates_target_repo_not_workspace_r
         "missing target_repo must report evaluation_error: {json_missing}"
     );
 }
+
+#[test]
+fn land_preflight_refuses_dirty_checkout_before_changing_branch_or_trunk() {
+    let tmp = temp_in_private_tmp("obb-land-preflight-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    let store = wave2_take(&repo, &tmp.path().join("state"));
+    write_rel(&repo, "NOTES.txt", "candidate\n");
+    git_cmd(&repo, &["add", "NOTES.txt"]);
+    git_cmd(&repo, &["commit", "-m", "candidate"]);
+    let receipt = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    store
+        .propose_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+    // An unrelated tracked edit would survive checkout and the fast-forward, then fail Q5.
+    write_rel(&repo, "dead.txt", "uncommitted work\n");
+    let refused = store
+        .land_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap_err();
+    assert!(matches!(refused, StateRefusal::GuardFailed { ref guard, .. } if guard == "Q5"));
+    assert_eq!(
+        git_cmd(&repo, &["rev-parse", "main"]).trim(),
+        receipt.base_sha
+    );
+    assert_eq!(
+        git_cmd(&repo, &["branch", "--show-current"]).trim(),
+        "candidate"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("dead.txt")).unwrap(),
+        "uncommitted work\n"
+    );
+    assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
+    write_rel(&repo, "dead.txt", "obsolete\n");
+    store
+        .land_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+}
+
+#[test]
+fn candidate_receipts_and_leases_preserve_quoted_and_whitespace_paths() {
+    let tmp = temp_in_private_tmp("obb-candidate-paths-");
+    let (repo, gate) = wave2_repo(tmp.path());
+    let store = wave2_take(&repo, &tmp.path().join("state"));
+    let paths = [
+        " spaced.txt ",
+        "src/café.txt",
+        "src/tab\tname.txt",
+        "src/line\nbreak.txt",
+    ];
+    for path in paths {
+        write_rel(&repo, path, "candidate\n");
+    }
+    git_cmd(&repo, &["add", "."]);
+    git_cmd(&repo, &["commit", "-m", "candidate unusual paths"]);
+    let receipt = issue_judge_receipt(&gate, &repo, "main").unwrap();
+    let mut expected = paths.to_vec();
+    expected.sort();
+    assert_eq!(receipt.changed_paths, expected);
+    let quest = store
+        .propose_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+    assert!(quest.footprint_lease.contains(&paths[0].to_string()));
+    store
+        .land_quest("Q", "worker", &receipt, &repo, "main")
+        .unwrap();
+}
