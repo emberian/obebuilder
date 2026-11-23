@@ -224,9 +224,9 @@ enum ConeSubcommand {
         #[arg(long = "propose")]
         propose: Vec<String>,
 
-        /// Proposed Wave-0 barrier slice(s) `<shard_name>=<file1>,<file2>,...` allowed to edit `fan_in > 25` hubs before fanout
-        #[arg(long = "wave0")]
-        wave0: Vec<String>,
+        /// Proposed barrier slice(s) `<shard_name>=<file1>,<file2>,...` allowed to edit `fan_in > 25` hubs before fanout
+        #[arg(long = "barrier")]
+        barrier: Vec<String>,
     },
 }
 
@@ -896,11 +896,11 @@ async fn run() -> Result<ExitCode> {
             if let Some(ConeSubcommand::Plan {
                 shards,
                 propose,
-                wave0,
+                barrier,
             }) = sub
             {
                 let mut proposed = Vec::new();
-                for spec in &wave0 {
+                for spec in &barrier {
                     proposed.push(parse_proposed_shard_spec(spec, true)?);
                 }
                 for spec in &propose {
@@ -2059,7 +2059,7 @@ fn resolve_apex_manifest_path(workspace: &Path, explicit: Option<PathBuf>) -> Re
     )
 }
 
-fn parse_proposed_shard_spec(raw: &str, wave0_barrier: bool) -> Result<ProposedShard> {
+fn parse_proposed_shard_spec(raw: &str, barrier: bool) -> Result<ProposedShard> {
     let Some((name, files_csv)) = raw.split_once('=') else {
         bail!(
             "invalid shard slice `{raw}`; expected `<shard_name>=<file_or_module1>,<file_or_module2>,...`"
@@ -2080,7 +2080,7 @@ fn parse_proposed_shard_spec(raw: &str, wave0_barrier: bool) -> Result<ProposedS
     Ok(ProposedShard {
         name: name.to_string(),
         files,
-        wave0_barrier,
+        barrier,
     })
 }
 
@@ -2441,7 +2441,7 @@ fn print_human_cone_report(rep: &obb_lint::cone::ConeReport) {
     }
     if !rep.high_blast_radius_hubs.is_empty() {
         println!(
-            "\nHigh-blast-radius hubs (`fan_in > 25`, showing top {} of {} — require Wave-0 barrier):",
+            "\nHigh-blast-radius hubs (`fan_in > 25`, showing top {} of {} — require a barrier slice):",
             rep.high_blast_radius_hubs.len().min(20),
             rep.high_blast_radius_hubs.len()
         );
@@ -2489,12 +2489,12 @@ fn print_human_cone_plan(plan: &obb_lint::cone::ConePlanReport, scan_ms: f64) {
         "OVERLAP REFUSED"
     };
     println!(
-        "obb cone plan [{verdict}]: repo={} mode={} shards={} wave0_hubs(fan_in>{})={} scan_ms={:.2}ms",
+        "obb cone plan [{verdict}]: repo={} mode={} shards={} barrier_hubs(fan_in>{})={} scan_ms={:.2}ms",
         plan.repo_root,
         plan.mode,
         plan.shards.len(),
         plan.hub_threshold,
-        plan.wave0_barrier_hubs.len(),
+        plan.barrier_hubs.len(),
         scan_ms
     );
     if !plan.overlapping_assignments.is_empty() {
@@ -2593,7 +2593,7 @@ fn print_human_apex_report(rep: &obb_lint::apex::ApexReport, subcmd: &str) {
     }
 
     if !rep.planned_apex.is_empty() {
-        println!("\nPlanned Wave 4–5 Vertical Spines (`[planned_apex]`):");
+        println!("\nPlanned vertical spines (`[planned_apex]`):");
         for p in &rep.planned_apex {
             let st = if p.materialized {
                 "MATERIALIZED"

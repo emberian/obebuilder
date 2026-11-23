@@ -1,4 +1,4 @@
-//! End-to-end CLI & library verification suite for `Obb-v4`:
+//! End-to-end CLI and library tests for tautological obligations, empty judge fragments, expose budgets and harnesses:
 //! 1. `lean/obligation-tautological-field`: catches Stage-A tautological field signatures inside
 //!    `*Obligations`, `*Ledger`, and `@[obb_obligation]` classes (modeled on `Trailblaze` catches:
 //!    `PolisObligations.darkBazaarSameOpeningZeroKnowledge`, `ClusterGovObligations.teeHardwareRootAttested`,

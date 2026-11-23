@@ -1,11 +1,11 @@
-//! `obb-v6` (`0.6.0`) end-to-end CLI & library separation tests:
+//! End-to-end CLI and library tests separating proofs, tests and mutation teeth:
 //! 1. `lean/test-in-library` flags `#guard`, `#guard_msgs`, `#tooth`, and `#eval` inside Tier-1
 //!    `lean/Obend/` library modules (excluding `lean/Obend/Teeth/`) with `Severity::Error` under `--strict-tests`.
 //! 2. Comments (`--`, `/- ... -/`, nested `/- /- ... -/ -/`, `/-- ... -/`), string literals (`"..."`,
 //!    `s!"..."`, `r#"..."#`), syntax quotes `` `(...) ``, and BitVec width suffixes `x#eval` are ignored.
 //! 3. `lean/Obend/Teeth/FooTeeth.lean` and `lean/tests/FooTest.lean` permit `#guard`, `#tooth`,
 //!    `#eval`, and `#guard_msgs` without counting toward `tier1_*` or firing `lean/test-in-library`.
-//! 4. Wave-7 compatibility: `--strict --strict-expose --strict-harnesses --strict-vacuity --strict-wire`
+//! 4. Strict-gate compatibility: `--strict --strict-expose --strict-harnesses --strict-vacuity --strict-wire`
 //!    exits `0` without emitting `lean/test-in-library` findings, while STILL populating exact
 //!    `tier1_guards`, `tier1_teeth`, and `tier1_evals` in both JSON and human summary output.
 
@@ -26,7 +26,7 @@ fn write_rel(root: &Path, rel: &str, content: &str) {
 }
 
 #[test]
-fn cli_v6_enforces_3way_proof_test_mutation_separation_and_tracks_tier1_metrics() {
+fn cli_enforces_3way_proof_test_mutation_separation_and_tracks_tier1_metrics() {
     // Verify crate version matches workspace Cargo.toml (`0.7.0`)
     let ver_out = Command::new(obb_bin())
         .arg("--version")
@@ -110,9 +110,9 @@ end Obend.Teeth
 "#,
     );
 
-    // A. Wave-7 strict flags WITHOUT `--strict-tests`: must exit 0 with 0 errors/findings,
+    // A. The full strict flag set WITHOUT `--strict-tests`: must exit 0 with 0 errors/findings,
     //    while still reporting exact `tier1_guards=2`, `tier1_teeth=1`, `tier1_evals=1`!
-    let wave7_out = Command::new(obb_bin())
+    let strict_out = Command::new(obb_bin())
         .args([
             "lint",
             "--repo",
@@ -125,18 +125,18 @@ end Obend.Teeth
             "--json",
         ])
         .output()
-        .expect("run wave7 obb lint");
+        .expect("run strict obb lint");
     assert!(
-        wave7_out.status.success(),
-        "Wave-7 gate without --strict-tests must exit 0: {}",
-        String::from_utf8_lossy(&wave7_out.stdout)
+        strict_out.status.success(),
+        "strict gate without --strict-tests must exit 0: {}",
+        String::from_utf8_lossy(&strict_out.stdout)
     );
-    let wave7_json: serde_json::Value = serde_json::from_slice(&wave7_out.stdout).unwrap();
-    assert_eq!(wave7_json["errors"], 0);
-    assert_eq!(wave7_json["total_findings"], 0);
-    assert_eq!(wave7_json["tier1_guards"], 2);
-    assert_eq!(wave7_json["tier1_teeth"], 1);
-    assert_eq!(wave7_json["tier1_evals"], 1);
+    let strict_json: serde_json::Value = serde_json::from_slice(&strict_out.stdout).unwrap();
+    assert_eq!(strict_json["errors"], 0);
+    assert_eq!(strict_json["total_findings"], 0);
+    assert_eq!(strict_json["tier1_guards"], 2);
+    assert_eq!(strict_json["tier1_teeth"], 1);
+    assert_eq!(strict_json["tier1_evals"], 1);
 
     // Check human summary output also includes `tier1_guards=2 tier1_teeth=1 tier1_evals=1` when `--strict-tests` is off
     let human_out = Command::new(obb_bin())
@@ -152,7 +152,7 @@ end Obend.Teeth
         "human summary must report tier1 counts: {human_stdout}"
     );
 
-    // B. Wave C1 gate WITH `--strict --strict-tests`: exits 2 and flags all 4 commands in `lean/Obend/Foo.lean`!
+    // B. The test-separation gate WITH `--strict --strict-tests`: exits 2 and flags all 4 commands in `lean/Obend/Foo.lean`!
     let c1_out = Command::new(obb_bin())
         .args([
             "lint",

@@ -1,6 +1,6 @@
 //! Planted-fault & end-to-end integration tests for:
 //! 1. `obb quarry` (`sync`, `status`, `inspect`, `quarry/obend-quarry.toml`, 6-Gate Surgery Checklist)
-//! 2. 2026 Soundness, Crypto-Landmine & Compositional Modularity Gates (`obb-lint`):
+//! 2. Soundness, crypto-landmine and compositional modularity gates (`obb-lint`):
 //!    - `lean/native-decide-in-proof` (`arXiv:2606.29493`)
 //!    - `lean/narrow-digest-weld` (`breadstuffs` 1-limb / <=64-bit digest bug class)
 //!    - `lean/uninhabited-premise-risk` (`HypothesisLedger` anti-vacuity tracking)
@@ -339,11 +339,9 @@ end Obend.Ledger
 
     let report = run_repo_lints(root).unwrap();
     assert!(
-        !report
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "lean/monolithic-module"
-                && f.path == "lean/Obend/Mid/Medium.lean"),
+        !report.findings.iter().any(
+            |f| f.rule_id == "lean/monolithic-module" && f.path == "lean/Obend/Mid/Medium.lean"
+        ),
         "2,000-line Medium.lean should NOT trigger `lean/monolithic-module` under 4,000-line threshold"
     );
     assert!(

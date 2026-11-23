@@ -1,6 +1,6 @@
-//! `obb v7 (0.7.0)` Honest Judge, Fail-Closed Floors, SHA-Bound Statechart Receipts & Unseeded E2E Quest Tests.
+//! Honest judge, fail-closed floors, SHA-bound statechart receipts and unseeded end-to-end quest tests.
 //!
-//! Verifies all five `obb v7` hardening requirements:
+//! Verifies five judge and state requirements:
 //! 1. `#tooth` (`planted_fault_red`) executes real positive (`exit == 0`) + isolated mutated negative
 //!    controls (`exit != 0`) in `/private/tmp`, distinguishing `BIT`, `VACUOUS`, `INVALID_TOOTH`,
 //!    and `POSITIVE_FAILED` without touching the candidate working tree; static/index presence is
@@ -67,10 +67,10 @@ fn git_cmd(repo: &Path, args: &[&str]) -> String {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("TMPDIR", std::env::temp_dir())
-        .env("GIT_AUTHOR_NAME", "obb-v7-test")
-        .env("GIT_AUTHOR_EMAIL", "obb-v7@localhost")
-        .env("GIT_COMMITTER_NAME", "obb-v7-test")
-        .env("GIT_COMMITTER_EMAIL", "obb-v7@localhost")
+        .env("GIT_AUTHOR_NAME", "obb-test")
+        .env("GIT_AUTHOR_EMAIL", "obb-test@localhost")
+        .env("GIT_COMMITTER_NAME", "obb-test")
+        .env("GIT_COMMITTER_EMAIL", "obb-test@localhost")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -141,7 +141,7 @@ fn build_gate(
 
 #[test]
 fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_dirtying_tree() {
-    let tmp = temp_in_private_tmp("obb-v7-teeth-");
+    let tmp = temp_in_private_tmp("obb-teeth-");
     let repo = tmp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     init_git_repo_on_main(&repo);
@@ -390,7 +390,7 @@ fn executed_tooth_distinguishes_bit_vacuous_invalid_and_positive_failed_without_
 
 #[test]
 fn fail_closed_unknown_floors_missing_measurements_and_honest_lexical_vs_kernel_regimes() {
-    let tmp = temp_in_private_tmp("obb-v7-floors-");
+    let tmp = temp_in_private_tmp("obb-floors-");
     let repo = tmp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     init_git_repo_on_main(&repo);
@@ -661,7 +661,7 @@ fn fail_closed_unknown_floors_missing_measurements_and_honest_lexical_vs_kernel_
 
 #[test]
 fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_stale_base_sha() {
-    let tmp = temp_in_private_tmp("obb-v7-e2e-");
+    let tmp = temp_in_private_tmp("obb-e2e-");
     let repo = tmp.path().join("repo");
     let state_dir = tmp.path().join("state");
     fs::create_dir_all(&repo).unwrap();
@@ -1429,7 +1429,7 @@ fn unseeded_end_to_end_quest_lifecycle_catches_footprint_vacuous_tampered_and_st
 
 #[test]
 fn emergency_override_records_attested_override_ungated_and_demo_seed_is_segregated() {
-    let tmp = temp_in_private_tmp("obb-v7-override-seed-");
+    let tmp = temp_in_private_tmp("obb-override-seed-");
     let repo = tmp.path().join("repo");
     let live_state_dir = tmp.path().join("live-state");
     let demo_state_dir = tmp.path().join("demo-state");
@@ -1551,7 +1551,7 @@ fn emergency_override_records_attested_override_ungated_and_demo_seed_is_segrega
 #[test]
 fn structural_scanner_tracks_lines_and_ignores_comments_literals_and_test_files() {
     use obb_lint::{RepoLintOptions, run_repo_lints_with_options};
-    let tmp = temp_in_private_tmp("obb-v7-scanner-");
+    let tmp = temp_in_private_tmp("obb-scanner-");
     let fixtures = [
         (
             "src/lib.rs",
@@ -1687,7 +1687,7 @@ async fn serve_enforces_auth_methods_content_type_and_bounded_streaming_bodies()
     };
     use obb_cli::serve::{MAX_BODY_BYTES, ServeConfig, build_router};
     use tower::ServiceExt;
-    let tmp = temp_in_private_tmp("obb-v7-http-");
+    let tmp = temp_in_private_tmp("obb-http-");
     let cfg = ServeConfig::new(
         tmp.path().into(),
         tmp.path().into(),
@@ -1800,7 +1800,7 @@ async fn serve_enforces_auth_methods_content_type_and_bounded_streaming_bodies()
 
 #[test]
 fn local_ledger_serializes_concurrent_writers_and_migrates_with_deterministic_fold() {
-    let tmp = temp_in_private_tmp("obb-v7-ledger-");
+    let tmp = temp_in_private_tmp("obb-ledger-");
     let state = tmp.path().join("state");
     let store = StateStore::open_with_state_dir(tmp.path(), Some(&state)).unwrap();
     std::thread::scope(|scope| {
@@ -1850,7 +1850,7 @@ fn local_ledger_serializes_concurrent_writers_and_migrates_with_deterministic_fo
 
 #[test]
 fn nested_javascript_templates_are_literals_and_unicode_ledger_tails_append_safely() {
-    let tmp = temp_in_private_tmp("obb-v7-lexical-edges-");
+    let tmp = temp_in_private_tmp("obb-lexical-edges-");
     write_rel(
         tmp.path(),
         "src/widget.js",
@@ -1896,7 +1896,7 @@ test('real', () => {});
 
 #[test]
 fn scanner_skips_cfg_not_test_and_plain_calls_but_catches_inner_attrs_and_focused_tests() {
-    let tmp = temp_in_private_tmp("obb-v7-scanner-edges-");
+    let tmp = temp_in_private_tmp("obb-scanner-edges-");
     write_rel(
         tmp.path(),
         "src/lib.rs",
@@ -1960,9 +1960,9 @@ fn construction_clock_defers_teeth_and_revert_floors_and_never_exceeds_attested(
     );
 }
 
-// Wave 2: authenticated evidence, input cones, exact proposals, deletion-only candidates.
+// Authenticated evidence, input cones, exact proposals, deletion-only candidates.
 
-fn wave2_repo(root: &Path) -> (PathBuf, Gate) {
+fn receipt_gate_repo(root: &Path) -> (PathBuf, Gate) {
     let repo = root.join("repo");
     fs::create_dir_all(&repo).unwrap();
     init_git_repo_on_main(&repo);
@@ -1980,7 +1980,7 @@ fn wave2_repo(root: &Path) -> (PathBuf, Gate) {
         "expect_failure_substring": "incorrect-value"
     })).unwrap();
     let gate = build_gate(
-        "wave2",
+        "receipt-gate",
         vec![
             (
                 Floor::Home(1),
@@ -2014,12 +2014,12 @@ fn wave2_repo(root: &Path) -> (PathBuf, Gate) {
     (repo, gate)
 }
 
-fn wave2_take(repo: &Path, state: &Path) -> StateStore {
+fn take_receipt_quest(repo: &Path, state: &Path) -> StateStore {
     let store = StateStore::open_with_state_dir(repo, Some(state)).unwrap();
     store
         .create_campaign(
             "C",
-            "Wave 2",
+            "Receipt boundaries",
             "Exercise receipt boundaries",
             repo.to_str().unwrap(),
         )
@@ -2043,7 +2043,7 @@ fn wave2_take(repo: &Path, state: &Path) -> StateStore {
 }
 
 #[test]
-fn wave2_hmac_vectors_and_recomputed_forgery_are_rejected() {
+fn hmac_vectors_and_recomputed_forgery_are_rejected() {
     use obb_judge::receipt_auth::hmac_sha256;
     let hex = |bytes: [u8; 32]| -> String {
         use std::fmt::Write;
@@ -2070,9 +2070,9 @@ fn wave2_hmac_vectors_and_recomputed_forgery_are_rejected() {
         "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
     );
 
-    let tmp = temp_in_private_tmp("obb-wave2-auth-");
-    let (repo, gate) = wave2_repo(tmp.path());
-    let store = wave2_take(&repo, &tmp.path().join("state"));
+    let tmp = temp_in_private_tmp("obb-auth-");
+    let (repo, gate) = receipt_gate_repo(tmp.path());
+    let store = take_receipt_quest(&repo, &tmp.path().join("state"));
     write_rel(&repo, "NOTES.txt", "candidate\n");
     git_cmd(&repo, &["add", "NOTES.txt"]);
     git_cmd(&repo, &["commit", "-m", "candidate"]);
@@ -2126,12 +2126,12 @@ fn wave2_hmac_vectors_and_recomputed_forgery_are_rejected() {
 }
 
 #[test]
-fn wave2_cli_uses_selected_state_key_or_environment_key_for_receipts_and_cache() {
-    for environment_key in [None, Some("wave2-external-signing-key")] {
-        let tmp = temp_in_private_tmp("obb-wave2-cli-key-");
-        let (repo, _gate) = wave2_repo(tmp.path());
+fn cli_uses_selected_state_key_or_environment_key_for_receipts_and_cache() {
+    for environment_key in [None, Some("external-signing-key")] {
+        let tmp = temp_in_private_tmp("obb-cli-key-");
+        let (repo, _gate) = receipt_gate_repo(tmp.path());
         let state = tmp.path().join("vault");
-        let store = wave2_take(&repo, &state);
+        let store = take_receipt_quest(&repo, &state);
         write_rel(&repo, "NOTES.txt", "candidate\n");
         git_cmd(&repo, &["add", "NOTES.txt"]);
         git_cmd(&repo, &["commit", "-m", "candidate"]);
@@ -2238,7 +2238,7 @@ fn wave2_cli_uses_selected_state_key_or_environment_key_for_receipts_and_cache()
 }
 
 #[test]
-fn wave2_cones_reuse_and_invalidate_on_inputs_commands_mutations_and_cache_tampering() {
+fn cones_reuse_and_invalidate_on_inputs_commands_mutations_and_cache_tampering() {
     for definition in [
         serde_json::json!({"kind": "cap", "cell": "no_sorry_ax", "max": 0, "inputs": ["src/"]}),
         serde_json::json!({"kind": "home", "commits": 1, "inputs": ["src/"]}),
@@ -2251,8 +2251,8 @@ fn wave2_cones_reuse_and_invalidate_on_inputs_commands_mutations_and_cache_tampe
             floor
         );
     }
-    let tmp = temp_in_private_tmp("obb-wave2-cones-");
-    let (repo, mut gate) = wave2_repo(tmp.path());
+    let tmp = temp_in_private_tmp("obb-cones-");
+    let (repo, mut gate) = receipt_gate_repo(tmp.path());
     let floor = |report: &obb_judge::JudgeCheckReport| {
         report
             .evaluations
@@ -2332,10 +2332,10 @@ fn wave2_cones_reuse_and_invalidate_on_inputs_commands_mutations_and_cache_tampe
 }
 
 #[test]
-fn wave2_land_rejects_unproposed_receipt_and_candidate_before_moving_trunk() {
-    let tmp = temp_in_private_tmp("obb-wave2-binding-");
-    let (repo, gate) = wave2_repo(tmp.path());
-    let store = wave2_take(&repo, &tmp.path().join("state"));
+fn land_rejects_unproposed_receipt_and_candidate_before_moving_trunk() {
+    let tmp = temp_in_private_tmp("obb-binding-");
+    let (repo, gate) = receipt_gate_repo(tmp.path());
+    let store = take_receipt_quest(&repo, &tmp.path().join("state"));
     write_rel(&repo, "NOTES.txt", "first\n");
     git_cmd(&repo, &["add", "NOTES.txt"]);
     git_cmd(&repo, &["commit", "-m", "first candidate"]);
@@ -2424,9 +2424,9 @@ fn wave2_land_rejects_unproposed_receipt_and_candidate_before_moving_trunk() {
 }
 
 #[test]
-fn wave3_cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
-    let tmp = temp_in_private_tmp("obb-wave3-cones-");
-    let (repo, gate) = wave2_repo(tmp.path());
+fn cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
+    let tmp = temp_in_private_tmp("obb-cone-entries-");
+    let (repo, gate) = receipt_gate_repo(tmp.path());
     // (all floors passed, command floor reused, tooth reused)
     let run = |gate: &Gate| {
         let report = evaluate_gate(gate, &repo).unwrap();
@@ -2486,10 +2486,10 @@ fn wave3_cones_refuse_reuse_when_tree_entries_cannot_speak_for_the_inputs() {
 }
 
 #[test]
-fn wave2_pure_deletion_quest_reaches_recorded_and_missing_files_are_not_evidence() {
-    let tmp = temp_in_private_tmp("obb-wave2-deletion-");
-    let (repo, gate) = wave2_repo(tmp.path());
-    let store = wave2_take(&repo, &tmp.path().join("state"));
+fn pure_deletion_quest_reaches_recorded_and_missing_files_are_not_evidence() {
+    let tmp = temp_in_private_tmp("obb-deletion-");
+    let (repo, gate) = receipt_gate_repo(tmp.path());
+    let store = take_receipt_quest(&repo, &tmp.path().join("state"));
     for artifacts in [vec![], vec!["never-existed.txt".into()]] {
         assert!(
             store
@@ -2584,14 +2584,14 @@ fn wave2_pure_deletion_quest_reaches_recorded_and_missing_files_are_not_evidence
 }
 
 #[tokio::test]
-async fn wave2_lints_scan_live_target_and_report_baseline_delta() {
+async fn lints_scan_live_target_and_report_baseline_delta() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
     };
     use obb_cli::serve::{ServeConfig, build_router};
     use tower::ServiceExt;
-    let tmp = temp_in_private_tmp("obb-wave2-live-lints-");
+    let tmp = temp_in_private_tmp("obb-live-lints-");
     let repo = tmp.path().join("live-repo");
     fs::create_dir_all(&repo).unwrap();
     let baseline = obb_lint::run_repo_lints(&repo).unwrap();
@@ -2642,11 +2642,11 @@ async fn wave2_lints_scan_live_target_and_report_baseline_delta() {
 }
 
 #[test]
-fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
-    let tmp = temp_in_private_tmp("obb-wave2-gate-bind-");
-    let (repo, strong_gate) = wave2_repo(tmp.path());
+fn convergence_gate_sha256_binds_propose_land_succession_and_override() {
+    let tmp = temp_in_private_tmp("obb-gate-bind-");
+    let (repo, strong_gate) = receipt_gate_repo(tmp.path());
     let state = tmp.path().join("state");
-    let store = wave2_take(&repo, &state);
+    let store = take_receipt_quest(&repo, &state);
 
     let strong_sha = strong_gate.canonical_sha256().unwrap();
     let camp0 = store.get_campaign("C").unwrap().unwrap();
@@ -2654,7 +2654,7 @@ fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
 
     // Construct a weaker gate (drops `value_is_good` floor) that still passes WellFormed + teeth.
     let mut weak_gate = strong_gate.clone();
-    weak_gate.name = "wave2-weakened".into();
+    weak_gate.name = "receipt-gate-weakened".into();
     weak_gate
         .floors
         .retain(|fl| fl.cell_key() != "value_is_good");
@@ -2773,9 +2773,9 @@ fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
         .unwrap();
     assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Toothed");
 
-    // Monotonically strengthen the campaign gate (`wave2 -> wave2-v2`, adding `no_sorry_ax`) BEFORE landing `Q`.
+    // Monotonically strengthen the campaign gate (`receipt-gate -> receipt-gate-stronger`, adding `no_sorry_ax`) BEFORE landing `Q`.
     let mut stronger_gate = strong_gate.clone();
-    stronger_gate.name = "wave2-v2".into();
+    stronger_gate.name = "receipt-gate-stronger".into();
     stronger_gate
         .floors
         .push(Floor::Named("no_sorry_ax".into()));
@@ -2831,15 +2831,15 @@ fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
         .unwrap();
     assert_eq!(store.get_quest("Q").unwrap().unwrap().state, "Landed");
 
-    // Strengthening the campaign gate AGAIN (`wave2-v3`) AFTER `Q` has already landed must NOT brick
+    // Strengthening the campaign gate AGAIN (`receipt-gate-strongest`) AFTER `Q` has already landed must NOT brick
     // claiming/recording `Q` on its landed evidence!
-    let mut v3_gate = stronger_gate.clone();
-    v3_gate.name = "wave2-v3".into();
-    v3_gate
+    let mut strongest_gate = stronger_gate.clone();
+    strongest_gate.name = "receipt-gate-strongest".into();
+    strongest_gate
         .floors
         .push(Floor::Named("no_declared_axiom".into()));
-    for fmt in &v3_gate.formats {
-        v3_gate.methods.push(MethodBinding {
+    for fmt in &strongest_gate.formats {
+        strongest_gate.methods.push(MethodBinding {
             format: fmt.clone(),
             floor: Floor::Named("no_declared_axiom".into()),
             method: if fmt == "revert@1" {
@@ -2849,9 +2849,9 @@ fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
             },
         });
     }
-    let rec_v3 = check_succeed(&stronger_gate, &v3_gate, &[]).unwrap();
+    let rec_strongest = check_succeed(&stronger_gate, &strongest_gate, &[]).unwrap();
     store
-        .record_lob_succession_with_gate(&rec_v3, &v3_gate)
+        .record_lob_succession_with_gate(&rec_strongest, &strongest_gate)
         .unwrap();
 
     store
@@ -2906,7 +2906,7 @@ fn wave2_convergence_gate_sha256_binds_propose_land_succession_and_override() {
 }
 
 #[test]
-fn wave2_convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_linked_worktrees() {
+fn convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_linked_worktrees() {
     fn copy_dir_all(src: &Path, dst: &Path) {
         fs::create_dir_all(dst).unwrap();
         for entry in fs::read_dir(src).unwrap() {
@@ -2921,10 +2921,10 @@ fn wave2_convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_
         }
     }
 
-    let tmp = temp_in_private_tmp("obb-wave2-repo-id-");
-    let (repo_a, gate) = wave2_repo(tmp.path());
+    let tmp = temp_in_private_tmp("obb-repo-id-");
+    let (repo_a, gate) = receipt_gate_repo(tmp.path());
     let state = tmp.path().join("state");
-    let store = wave2_take(&repo_a, &state);
+    let store = take_receipt_quest(&repo_a, &state);
 
     write_rel(&repo_a, "NOTES.txt", "candidate commit\n");
     git_cmd(&repo_a, &["add", "NOTES.txt"]);
@@ -3077,7 +3077,7 @@ fn wave2_convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_
 }
 
 #[tokio::test]
-async fn wave2_convergence_serve_api_judge_evaluates_target_repo_not_workspace_root() {
+async fn convergence_serve_api_judge_evaluates_target_repo_not_workspace_root() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -3085,7 +3085,7 @@ async fn wave2_convergence_serve_api_judge_evaluates_target_repo_not_workspace_r
     use obb_cli::serve::{ServeConfig, build_router};
     use tower::ServiceExt;
 
-    let tmp = temp_in_private_tmp("obb-wave2-serve-judge-");
+    let tmp = temp_in_private_tmp("obb-serve-judge-");
     let workspace = tmp.path().join("workspace");
     let target_repo = tmp.path().join("target-repo");
     fs::create_dir_all(&workspace).unwrap();
@@ -3225,8 +3225,8 @@ async fn wave2_convergence_serve_api_judge_evaluates_target_repo_not_workspace_r
 #[test]
 fn land_preflight_refuses_dirty_checkout_before_changing_branch_or_trunk() {
     let tmp = temp_in_private_tmp("obb-land-preflight-");
-    let (repo, gate) = wave2_repo(tmp.path());
-    let store = wave2_take(&repo, &tmp.path().join("state"));
+    let (repo, gate) = receipt_gate_repo(tmp.path());
+    let store = take_receipt_quest(&repo, &tmp.path().join("state"));
     write_rel(&repo, "NOTES.txt", "candidate\n");
     git_cmd(&repo, &["add", "NOTES.txt"]);
     git_cmd(&repo, &["commit", "-m", "candidate"]);
@@ -3262,8 +3262,8 @@ fn land_preflight_refuses_dirty_checkout_before_changing_branch_or_trunk() {
 #[test]
 fn candidate_receipts_and_leases_preserve_quoted_and_whitespace_paths() {
     let tmp = temp_in_private_tmp("obb-candidate-paths-");
-    let (repo, gate) = wave2_repo(tmp.path());
-    let store = wave2_take(&repo, &tmp.path().join("state"));
+    let (repo, gate) = receipt_gate_repo(tmp.path());
+    let store = take_receipt_quest(&repo, &tmp.path().join("state"));
     let paths = [
         " spaced.txt ",
         "src/café.txt",

@@ -125,7 +125,7 @@ Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-q
    `.obend` claim checks, process sink detectors, typeclass/structure compositionality indexing,
    and cross-agent `AGENTS.md` / `GEMINI.md` / `CLAUDE.md` harness parity (`obb harness`).
 2. **`obb cone` & `obb apex` (`obb-lint`)**: `< 25 ms` parallel Lean module-header DAG analyzer and
-   disjoint shard planner (`obb cone plan`, isolating high-fan-in Wave-0 hubs), paired with
+   disjoint shard planner (`obb cone plan`, isolating high-fan-in barrier hubs), paired with
    whole-system Apex theorem reverse-cone coverage and leaf-island detection against
    `quarry/obend-apex.toml`.
 3. **`obb pipeline` & `obb judge` (`obb-judge`)**: Two-stage `[HypothesisLedger]` / `[Obligations]`

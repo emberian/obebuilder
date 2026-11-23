@@ -561,7 +561,7 @@ async fn statechart_guards_disk_floor_segment_rules_and_http_serve_work() {
     let repo_judge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../judge.json");
     fs::copy(&repo_judge, root.join("judge.json")).unwrap();
 
-    // Dummy static file alone WITHOUT build-timings.json or executable teeth MUST fail closed in v7!
+    // Dummy static file alone WITHOUT build-timings.json or executable teeth MUST fail closed!
     write_rel(
         root,
         "crates/obb-cli/tests/planted_faults.rs",

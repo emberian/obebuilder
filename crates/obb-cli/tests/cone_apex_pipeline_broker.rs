@@ -1,4 +1,4 @@
-//! Comprehensive unit + integration + CLI planted-fault tests for `obb v2`:
+//! Unit, integration and CLI planted-fault tests for module cones, apex coverage, the pipeline and the broker:
 //! 1. `LAW-M1` & `LAW-M2` Module-Cone Hygiene (`lean/file-wide-expose`, `lean/public-meta-import-leak`, `obb cone`, `obb cone plan`)
 //! 2. `obb apex` Whole-System Compositional Assurance & Anti-Leaf-Island Engine (`quarry/obend-apex.toml`)
 //! 3. `obb pipeline` Two-Stage `[HypothesisLedger]` Interface-Lock (`STAGE_A_LOCKED` -> `STAGE_B_SEALED`) & Smuggling Refusal
@@ -278,12 +278,12 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
     let strict_cone = scan_repo_cone(root, Some(1)).unwrap();
     assert!(!strict_cone.depth_violations.is_empty());
 
-    // 1. Auto-partition into 3 shards: `Hub` and `Mid` (`fan_in > 25`) are isolated into `wave0_barrier_hubs`
+    // 1. Auto-partition into 3 shards: `Hub` and `Mid` (`fan_in > 25`) are isolated into `barrier_hubs`
     // and worker shards are 100% disjoint!
     let auto_plan = plan_cone_shards(&cone, 3, &[]).unwrap();
     assert!(auto_plan.disjoint_write_slices);
     assert_eq!(auto_plan.shards.len(), 3);
-    assert_eq!(auto_plan.wave0_barrier_hubs.len(), 2);
+    assert_eq!(auto_plan.barrier_hubs.len(), 2);
     let mut seen_files = BTreeSet::new();
     for sh in &auto_plan.shards {
         for f in &sh.files {
@@ -293,7 +293,7 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
             );
             assert!(
                 f != "lean/Obend/Core/Hub.lean" && f != "lean/Obend/Core/Mid.lean",
-                "high-blast-radius hub `{f}` must stay in Wave-0 barrier, not parallel worker shards"
+                "high-blast-radius hub `{f}` must stay in the barrier, not parallel worker shards"
             );
         }
     }
@@ -309,7 +309,7 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
                     "lean/Obend/Vault/Consumer00.lean".into(),
                     "lean/Obend/Vault/Consumer01.lean".into(),
                 ],
-                wave0_barrier: false,
+                barrier: false,
             },
             ProposedShard {
                 name: "worker-b".into(),
@@ -317,7 +317,7 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
                     "lean/Obend/Vault/Consumer01.lean".into(),
                     "lean/Obend/Vault/Consumer02.lean".into(),
                 ],
-                wave0_barrier: false,
+                barrier: false,
             },
         ],
     )
@@ -330,7 +330,7 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
     );
 
     // 3. Disjoint proposed shards where `worker-a` touches `Obend/Core/Hub.lean` (`fan_in = 28 > 25`)
-    // outside a Wave-0 barrier -> emits `HubContentionWarning`!
+    // outside a barrier slice -> emits `HubContentionWarning`!
     let hub_warn_plan = plan_cone_shards(
         &cone,
         2,
@@ -338,12 +338,12 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
             ProposedShard {
                 name: "worker-a".into(),
                 files: vec!["lean/Obend/Core/Hub.lean".into()],
-                wave0_barrier: false,
+                barrier: false,
             },
             ProposedShard {
                 name: "worker-b".into(),
                 files: vec!["lean/Obend/Vault/Consumer00.lean".into()],
-                wave0_barrier: false,
+                barrier: false,
             },
         ],
     )
@@ -352,31 +352,31 @@ fn cone_blast_radius_depth_and_shard_planner_enforce_disjoint_slices_and_hub_bar
     assert_eq!(hub_warn_plan.hub_warnings.len(), 1);
     assert_eq!(hub_warn_plan.hub_warnings[0].module, "Obend.Core.Hub");
 
-    // Moving `Hub.lean` into a `wave0_barrier: true` slice clears the hub contention warning!
-    let wave0_clean_plan = plan_cone_shards(
+    // Moving `Hub.lean` into a `barrier: true` slice clears the hub contention warning!
+    let barrier_clean_plan = plan_cone_shards(
         &cone,
         2,
         &[
             ProposedShard {
-                name: "wave0-interface".into(),
+                name: "barrier-interface".into(),
                 files: vec!["lean/Obend/Core/Hub.lean".into()],
-                wave0_barrier: true,
+                barrier: true,
             },
             ProposedShard {
                 name: "worker-a".into(),
                 files: vec!["lean/Obend/Vault/Consumer00.lean".into()],
-                wave0_barrier: false,
+                barrier: false,
             },
             ProposedShard {
                 name: "worker-b".into(),
                 files: vec!["lean/Obend/Vault/Consumer01.lean".into()],
-                wave0_barrier: false,
+                barrier: false,
             },
         ],
     )
     .unwrap();
-    assert!(wave0_clean_plan.disjoint_write_slices);
-    assert!(wave0_clean_plan.hub_warnings.is_empty());
+    assert!(barrier_clean_plan.disjoint_write_slices);
+    assert!(barrier_clean_plan.hub_warnings.is_empty());
 
     // CLI overlap check exits with code 2
     let cli_overlap = Command::new(obb_bin())

@@ -5,7 +5,7 @@
 //! (e.g. `tier1_module_sec_cap <= 60` -> `<= 600`), dropping a floor, dropping `revert@1`,
 //! or expanding the trust base without an explicit `LobCost` ledger entry is refused by name.
 //!
-//! In `obb v7 (0.7.0)`:
+//! Evaluation guarantees:
 //! - `#tooth` (`planted_fault_red`) executes real positive + mutated negative controls in isolated
 //!   disposable `/private/tmp` copies, distinguishing `BIT`, `VACUOUS`, `INVALID_TOOTH`, and
 //!   `POSITIVE_FAILED` without touching the working tree.

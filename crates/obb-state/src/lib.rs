@@ -1,7 +1,7 @@
 //! Statechart Supervisor, Segment Tree, Append-Only JSONL Ledger & Live Probes
 //! (`PROCESS.md`, `DESIGN.md` §4–5, `spec/process.json`).
 //!
-//! In `obb v7 (0.7.0)`:
+//! Transition guarantees:
 //! - Caller-supplied `guard_passed: bool` self-attestation is eliminated from both campaign and
 //!   quest statechart transitions (`CampaignGuardEvidence`, `QuestGuardEvidence`).
 //! - Authoritative quest transitions (`Toothed`, `Landed`, `Claimed`, `Recorded`, and composite
@@ -698,7 +698,7 @@ impl StateStore {
             ",
         )?;
 
-        // Safe schema migration for any pre-v7 SQLite DBs
+        // Additive schema migration for databases created before obb 0.7.0
         for (table, col_ddl) in [
             ("campaigns", "origin TEXT NOT NULL DEFAULT 'live'"),
             ("campaigns", "judge_path TEXT"),

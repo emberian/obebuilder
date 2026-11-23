@@ -1,5 +1,5 @@
-//! `obb harness` — Canonical Multi-Agent Harness Customizations (`carbon` Antigravity,
-//! `fable` Claude Code, `astra` Codex) & Progressive-Disclosure Skill Verifier (`Obb-v4`).
+//! `obb harness` — Canonical Multi-Agent Harness Customizations (Antigravity, Claude Code,
+//! Codex) & Progressive-Disclosure Skill Verifier.
 //!
 //! Materializes and audits:
 //! - Root rules: `AGENTS.md` (`< 12,000` B), `GEMINI.md` (`< 4,000` B, `@[AGENTS.md](./AGENTS.md)`),

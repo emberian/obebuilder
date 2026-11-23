@@ -1,4 +1,4 @@
-//! Planted-fault & verification suite for `Obb-v3-Hardening`:
+//! Planted-fault suite for obligation discovery, cosplay lints, broker recipe isolation and state-store isolation:
 //! 1. `obb-judge::pipeline`: `*Obligations` + `extends HypothesisLedger` discovery; `UNDECLARED` on
 //!    `0`-obligation repos (fails `--strict` / `--require-sealed`, never `STAGE_B_SEALED`);
 //!    `(class_name, carrier_type)` discharge keying; `Unit`/`PUnit`/`Bool`/`Nat` trivial-carrier refusal.

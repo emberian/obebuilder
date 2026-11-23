@@ -91,7 +91,7 @@ pub struct ProposedShard {
     pub name: String,
     pub files: Vec<String>,
     #[serde(default)]
-    pub wave0_barrier: bool,
+    pub barrier: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ pub struct ConePlanReport {
     pub mode: String,
     pub disjoint_write_slices: bool,
     pub hub_threshold: usize,
-    pub wave0_barrier_hubs: Vec<ConeHubSummary>,
+    pub barrier_hubs: Vec<ConeHubSummary>,
     pub overlapping_assignments: Vec<ShardOverlap>,
     pub hub_warnings: Vec<HubContentionWarning>,
     pub shards: Vec<PlannedShard>,
@@ -818,7 +818,7 @@ fn assemble_cone_report(
 }
 
 /// Partition library modules into `shards_k` disjoint write slices (isolating `fan_in > 25` hubs
-/// behind a Wave-0 barrier), OR validate a caller-supplied list of `proposed_shards` for disjointness
+/// behind a barrier slice), OR validate a caller-supplied list of `proposed_shards` for disjointness
 /// and high-blast-radius hub contention.
 pub fn plan_cone_shards(
     cone: &ConeReport,
@@ -844,7 +844,7 @@ pub fn plan_cone_shards(
         let mut file_owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut planned_shards = Vec::with_capacity(proposed_shards.len());
         let mut hub_warnings = Vec::new();
-        let parallel_workers = proposed_shards.iter().filter(|s| !s.wave0_barrier).count();
+        let parallel_workers = proposed_shards.iter().filter(|s| !s.barrier).count();
 
         for prop in proposed_shards {
             let mut norm_files = Vec::new();
@@ -877,7 +877,7 @@ pub fn plan_cone_shards(
                     lines += node.lines;
                     max_blast = max_blast.max(node.blast_radius);
 
-                    if !prop.wave0_barrier
+                    if !prop.barrier
                         && parallel_workers > 1
                         && (node.blast_radius > HUB_FAN_IN_THRESHOLD
                             || node.public_fan_in > HUB_FAN_IN_THRESHOLD)
@@ -889,7 +889,7 @@ pub fn plan_cone_shards(
                             public_fan_in: node.public_fan_in,
                             blast_radius: node.blast_radius,
                             message: format!(
-                                "Worker shard `{}` writes high-blast-radius hub `{}` (blast_radius={}, public_fan_in={} > {} cap) outside a Wave-0 barrier; editing its public header invalidates {} downstream `.olean`s!",
+                                "Worker shard `{}` writes high-blast-radius hub `{}` (blast_radius={}, public_fan_in={} > {} cap) outside a barrier slice; editing its public header invalidates {} downstream `.olean`s!",
                                 prop.name,
                                 node.module,
                                 node.blast_radius,
@@ -932,15 +932,15 @@ pub fn plan_cone_shards(
             mode: "validate_proposed".to_string(),
             disjoint_write_slices: overlapping_assignments.is_empty(),
             hub_threshold: HUB_FAN_IN_THRESHOLD,
-            wave0_barrier_hubs: cone.high_blast_radius_hubs.clone(),
+            barrier_hubs: cone.high_blast_radius_hubs.clone(),
             overlapping_assignments,
             hub_warnings,
             shards: planned_shards,
         });
     }
 
-    // Mode B: Automatic K-way disjoint shard partitioner (isolating `fan_in > 25` hubs to Wave-0)
-    let mut wave0_hubs = Vec::new();
+    // Mode B: Automatic K-way disjoint shard partitioner (isolating `fan_in > 25` hubs into the barrier)
+    let mut barrier_hubs = Vec::new();
     let mut sub_buckets: BTreeMap<String, Vec<&ModuleConeNode>> = BTreeMap::new();
 
     for node in &cone.modules {
@@ -948,7 +948,7 @@ pub fn plan_cone_shards(
             continue;
         }
         if node.blast_radius > HUB_FAN_IN_THRESHOLD || node.public_fan_in > HUB_FAN_IN_THRESHOLD {
-            wave0_hubs.push(ConeHubSummary {
+            barrier_hubs.push(ConeHubSummary {
                 module: node.module.clone(),
                 path: node.rel_path.clone(),
                 public_fan_in: node.public_fan_in,
@@ -962,7 +962,7 @@ pub fn plan_cone_shards(
         }
     }
 
-    wave0_hubs.sort_by(|a, b| {
+    barrier_hubs.sort_by(|a, b| {
         b.blast_radius
             .cmp(&a.blast_radius)
             .then_with(|| a.module.cmp(&b.module))
@@ -1045,7 +1045,7 @@ pub fn plan_cone_shards(
         mode: "auto_partition".to_string(),
         disjoint_write_slices: true,
         hub_threshold: HUB_FAN_IN_THRESHOLD,
-        wave0_barrier_hubs: wave0_hubs,
+        barrier_hubs,
         overlapping_assignments: Vec::new(),
         hub_warnings: Vec::new(),
         shards,

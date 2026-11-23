@@ -831,14 +831,10 @@ fn check_trivial_conclusion_and_params(
                     .body_tokens
                     .first()
                     .is_some_and(|t| matches!(&t.kind, LeanTokenKind::Symbol(s) if s == "|"));
-                if !has_top_pipe
+                !has_top_pipe
                     && (decl.name.ends_with("_thm") || decl.name.starts_with("verify"))
                     && !ident_referenced(&decl.type_tokens, &b.name)
                     && !ident_referenced(&decl.body_tokens, &b.name)
-                {
-                    return true;
-                }
-                false
             })
             .map(|b| b.name.as_str())
             .collect();

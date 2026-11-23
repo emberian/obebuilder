@@ -1,8 +1,8 @@
-//! `obb-v5` end-to-end CLI & broker integration tests:
+//! End-to-end CLI and broker tests for vacuity, wire-tag drift and strict-gate compatibility:
 //! 1. `lean/judge-fragment-restates-check` (`SameOpening.lean:782` pattern vs semantic `Fragment`)
 //! 2. `lean/pigeonhole-vacuous-premise` (`ModuleSISHard`, `¬ BoundedCollision` > 32B, `∨ CshakeCollision` vs `PSum` & `MSISGame`)
 //! 3. `cross-lang/domain-tag-drift` (shared tag framing-arity mismatch & orphaned Rust `/v1` / `_V1` wire tags)
-//! 4. `M3` gate compatibility (`--strict --strict-expose --strict-harnesses` exits `0` on warnings, while `--strict-vacuity` and `--strict-wire` exit `2`)
+//! 4. Default strict gate compatibility (`--strict --strict-expose --strict-harnesses` exits `0` on warnings, while `--strict-vacuity` and `--strict-wire` exit `2`)
 //! 5. `obb-broker` resilient `hbox` / `bb2` `BASE_REPO` auto-detection and writable `SEED_POOL` fallback.
 
 pub mod support;
@@ -27,7 +27,7 @@ fn write_rel(root: &Path, rel: &str, content: &str) {
 }
 
 #[test]
-fn cli_v5_rules_catch_vacuity_and_wire_drift_while_preserving_m3_strict_gate() {
+fn cli_rules_catch_vacuity_and_wire_drift_while_preserving_default_strict_gate() {
     let repo = tempfile::tempdir().unwrap();
 
     // 1. Lean module with `SameOpening` tautological `Fragment` + compressing `ModuleSISHard` + `¬ BoundedCollision _ 65`
@@ -109,8 +109,8 @@ pub fn amend_root(payload: &[u8]) -> [u8; 32] {
 "#,
     );
 
-    // A. Default M3 gate (`--strict --strict-expose --strict-harnesses`): exits 0 while reporting all v5 warnings!
-    let m3_out = Command::new(obb_bin())
+    // A. Default strict gate (`--strict --strict-expose --strict-harnesses`): exits 0 while reporting all vacuity and wire warnings!
+    let default_gate_out = Command::new(obb_bin())
         .args([
             "lint",
             "--repo",
@@ -121,17 +121,27 @@ pub fn amend_root(payload: &[u8]) -> [u8; 32] {
             "--json",
         ])
         .output()
-        .expect("run obb lint m3 gate");
+        .expect("run obb lint default strict gate");
     assert!(
-        m3_out.status.success(),
-        "M3 default strict gate must exit 0 when only v5 warnings fire: {}",
-        String::from_utf8_lossy(&m3_out.stdout)
+        default_gate_out.status.success(),
+        "default strict gate must exit 0 when only vacuity and wire warnings fire: {}",
+        String::from_utf8_lossy(&default_gate_out.stdout)
     );
-    let m3_json: serde_json::Value = serde_json::from_slice(&m3_out.stdout).unwrap();
-    assert_eq!(m3_json["errors"], 0);
-    assert_eq!(m3_json["by_rule"]["lean/judge-fragment-restates-check"], 1);
-    assert_eq!(m3_json["by_rule"]["lean/pigeonhole-vacuous-premise"], 2);
-    assert_eq!(m3_json["by_rule"]["cross-lang/domain-tag-drift"], 2);
+    let default_gate_json: serde_json::Value =
+        serde_json::from_slice(&default_gate_out.stdout).unwrap();
+    assert_eq!(default_gate_json["errors"], 0);
+    assert_eq!(
+        default_gate_json["by_rule"]["lean/judge-fragment-restates-check"],
+        1
+    );
+    assert_eq!(
+        default_gate_json["by_rule"]["lean/pigeonhole-vacuous-premise"],
+        2
+    );
+    assert_eq!(
+        default_gate_json["by_rule"]["cross-lang/domain-tag-drift"],
+        2
+    );
 
     // B. `--strict --strict-vacuity`: escalates vacuity & fragment rules to Error -> exits 2!
     let vac_out = Command::new(obb_bin())
@@ -272,7 +282,7 @@ fn broker_hbox_recipe_falls_back_when_default_seed_pool_unwritable_and_autodetec
 }
 
 #[test]
-fn stage2_fable_hardening_catches_bypasses_and_eliminates_false_positives() {
+fn vacuity_and_wire_rules_catch_bypasses_and_eliminate_false_positives() {
     let repo = tempfile::tempdir().unwrap();
 
     // 1. Adversarial bypass attempts that MUST be caught:
@@ -525,14 +535,14 @@ fn broker_rejects_malicious_targets_and_unsafe_seed_paths() {
 }
 
 #[test]
-fn stage3_astra_polarity_turbofish_nested_cfg_and_cycle_safety() {
+fn wire_drift_handles_polarity_turbofish_nested_cfg_and_cycle_safety() {
     let repo = tempfile::tempdir().unwrap();
 
     // 1. Lean: cyclic struct updates, pure normalizer shared with `check`, double negation `¬ ¬ Collision`,
     //    `Not (ModuleSISHard ...)`, and arrow premise on `def` (`ModuleSISHard pp 999 → Nat`)
     write_rel(
         repo.path(),
-        "lean/Obend/Crypto/AstraRegression.lean",
+        "lean/Obend/Crypto/DriftRegression.lean",
         r#"module
 public section
 namespace Obend.Crypto
@@ -578,10 +588,10 @@ theorem toyLengthHash_collides : Collision toyLengthHash := by
   exact toy_counterexample
 
 def dynamic_drop_frame (a b c : ByteArray) : ByteArray :=
-  domainHash "OBEND.ASTRA.TURBO/v1" ([a, b, c].drop 1)
+  domainHash "OBEND.DRIFT.TURBO/v1" ([a, b, c].drop 1)
 
 def spaced_decimal_tag (a b : ByteArray) : ByteArray :=
-  domainHash [79 , 66 , 69 , 78 , 68 , 46 , 65 , 83 , 84 , 82 , 65 , 46 , 68 , 69 , 67 , 47 , 118 , 49] [a, b]
+  domainHash [79 , 66 , 69 , 78 , 68 , 46 , 68 , 82 , 73 , 70 , 84 , 46 , 68 , 69 , 67 , 47 , 118 , 49] [a, b]
 
 end Obend.Crypto
 "#,
@@ -590,19 +600,19 @@ end Obend.Crypto
     // 2. Rust: nested `mod tests { #![cfg(test)] ... }` followed by production code using turbofish `<u64, u32>`
     write_rel(
         repo.path(),
-        "crates/obend-crypto-exec/src/astra_wire.rs",
+        "crates/obend-crypto-exec/src/drift_wire.rs",
         r#"
 mod inner_tests {
     #![cfg(test)]
     fn ignored() {
-        let _ = hash("OBEND.ASTRA.ONLY_IN_TEST/v1", &[b"x"]);
+        let _ = hash("OBEND.DRIFT.ONLY_IN_TEST/v1", &[b"x"]);
     }
 }
 
 pub fn prod_after_inner_cfg_test(a: &[u8], b: &[u8]) -> [u8; 32] {
-    let _ = hash("OBEND.ASTRA.TURBO/v1", &[encode::<u64, u32>(a), b]);
-    let _ = hash("OBEND.ASTRA.DEC/v1", &[a, b]);
-    hash("OBEND.ASTRA.PROD_ORPHAN/v1", &[a, b])
+    let _ = hash("OBEND.DRIFT.TURBO/v1", &[encode::<u64, u32>(a), b]);
+    let _ = hash("OBEND.DRIFT.DEC/v1", &[a, b]);
+    hash("OBEND.DRIFT.PROD_ORPHAN/v1", &[a, b])
 }
 "#,
     );
@@ -637,7 +647,7 @@ pub fn prod_after_inner_cfg_test(a: &[u8], b: &[u8]) -> [u8; 32] {
         "exact 2 vacuity hits expected on arrow_premise_on_def + let_in_type_disjunction: {vac_hits:#?}"
     );
 
-    // Only `OBEND.ASTRA.PROD_ORPHAN/v1` should fire `cross-lang/domain-tag-drift`
+    // Only `OBEND.DRIFT.PROD_ORPHAN/v1` should fire `cross-lang/domain-tag-drift`
     // (`ONLY_IN_TEST` is skipped; `TURBO` has dynamic `.drop 1` in Lean and 2-elem turbofish in Rust; `DEC` matches spaced `[79 , 66 , ...]`)
     let wire_hits: Vec<_> = findings
         .iter()
@@ -646,7 +656,7 @@ pub fn prod_after_inner_cfg_test(a: &[u8], b: &[u8]) -> [u8; 32] {
     assert_eq!(
         wire_hits.len(),
         1,
-        "exact 1 wire hit expected on OBEND.ASTRA.PROD_ORPHAN/v1: {wire_hits:#?}"
+        "exact 1 wire hit expected on OBEND.DRIFT.PROD_ORPHAN/v1: {wire_hits:#?}"
     );
-    assert_eq!(wire_hits[0]["symbol"], "OBEND.ASTRA.PROD_ORPHAN/v1");
+    assert_eq!(wire_hits[0]["symbol"], "OBEND.DRIFT.PROD_ORPHAN/v1");
 }
