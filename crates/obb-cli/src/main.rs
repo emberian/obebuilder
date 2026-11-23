@@ -92,7 +92,7 @@ enum Commands {
         #[arg(long)]
         strict_tests: bool,
 
-        /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >1,500-line monoliths)
+        /// Print detailed Modularity & Compositionality Index (carrier/leaf ratios & >4,000-line monoliths)
         #[arg(long)]
         modularity: bool,
 

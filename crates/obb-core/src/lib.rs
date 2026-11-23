@@ -185,7 +185,7 @@ pub struct DirectoryCensus {
     pub warning_count: usize,
 }
 
-/// Giant monolithic `.lean` module (> 1,500 lines) risking elaboration RSS blowup.
+/// Giant monolithic `.lean` module (> 4,000 lines) risking elaboration RSS blowup.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonolithicModule {
     pub path: String,

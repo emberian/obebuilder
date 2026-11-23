@@ -1147,7 +1147,7 @@ pub fn inspect_quarry_target(
         },
         SurgeryGateResult {
             gate_id: "G6-compositional-modularity".to_string(),
-            title: "Compositional Modularity & Elaboration Budget (<=1,500 lines, maxHeartbeats <=400k)".to_string(),
+            title: "Compositional Modularity & Elaboration Budget (<=4,000 lines, maxHeartbeats <=400k)".to_string(),
             passed: g6_defects == 0,
             defect_count: g6_defects,
             summary: format!(

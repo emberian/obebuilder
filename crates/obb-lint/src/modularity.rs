@@ -2,14 +2,14 @@
 //!
 //! Measures algebraic interface density (`structure` + `class` + `instance`) versus isolated
 //! leaf theorems (theorems never referenced by any downstream proof or definition), and flags
-//! giant >1,500-line monolithic `.lean` modules that risk elaboration RSS blowups.
+//! giant >4,000-line monolithic `.lean` modules that risk elaboration RSS blowups.
 
 use crate::lean_index::{DeclKind, LeanIndex, ParsedLeanDecl};
 use crate::lean_lexer::{LeanToken, LeanTokenKind};
 use obb_core::{DirectoryModularity, ModularityReport, MonolithicModule};
 use std::collections::{BTreeMap, HashSet};
 
-pub const MONOLITHIC_LINE_THRESHOLD: usize = 1500;
+pub const MONOLITHIC_LINE_THRESHOLD: usize = 4000;
 
 fn collect_decl_referenced_idents(decl: &ParsedLeanDecl, out: &mut HashSet<String>) {
     let mut local_seen = HashSet::new();

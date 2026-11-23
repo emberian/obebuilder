@@ -4,7 +4,7 @@
 //!    - `lean/native-decide-in-proof` (`arXiv:2606.29493`)
 //!    - `lean/narrow-digest-weld` (`breadstuffs` 1-limb / <=64-bit digest bug class)
 //!    - `lean/uninhabited-premise-risk` (`HypothesisLedger` anti-vacuity tracking)
-//!    - `obb lint --modularity` + `lean/monolithic-module` (>1,500-line cap)
+//!    - `obb lint --modularity` + `lean/monolithic-module` (>4,000-line cap)
 
 use obb_lint::run_repo_lints;
 use obb_quarry::{QuarryManifest, QuarryState, inspect_quarry_target, status_quarry, sync_quarry};
@@ -292,7 +292,7 @@ end Obend.Judge
 }
 
 #[test]
-fn modularity_index_and_monolithic_module_detector_measure_compositionality_and_1500_line_cap() {
+fn modularity_index_and_monolithic_module_detector_measure_compositionality_and_4000_line_cap() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
@@ -320,9 +320,16 @@ end Obend.Ledger
 "#,
     );
 
-    // Build a >1,500-line monolithic `.lean` module (1,515 lines)
+    // Build a >4,000-line monolithic `.lean` module (4,015 lines) and a 2,000-line non-monolithic module
+    let mut mid_src = String::from("namespace Obend.Mid\n\ndef midId (n : Nat) : Nat := n\n");
+    for i in 0..1995 {
+        mid_src.push_str(&format!("-- padding line {i}\n"));
+    }
+    mid_src.push_str("end Obend.Mid\n");
+    write_rel(root, "lean/Obend/Mid/Medium.lean", &mid_src);
+
     let mut big_src = String::from("namespace Obend.Monolith\n\ndef stepId (n : Nat) : Nat := n\n");
-    for i in 0..1510 {
+    for i in 0..4010 {
         big_src.push_str(&format!("-- padding line {i}\n"));
     }
     big_src.push_str(
@@ -332,16 +339,24 @@ end Obend.Ledger
 
     let report = run_repo_lints(root).unwrap();
     assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "lean/monolithic-module"
+                && f.path == "lean/Obend/Mid/Medium.lean"),
+        "2,000-line Medium.lean should NOT trigger `lean/monolithic-module` under 4,000-line threshold"
+    );
+    assert!(
         report
             .findings
             .iter()
             .any(|f| f.rule_id == "lean/monolithic-module"
                 && f.path == "lean/Obend/Monolith/Giant.lean"),
-        "expected `lean/monolithic-module` warning on >1,500-line Giant.lean"
+        "expected `lean/monolithic-module` warning on >4,000-line Giant.lean"
     );
 
     let m = &report.modularity;
-    assert_eq!(m.lean_files, 2);
+    assert_eq!(m.lean_files, 3);
     assert_eq!(m.structures, 1);
     assert_eq!(m.classes, 1);
     assert_eq!(m.instances, 1);
@@ -356,7 +371,7 @@ end Obend.Ledger
         m.monolithic_modules[0].path,
         "lean/Obend/Monolith/Giant.lean"
     );
-    assert!(m.monolithic_modules[0].lines > 1500);
+    assert!(m.monolithic_modules[0].lines > 4000);
     assert!((m.carrier_to_leaf_ratio - 1.0).abs() < 1e-6);
 }
 

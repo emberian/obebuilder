@@ -111,7 +111,7 @@ destination_path = "lean/Obend/Metatheory/FibredCCC.lean"
 audit_notes = "Fibred cartesian closed category (`CCC`) structure for semantics-preserving compiler/lowering passes with indexed logical relations."
 required_cures = [
   "G4: Provide inhabitedness witness instance on `Obend.Core.Term` lowering",
-  "G6: Split categorical laws from concrete instance files (<1,500 lines)"
+  "G6: Split categorical laws from concrete instance files (<4,000 lines)"
 ]
 
 [[entries]]

@@ -244,7 +244,7 @@ pub fn run_lean_lints_with_options(
             }
         }
 
-        // Module-level monolithic file budget check (> 1,500 lines risks RSS blowup)
+        // Module-level monolithic file budget check (> 4,000 lines risks RSS blowup)
         if !is_test_only && file.line_count > crate::modularity::MONOLITHIC_LINE_THRESHOLD {
             findings.push(Finding {
                 rule_id: "lean/monolithic-module".to_string(),
@@ -263,7 +263,7 @@ pub fn run_lean_lints_with_options(
                     crate::modularity::MONOLITHIC_LINE_THRESHOLD,
                     file.declarations.len()
                 ),
-                remediation: "Split this module into focused submodules (<1,500 lines each) separating carrier types/specs (`Structure`/`Class`) from downstream soundness proofs.".to_string(),
+                remediation: "Split this module along a natural semantic boundary (<4,000 lines per module) separating carrier types/specs (`Structure`/`Class`) from downstream soundness proofs.".to_string(),
             });
         }
 
