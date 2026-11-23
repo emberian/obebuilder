@@ -66,7 +66,7 @@ fn git_cmd(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("TMPDIR", "/private/tmp")
+        .env("TMPDIR", std::env::temp_dir())
         .env("GIT_AUTHOR_NAME", "obb-v7-test")
         .env("GIT_AUTHOR_EMAIL", "obb-v7@localhost")
         .env("GIT_COMMITTER_NAME", "obb-v7-test")
@@ -98,7 +98,7 @@ fn run_obb(args: &[&str]) -> Output {
     Command::new(obb_bin())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("TMPDIR", "/private/tmp")
+        .env("TMPDIR", std::env::temp_dir())
         .args(args)
         .output()
         .expect("obb binary failed to spawn")
@@ -2939,7 +2939,8 @@ fn wave2_convergence_repo_identity_blocks_cross_checkout_transplants_and_allows_
         .trim()
         .to_string();
     let mut unkeyed_forged = JudgeReceipt {
-        receipt_version: obb_judge::RECEIPT_VERSION,
+        receipt_version: 1,
+        transport: None,
         judge_name: gate.name.clone(),
         gate_sha256: gate.canonical_sha256().unwrap(),
         repo_root: fake_id.toplevel.to_string_lossy().to_string(),

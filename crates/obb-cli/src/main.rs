@@ -9,7 +9,7 @@ use obb_cli::serve::run_server_with_options;
 use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
 use obb_judge::{
     Gate, JudgeClock, JudgeReceipt, SuccessionRecord, TrustBase, check_revert_clean, check_succeed,
-    check_well_formed, evaluate_gate_on, issue_judge_receipt_with_state_dir,
+    evaluate_gate_on, issue_judge_receipt_with_state_dir,
 };
 use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
@@ -45,6 +45,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Authenticate a native receipt and compare its inputs to an immutable Git tree.
+    VerifyTransport {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        target_tree: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
     /// Mechanical anti-slop, vacuity, cross-language mirror & Markdown symbol/constructor linter
     Lint {
         /// Repository root to scan (strictly read-only)
@@ -1178,11 +1187,29 @@ async fn run() -> Result<ExitCode> {
             }
         },
 
+        Commands::VerifyTransport {
+            receipt,
+            target_tree,
+            repo,
+        } => {
+            let key = obb_judge::receipt_auth::load_receipt_key(cli.state_dir.as_deref(), &repo)?
+                .context("missing receipt verification key")?;
+            let receipt = JudgeReceipt::load_from_path(&receipt)?;
+            let verdict = receipt.verify_transport(&key, &repo, &target_tree)?;
+            println!("{}", serde_json::to_string(&verdict)?);
+            Ok(
+                if matches!(verdict, obb_judge::transport::Transport::Transported) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                },
+            )
+        }
         Commands::Judge { sub } => match sub {
             JudgeSubcommand::Show { judge } => {
                 let jpath = resolve_judge_path(&cli.workspace, judge);
                 let gate = Gate::load_from_path(&jpath)?;
-                check_well_formed(&gate)?;
+                gate.check_evaluable()?;
                 println!(
                     "Judge `{}` (WellFormed = true)\n  formats ({}): {}\n  floors  ({}): {}\n  basis   ({}): {}",
                     gate.name,

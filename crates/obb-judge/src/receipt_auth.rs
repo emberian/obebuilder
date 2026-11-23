@@ -124,7 +124,7 @@ pub(crate) fn verify_mac(key: &[u8], context: &str, message: &[u8], mac: &str) -
         _ => None,
     };
     let mut supplied = [0; 32];
-    for (output, pair) in supplied.iter_mut().zip(mac.as_bytes().chunks_exact(2)) {
+    for (output, pair) in supplied.iter_mut().zip(mac.as_bytes().as_chunks::<2>().0) {
         let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
             return false;
         };

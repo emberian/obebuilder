@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "obb-broker"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "obb-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "obb-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "obb-judge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "obb-lint"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "obb-quarry"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "obb-state"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",

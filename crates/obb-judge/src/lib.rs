@@ -41,7 +41,8 @@ fn is_false(value: &bool) -> bool {
 }
 
 pub const REVERT_FORMAT: &str = "revert@1";
-pub const RECEIPT_VERSION: u32 = 1;
+pub mod transport;
+pub const RECEIPT_VERSION: u32 = 2;
 
 fn default_tooth_timeout_ms() -> u64 {
     15_000
@@ -518,6 +519,14 @@ pub struct Gate {
 }
 
 impl Gate {
+    pub fn check_evaluable(&self) -> Result<()> {
+        if self.formats == ["cone-unit@1"] {
+            transport::check_unit(self)
+        } else {
+            check_well_formed(self).context("judge failed WellFormed check")
+        }
+    }
+
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read judge file {}", path.display()))?;
@@ -1145,6 +1154,8 @@ pub struct JudgeReceipt {
     pub kernel_verified: bool,
     pub teeth_report: TeethReport,
     pub evaluations: Vec<FloorEvaluation>,
+    #[serde(flatten)]
+    pub transport: Option<transport::TransportCone>,
     pub receipt_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_mac: Option<String>,
@@ -1169,9 +1180,19 @@ struct JudgeReceiptSignable<'a> {
     kernel_verified: bool,
     teeth_report: &'a TeethReport,
     evaluations: &'a [FloorEvaluation],
+    #[serde(flatten)]
+    transport: Option<&'a transport::TransportCone>,
 }
 
 impl JudgeReceipt {
+    fn mac_domain(&self) -> &'static str {
+        if self.receipt_version == 1 {
+            receipt_auth::RECEIPT_CONTEXT
+        } else {
+            "obb-judge-receipt-v2"
+        }
+    }
+
     pub fn compute_hash(&self) -> Result<String> {
         let signable = JudgeReceiptSignable {
             receipt_version: self.receipt_version,
@@ -1190,9 +1211,15 @@ impl JudgeReceipt {
             kernel_verified: self.kernel_verified,
             teeth_report: &self.teeth_report,
             evaluations: &self.evaluations,
+            transport: self.transport.as_ref(),
         };
-        let bytes =
-            serde_json::to_vec(&signable).context("failed to serialize JudgeReceiptSignable")?;
+        let bytes = if self.receipt_version == 1 {
+            serde_json::to_vec(&signable)?
+        } else {
+            let mut value = serde_json::to_value(&signable)?;
+            value.sort_all_objects();
+            serde_json::to_vec(&value)?
+        };
         Ok(sha256_hex(&bytes))
     }
 
@@ -1201,7 +1228,7 @@ impl JudgeReceipt {
         self.receipt_hash = self.compute_hash()?;
         self.receipt_mac = Some(receipt_auth::mac_hex(
             key,
-            receipt_auth::RECEIPT_CONTEXT,
+            self.mac_domain(),
             self.receipt_hash.as_bytes(),
         ));
         Ok(())
@@ -1210,12 +1237,7 @@ impl JudgeReceipt {
     pub fn verify_authenticated(&self, key: &[u8]) -> Result<()> {
         self.verify_integrity()?;
         if !self.receipt_mac.as_deref().is_some_and(|mac| {
-            receipt_auth::verify_mac(
-                key,
-                receipt_auth::RECEIPT_CONTEXT,
-                self.receipt_hash.as_bytes(),
-                mac,
-            )
+            receipt_auth::verify_mac(key, self.mac_domain(), self.receipt_hash.as_bytes(), mac)
         }) {
             bail!("JudgeReceipt receipt_mac is missing or invalid");
         }
@@ -1223,7 +1245,10 @@ impl JudgeReceipt {
     }
 
     pub fn verify_integrity(&self) -> Result<()> {
-        if self.receipt_version != RECEIPT_VERSION {
+        if !matches!(
+            (self.receipt_version, &self.transport),
+            (1, None) | (RECEIPT_VERSION, Some(_))
+        ) {
             bail!(
                 "unsupported JudgeReceipt version {} (expected {})",
                 self.receipt_version,
@@ -1902,7 +1927,7 @@ pub fn evaluate_gate_on(
     repo_root: &Path,
     clock: JudgeClock,
 ) -> Result<JudgeCheckReport> {
-    evaluate_gate_with_key(gate, repo_root, clock, None)
+    evaluate_gate_with_key(gate, repo_root, clock, None, None)
 }
 
 fn evaluate_gate_with_key(
@@ -1910,8 +1935,9 @@ fn evaluate_gate_with_key(
     repo_root: &Path,
     clock: JudgeClock,
     signing_key: Option<&[u8]>,
+    receipt_tree: Option<&str>,
 ) -> Result<JudgeCheckReport> {
-    check_well_formed(gate).context("judge failed WellFormed check")?;
+    gate.check_evaluable()?;
     let fast = clock == JudgeClock::Construction;
     let mut deferred_floors = Vec::new();
 
@@ -1922,9 +1948,20 @@ fn evaluate_gate_with_key(
         bail!("repo path is not a directory: {}", canon.display());
     }
 
+    let unit = gate.formats == ["cone-unit@1"];
+    let projection = if unit && !fast {
+        Some(match receipt_tree {
+            Some(tree) => tree.to_string(),
+            None => run_git_ro(&canon, &["rev-parse", "HEAD^{tree}"])?
+                .trim()
+                .to_string(),
+        })
+    } else {
+        None
+    };
     let cache = cone_cache::ConeCache::open(
         &canon,
-        !fast && gate.floors.iter().any(|f| !f.inputs().is_empty()),
+        !unit && !fast && gate.floors.iter().any(|f| !f.inputs().is_empty()),
         signing_key,
     )?;
     let mut floor_cache = Vec::with_capacity(gate.floors.len());
@@ -1957,15 +1994,16 @@ fn evaluate_gate_with_key(
         let cached = cache.read::<FloorEvaluation>(digest.as_deref())?;
         floor_cache.push((digest, cached));
     }
-    let needs_scan = gate
-        .floors
-        .iter()
-        .zip(&floor_cache)
-        .any(|(floor, (_, cached))| {
-            cached.is_none()
-                && !matches!(floor.core(), Floor::Home(_))
-                && floor.cell_key() != "planted_fault_red"
-        });
+    let needs_scan = !unit
+        && gate
+            .floors
+            .iter()
+            .zip(&floor_cache)
+            .any(|(floor, (_, cached))| {
+                cached.is_none()
+                    && !matches!(floor.core(), Floor::Home(_))
+                    && floor.cell_key() != "planted_fault_red"
+            });
 
     let gate_mentions_test_in_library = gate
         .floors
@@ -2029,7 +2067,11 @@ fn evaluate_gate_with_key(
         .floors
         .iter()
         .any(|fl| fl.cell_key() == "planted_fault_red");
-    let teeth_specs = load_repo_teeth(gate, &canon)?;
+    let teeth_specs = if unit {
+        Vec::new()
+    } else {
+        load_repo_teeth(gate, &canon)?
+    };
     let teeth_report = if !fast && (gate_needs_teeth || !teeth_specs.is_empty()) {
         evaluate_teeth_with_key(&canon, &teeth_specs, signing_key)?
     } else {
@@ -2171,7 +2213,13 @@ fn evaluate_gate_with_key(
                         fl.to_wire()
                     );
                 }
-                *eval = evaluate_command_floor(fl, &canon, command, *timeout_ms)?;
+                *eval = evaluate_command_floor(
+                    fl,
+                    &canon,
+                    command,
+                    *timeout_ms,
+                    projection.as_deref(),
+                )?;
                 compiled_or_external_passed |= eval.passed;
             }
             cache.write(digest.as_deref(), eval)?;
@@ -2215,12 +2263,17 @@ fn evaluate_command_floor(
     repo: &Path,
     command: &str,
     timeout_ms: u64,
+    projection: Option<&str>,
 ) -> Result<FloorEvaluation> {
     if command.trim().is_empty() || command_invokes_forbidden_macos_lean(command) {
         bail!("empty or forbidden floor command for {}", fl.to_wire());
     }
     let sandbox = create_isolated_tempdir("obb-floor-")?;
-    copy_repo_to_sandbox(repo, sandbox.path())?;
+    if let Some(tree) = projection {
+        transport::project(repo, tree, fl, sandbox.path())?;
+    } else {
+        copy_repo_to_sandbox(repo, sandbox.path())?;
+    }
     let output = run_sandboxed_shell_cmd(sandbox.path(), command, None, None, timeout_ms)?;
     let passed = output.exit_code == Some(0) && !output.timed_out;
     Ok(FloorEvaluation {
@@ -2909,14 +2962,22 @@ pub fn issue_judge_receipt_with_state_dir(
         .map(str::to_string)
         .collect();
 
-    let report = evaluate_gate_with_key(gate, &canon, JudgeClock::Convergence, Some(&key))?;
+    let report = evaluate_gate_with_key(
+        gate,
+        &canon,
+        JudgeClock::Convergence,
+        Some(&key),
+        Some(&tree_oid),
+    )?;
     let clean_working_tree = clean_working_tree
         && cone_cache::clean_for_cache(&canon)?
         && run_git_ro(&canon, &["rev-parse", "HEAD^{commit}"])?.trim() == head_sha;
     let gate_sha256 = gate.canonical_sha256()?;
 
+    let transport = transport::issue(gate, &canon, &tree_oid, &report, clean_working_tree)?;
     let mut receipt = JudgeReceipt {
         receipt_version: RECEIPT_VERSION,
+        transport: Some(transport),
         judge_name: report.judge_name,
         gate_sha256,
         repo_root: canon.to_string_lossy().to_string(),

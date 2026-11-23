@@ -107,12 +107,12 @@ ember" column; server-sent events. An unseeded vault opens empty (`0` live trans
 `AttestedOverride` emergency merges from `demo_seed` fixtures. This is how a person follows forty
 segments without reading forty transcripts (after Luke Hutchison's Zed plan page).
 
-## 6. Shape and landed engines (`obb v7`, `0.7.0`)
+## 6. Shape and landed engines (`obb v8`, `0.8.0`)
 
 Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-quarry`,
-`obb-state`, `obb-broker`, `obb-cli`), one binary `obb` with twelve top-level commands (`lint`,
+`obb-state`, `obb-broker`, `obb-cli`), one binary `obb` with thirteen top-level commands (`lint`,
 `cone`, `apex`, `pipeline`, `harness`, `broker`, `quarry`, `judge`, `state`, `seg`, `ledger`,
-`serve`):
+`serve`, `verify-transport`):
 
 1. **`obb lint` & `obb harness` (`obb-lint`)**: Vacuity, `atp-checkers`, uninhabited-premise,
    `Judge.Fragment` operational-check restatement (`lean/judge-fragment-restates-check`),
@@ -138,7 +138,8 @@ Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-q
    `--emit-receipt`). Opt-in floor/tooth input cones reuse authenticated verdicts from
    `.obb/cache/cones/`, keyed by git input OIDs, check definitions, and the evaluator executable.
    Dirty trees bypass reuse; history and external evidence retain their own freshness checks.
-   Key selection and the declared-dependency trust boundary are specified in `JUDGE.md`.
+   File-unit gates can export the committed file view, modes, Merkle root and runtime fingerprint in a wire-v2 receipt.
+   `obb verify-transport` authenticates this evidence against another tree. See `JUDGE.md` for the wire format and key selection.
 4. **`obb quarry` (`obb-quarry`, `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
    synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
 5. **`obb broker`, `obb state`, `obb seg`, `obb ledger` & `obb serve` (`obb-broker`, `obb-state`)**:

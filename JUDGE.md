@@ -82,7 +82,7 @@ is configured or `receipt_mac` is missing or invalid. Key rotation
 invalidates prior receipts and cache entries.
 
 The MAC covers `receipt_hash`, which hashes the canonical receipt payload, excluding the
-hash and MAC fields themselves. The MAC input is domain-tagged: `obb-judge-receipt-v1`, a
+hash and MAC fields themselves. The MAC domain is `obb-judge-receipt-v2` (or `obb-judge-receipt-v1` for legacy receipts), followed by a
 NUL byte, then the hash; cone cache entries use `obb-cone-verdict-v1` under the same key, so
 a tag for one kind of message never verifies as the other. Recomputing an unkeyed hash after editing a verdict does
 not produce a valid MAC. This authenticates possession of the key: mode `0600` does not
@@ -123,3 +123,38 @@ repository key cannot authorize evidence for a vault-key-signed receipt. Malform
 tampered entries are treated as misses. This
 is declared-dependency reuse, not proof of cone completeness: external tools, environment,
 and network state must be held fixed, or reuse must be disabled for that check.
+
+### Transporting a file-unit verdict
+
+Use `cone-unit@1` for a trusted shell check whose repository inputs are exact regular
+files. OBB materializes each floor's declared files from the pinned tree, including
+their executable bits. Pin the external runtime image through `OBB_RUNTIME_ID` when
+the shell command depends on installed tools. The toolchain fingerprint includes
+this value, the judge executable and `/bin/sh`.
+
+```json
+{
+  "name": "quality",
+  "formats": ["cone-unit@1"],
+  "floors": [{"floor":"quality","inputs":["check.sh","value"],"command":"sh check.sh"}],
+  "methods": [{"format":"cone-unit@1","floor":"quality","method":"eval:external:shell"}],
+  "basis": ["external:shell"]
+}
+```
+
+```sh
+obb judge check --judge gate.json --repo . --base main --emit-receipt ../quality.json
+obb verify-transport --receipt ../quality.json --target-tree "$(git rev-parse 'candidate^{tree}')"
+```
+
+Wire v2 signs the compact JSON payload with object keys recursively sorted. As in v1,
+the hash and MAC fields are excluded from the payload. The file map records raw blob
+SHA-256 values. The Merkle leaves cover path, mode and digest. Authenticated Git
+object IDs permit a batched target lookup without reading unchanged file contents.
+Verification prints `"Transported"` on success or `{"Invalidated":{"changed_paths":[...]}}`
+on a mismatch. Invalid evidence is a command error. Embedded verifiers can use
+`JudgeReceipt::verify_transport_with_toolchain` with their approved issuer fingerprint.
+
+Governance gates retain their original tree and history bindings. Their v2 receipt
+carries an empty transport cone. File units do not discharge a governance gate's
+history checks or execution teeth. State transitions can still authenticate wire v1.
