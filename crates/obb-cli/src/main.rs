@@ -292,7 +292,7 @@ enum PipelineSubcommand {
         #[arg(long)]
         strict: bool,
 
-        /// Allow `STAGE_B_SEALED` with `0` obligation classes and no Apex manifest; recorded as `allow_empty_override` and never applied over a present Apex manifest
+        /// Allow `STAGE_B_SEALED` with `0` obligation classes and no Apex manifest; recorded as `allow_empty_override`. A present Apex manifest must verify with zero unwired leaf islands
         #[arg(long)]
         allow_empty: bool,
 
@@ -2665,7 +2665,7 @@ fn print_human_pipeline_report(
     );
     if rep.allow_empty_override {
         println!(
-            "[ALLOW-EMPTY OVERRIDE] `--allow-empty` produced `{}` with 0 obligation classes and no Apex manifest; this is not verified coverage of the {} theorem declaration(s).",
+            "[ALLOW-EMPTY OVERRIDE] allow_empty_override: true | `--allow-empty` produced `{}` with 0 obligation classes, no Apex manifest, and {} theorem declaration(s).",
             rep.stage, rep.theorem_declaration_count
         );
     }

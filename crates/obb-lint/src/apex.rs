@@ -35,26 +35,34 @@ pub enum ApexManifestDiscovery {
 /// Locate the repository's Apex manifest: `obb-apex.toml`, then `quarry/obend-apex.toml`, then the
 /// only `quarry/*-apex.toml`. Several `quarry/*-apex.toml` files without one of the first two
 /// names are reported as [`ApexManifestDiscovery::Ambiguous`] rather than resolved by a guess.
-pub fn discover_repo_apex_manifest(repo_root: &Path) -> std::io::Result<ApexManifestDiscovery> {
+pub fn discover_repo_apex_manifest(repo_root: &Path) -> Result<ApexManifestDiscovery> {
     for rel in [REPO_ROOT_APEX_MANIFEST_REL, DEFAULT_APEX_MANIFEST_REL] {
-        if repo_root.join(rel).is_file() {
-            return Ok(ApexManifestDiscovery::Found {
-                rel_path: rel.to_string(),
-            });
+        match std::fs::symlink_metadata(repo_root.join(rel)) {
+            Ok(_) => {
+                return Ok(ApexManifestDiscovery::Found {
+                    rel_path: rel.into(),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect `{rel}`")),
         }
     }
     let quarry_dir = repo_root.join("quarry");
-    if !quarry_dir.is_dir() {
-        return Ok(ApexManifestDiscovery::Absent);
+    match std::fs::symlink_metadata(&quarry_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ApexManifestDiscovery::Absent);
+        }
+        result => {
+            result.context("cannot inspect `quarry/`")?;
+        }
     }
     let mut candidates = Vec::new();
-    for entry in std::fs::read_dir(&quarry_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.ends_with("-apex.toml") && entry.path().is_file() {
+    for entry in std::fs::read_dir(&quarry_dir).context("cannot list `quarry/`")? {
+        let name = entry?.file_name();
+        if name.as_encoded_bytes().ends_with(b"-apex.toml") {
+            let name = name
+                .to_str()
+                .context("Apex manifest name in `quarry/` is not UTF-8")?;
             candidates.push(format!("quarry/{name}"));
         }
     }
@@ -141,6 +149,12 @@ pub struct ApexManifest {
 
 impl ApexManifest {
     pub fn load_from_path(path: &Path) -> Result<Self> {
+        if !std::fs::metadata(path)
+            .with_context(|| format!("cannot inspect apex manifest {}", path.display()))?
+            .is_file()
+        {
+            bail!("apex manifest {} must be a regular file", path.display());
+        }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read apex manifest {}", path.display()))?;
         let parsed: Self = toml::from_str(&raw)
@@ -298,16 +312,6 @@ fn collect_decl_idents(decl: &ParsedLeanDecl, out: &mut Vec<String>) {
     for sf in &decl.struct_fields {
         push_toks(&sf.type_tokens);
     }
-}
-
-fn decl_has_sorry(decl: &ParsedLeanDecl) -> bool {
-    decl.type_tokens
-        .iter()
-        .chain(decl.body_tokens.iter())
-        .chain(decl.where_fields.iter().flat_map(|w| w.rhs_tokens.iter()))
-        .any(
-            |tok| matches!(&tok.kind, LeanTokenKind::Ident(id) if id == "sorry" || id == "sorryAx"),
-        )
 }
 
 pub fn evaluate_apex(
@@ -506,16 +510,14 @@ pub fn evaluate_apex_with_index(
         // Check module-level sorry/axioms across `mod_cone` as well as `decl_cone`
         for &mf in &mod_cone {
             let mfile = &index.files[mf];
+            for (line, col, token) in &mfile.raw_sorry_sites {
+                sorry_count += 1;
+                offenders.insert(format!("{token} ({}:{line}:{col})", mfile.rel_path));
+            }
             for md in &mfile.declarations {
-                if md.fixture_kept {
-                    continue;
-                }
                 if md.kind == DeclKind::Axiom {
                     custom_axiom_count += 1;
                     offenders.insert(format!("axiom {} ({})", md.fq_name, mfile.rel_path));
-                } else if decl_has_sorry(md) {
-                    sorry_count += 1;
-                    offenders.insert(format!("sorry in {} ({})", md.fq_name, mfile.rel_path));
                 }
             }
         }

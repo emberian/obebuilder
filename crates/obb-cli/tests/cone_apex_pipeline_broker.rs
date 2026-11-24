@@ -805,7 +805,17 @@ fn has_unverified_apex_violation(
 fn pipeline_strict_separates_zero_theorem_declarations_from_undeclared_theorems() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    let (code, empty) = pipeline_cli_json(root, &["--strict"]);
+    assert_eq!(code, Some(2));
+    assert_eq!(empty["ledger_basis"]["kind"], "zero_declarations");
+    assert!(check_pipeline_with_options(&root.join("nonexistent"), ALLOW_EMPTY).is_err());
+
     // Library definitions only; theorems under test-only paths are not counted
+    write_rel(
+        root,
+        "lean/Obend/Teeth/Smoke.lean",
+        "theorem smoke : True := True.intro\n",
+    );
     write_rel(
         root,
         "lean/Obend/Core/Defs.lean",
@@ -850,7 +860,7 @@ fn pipeline_strict_separates_zero_theorem_declarations_from_undeclared_theorems(
     write_rel(
         root,
         "lean/Obend/Core/Lemma.lean",
-        "module\npublic import Obend.Core.Defs\npublic section\nnamespace Obend.Core\ntheorem idNat_eq (n : Nat) : idNat n = n := rfl\nend Obend.Core\n",
+        "module\npublic import Obend.Core.Defs\npublic section\nnamespace Obend.Core\nlemma idNat_eq (n : Nat) : idNat n = n := rfl\nend Obend.Core\n",
     );
     let rep_undeclared = check_pipeline_with_options(root, STRICT).unwrap();
     assert_eq!(
@@ -921,6 +931,8 @@ fn pipeline_records_allow_empty_override_for_release_consumers() {
         "{stdout}"
     );
     assert!(stdout.contains("[ALLOW-EMPTY OVERRIDE]"), "{stdout}");
+
+    assert!(stdout.contains("allow_empty_override: true"), "{stdout}");
 
     // Without the flag the same tree is not sealed, and no override is claimed
     let plain = check_pipeline(root).unwrap();
@@ -1079,7 +1091,11 @@ fn pipeline_refuses_unverified_apex_manifest_even_under_allow_empty() {
         strict.violations
     );
 
-    for flags in [&["--strict"][..], &["--strict", "--allow-empty"]] {
+    for flags in [
+        &["--strict"][..],
+        &["--allow-empty"],
+        &["--strict", "--allow-empty"],
+    ] {
         let (code, json) = pipeline_cli_json(root, flags);
         assert_eq!(code, Some(2), "{flags:?}: {json}");
         assert_eq!(json["stage"], "FAILED");
@@ -1096,13 +1112,13 @@ fn pipeline_refuses_unverified_apex_manifest_even_under_allow_empty() {
         );
     }
 
-    // 2. The manifest's own island cap binds under `--allow-empty` without `--strict`
+    // 2. The manifest's own island cap also binds without either flag
     write_rel(
         root,
         "quarry/obend-apex.toml",
         &apex_manifest("max_unwired_islands = 0", REPLAY_APEX_ENTRY),
     );
-    let (code, json) = pipeline_cli_json(root, &["--allow-empty"]);
+    let (code, json) = pipeline_cli_json(root, &[]);
     assert_eq!(code, Some(2), "{json}");
     assert_eq!(json["stage"], "FAILED");
     assert_eq!(json["allow_empty_override"], false);
@@ -1173,6 +1189,15 @@ fn pipeline_refuses_unverified_apex_manifest_even_under_allow_empty() {
         rep_unregistered.violations
     );
 
+    for invalid in ["", "this is not toml"] {
+        write_rel(missing.path(), "quarry/obend-apex.toml", invalid);
+        let (code, rep) = pipeline_cli_json(missing.path(), &["--allow-empty"]);
+        assert_eq!(code, Some(2));
+        assert_eq!(rep["stage"], "FAILED");
+        assert_eq!(rep["allow_empty_override"], false);
+        assert_eq!(rep["violations"][0]["kind"], "unverified_apex_manifest");
+    }
+
     // 5. Several `quarry/*-apex.toml` without an authoritative name are refused, not guessed
     let ambiguous = tempfile::tempdir().unwrap();
     write_wired_apex_tree(ambiguous.path());
@@ -1194,6 +1219,90 @@ fn pipeline_refuses_unverified_apex_manifest_even_under_allow_empty() {
         "{:?}",
         rep_ambiguous.violations
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_rejects_unreadable_manifest_candidates_before_fallback() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_wired_apex_tree(root);
+    for rel in [
+        "quarry/project-apex.toml",
+        "quarry/obend-apex.toml",
+        "obb-apex.toml",
+    ] {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Each broken higher-priority entry must also outrank the valid lower one.
+        symlink("missing.toml", &path).unwrap();
+        let (code, rep) = pipeline_cli_json(root, &["--allow-empty"]);
+        assert_eq!(code, Some(2), "{rel}: {rep}");
+        assert_eq!(rep["ledger_basis"]["manifest_path"], rel);
+        assert_eq!(rep["violations"][0]["kind"], "unverified_apex_manifest");
+        assert_eq!(rep["allow_empty_override"], false);
+        fs::remove_file(path).unwrap();
+        write_rel(root, rel, &apex_manifest("", REPLAY_APEX_ENTRY));
+    }
+}
+
+#[test]
+fn pipeline_checks_entire_apex_cone_for_sorry_and_custom_axioms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_wired_apex_tree(root);
+    write_rel(root, "obb-apex.toml", &apex_manifest("", REPLAY_APEX_ENTRY));
+    for (source, diagnostic) in [
+        (
+            "theorem replay_sound (_ : (show Type from by sorry)) : True := True.intro",
+            "1 sorry site(s)",
+        ),
+        (
+            "-- fixture kept\ntheorem replay_sound : True := by sorry",
+            "1 sorry site(s)",
+        ),
+        (
+            "-- fixture kept\naxiom trusted : True\ntheorem replay_sound : True := trusted",
+            "1 custom axiom(s)",
+        ),
+    ] {
+        write_rel(
+            root,
+            "lean/Obend/Vault/Replay.lean",
+            &format!(
+                "module\npublic import Obend.Core.Step\npublic section\nnamespace Obend.Vault\n{source}\nend Obend.Vault\n"
+            ),
+        );
+        let rep = check_pipeline_with_options(root, ALLOW_EMPTY).unwrap();
+        assert_eq!(rep.stage, PipelineStage::Failed);
+        assert!(
+            has_unverified_apex_violation(&rep, diagnostic),
+            "{:?}",
+            rep.violations
+        );
+        assert!(!rep.allow_empty_override);
+    }
+}
+
+#[test]
+fn pipeline_verifies_apex_against_the_supplied_index() {
+    use obb_judge::pipeline::check_pipeline_with_index_and_options;
+    use obb_lint::lean_index::build_lean_index;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_wired_apex_tree(root);
+    write_rel(root, "obb-apex.toml", &apex_manifest("", REPLAY_APEX_ENTRY));
+    let index = build_lean_index(root);
+    fs::remove_file(root.join("lean/Obend/Vault/Replay.lean")).unwrap();
+    let snapshot = check_pipeline_with_index_and_options(root.to_str().unwrap(), &index, STRICT);
+    assert_eq!(snapshot.stage, PipelineStage::StageBSealed);
+    assert_eq!(snapshot.theorem_declaration_count, 2);
+    let fresh = check_pipeline_with_options(root, STRICT).unwrap();
+    assert_eq!(fresh.stage, PipelineStage::Failed);
+    assert!(has_unverified_apex_violation(&fresh, "not found"));
 }
 
 #[test]

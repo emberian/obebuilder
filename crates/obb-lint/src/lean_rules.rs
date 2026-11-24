@@ -666,7 +666,8 @@ fn bucket_for_finding_path(rel_path: &str) -> String {
     }
 }
 
-fn is_teeth_or_test_path(rel_path: &str) -> bool {
+/// Whether a Lean source is a test or mutation witness.
+pub fn is_teeth_or_test_path(rel_path: &str) -> bool {
     rel_path.contains("/Teeth/")
         || rel_path.starts_with("Obend/Teeth/")
         || rel_path.contains("/tests/")
