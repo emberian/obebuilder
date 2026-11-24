@@ -9,9 +9,19 @@
 //! - `FAILED`: Immediate refusal if any worker smuggled `sorry` or `axiom`, left a cyclic instance
 //!   loop (`[LedgerA] -> LedgerB -> LedgerA`), or instantiated an obligation over an uninhabited
 //!   (`Empty` / `False` / 0-constructor) carrier witness.
+//!
+//! A repository without obligation classes is classified by [`PipelineLedgerBasis`]: its own Apex
+//! manifest (`obb-apex.toml`, `quarry/obend-apex.toml` or a single `quarry/*-apex.toml`) seals it
+//! only when every registered apex theorem verifies, and a present manifest that fails verification
+//! is `FAILED` even under `--allow-empty`. Without a manifest, the report separates zero theorem
+//! declarations, undeclared theorems and an explicit `--allow-empty` override.
 
 use anyhow::Result;
 use chrono::Utc;
+use obb_lint::apex::{
+    self, ApexCheckOptions, ApexManifestDiscovery, QUARRY_APEX_MANIFEST_PATTERN,
+    discover_repo_apex_manifest, evaluate_apex_with_index,
+};
 use obb_lint::lean_index::{BinderParam, DeclKind, LeanIndex, ParsedLeanDecl, build_lean_index};
 use obb_lint::lean_lexer::{LeanToken, LeanTokenKind};
 use serde::{Deserialize, Serialize};
@@ -54,10 +64,55 @@ impl fmt::Display for PipelineStage {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineCheckOptions {
-    /// Refuse (`passed == false`) when `0` obligation classes are discovered (`UNDECLARED`).
+    /// Refuse (`passed == false`) on `UNDECLARED`, and require zero unwired leaf islands when an
+    /// Apex manifest is the ledger basis.
     pub strict: bool,
-    /// Allow `STAGE_B_SEALED` when `0` obligation classes are discovered in the repository.
+    /// Allow `STAGE_B_SEALED` with `0` obligation classes and no Apex manifest. The report records
+    /// the override; a present Apex manifest is verified regardless.
     pub allow_empty: bool,
+}
+
+/// The evidence a pipeline stage rests on, so an `--allow-empty` seal or an empty theorem tree
+/// is never mistaken for verified coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PipelineLedgerBasis {
+    /// `*Obligations` / `HypothesisLedger` / `@[obb_obligation]` classes were discovered.
+    ObligationClasses,
+    /// No obligation classes; the repository's own Apex manifest was checked against its Lean
+    /// index. All counts are `0` when the manifest could not be resolved or loaded.
+    ApexManifest {
+        manifest_path: String,
+        registered_apex_count: usize,
+        valid_apex_count: usize,
+        unwired_island_count: usize,
+    },
+    /// No obligation classes, no Apex manifest, and `--allow-empty` was requested.
+    AllowEmptyOverride,
+    /// No obligation classes, no Apex manifest, and no non-test theorem declarations.
+    ZeroDeclarations,
+    /// Non-test theorem declarations exist, but neither obligation classes nor an Apex manifest
+    /// account for them.
+    UndeclaredTheorems,
+}
+
+impl PipelineLedgerBasis {
+    /// The serialized `kind` tag.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ObligationClasses => "obligation_classes",
+            Self::ApexManifest { .. } => "apex_manifest",
+            Self::AllowEmptyOverride => "allow_empty_override",
+            Self::ZeroDeclarations => "zero_declarations",
+            Self::UndeclaredTheorems => "undeclared_theorems",
+        }
+    }
+}
+
+impl fmt::Display for PipelineLedgerBasis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +174,12 @@ pub struct PipelineReport {
     pub passed: bool,
     pub ready_for_parallel_swarm: bool,
     pub ready_for_claimed: bool,
+    pub ledger_basis: PipelineLedgerBasis,
+    /// `true` only when `--allow-empty` produced `STAGE_B_SEALED`: no obligation classes and no
+    /// Apex manifest verified anything.
+    pub allow_empty_override: bool,
+    /// `theorem` / `lemma` declarations in the Lean index outside test-only paths.
+    pub theorem_declaration_count: usize,
     pub smuggled_sorry_count: usize,
     pub smuggled_axiom_count: usize,
     pub total_obligations: usize,
@@ -486,6 +547,150 @@ fn carrier_args_cover(inst_args: &[String], req_args: &[String]) -> bool {
     })
 }
 
+/// `theorem` / `lemma` declarations outside test-only paths.
+fn count_theorem_declarations(index: &LeanIndex) -> usize {
+    index
+        .files
+        .iter()
+        .filter(|f| !is_test_only_path(&f.rel_path))
+        .flat_map(|f| &f.declarations)
+        .filter(|d| d.kind == DeclKind::Theorem)
+        .count()
+}
+
+fn unverified_apex_manifest_violation(
+    path: &str,
+    symbol: &str,
+    message: String,
+    remediation: String,
+) -> PipelineViolation {
+    PipelineViolation {
+        kind: "unverified_apex_manifest".to_string(),
+        path: path.to_string(),
+        line: 1,
+        symbol: symbol.to_string(),
+        message,
+        remediation,
+    }
+}
+
+fn unresolved_apex_basis(manifest_path: &str) -> PipelineLedgerBasis {
+    PipelineLedgerBasis::ApexManifest {
+        manifest_path: manifest_path.to_string(),
+        registered_apex_count: 0,
+        valid_apex_count: 0,
+        unwired_island_count: 0,
+    }
+}
+
+/// Classify a repository that declares no obligation classes. A present Apex manifest is the
+/// basis and must verify (islands capped at `0` under `--strict`); each reason it does not is an
+/// `unverified_apex_manifest` violation. Returns the basis and whether the manifest verified.
+fn classify_without_obligation_classes(
+    repo_root: &str,
+    index: &LeanIndex,
+    opts: PipelineCheckOptions,
+    theorem_declaration_count: usize,
+    violations: &mut Vec<PipelineViolation>,
+) -> (PipelineLedgerBasis, bool) {
+    let root = Path::new(repo_root);
+    let manifest_rel = match discover_repo_apex_manifest(root) {
+        Ok(ApexManifestDiscovery::Absent) => {
+            let basis = if opts.allow_empty {
+                PipelineLedgerBasis::AllowEmptyOverride
+            } else if theorem_declaration_count == 0 {
+                PipelineLedgerBasis::ZeroDeclarations
+            } else {
+                PipelineLedgerBasis::UndeclaredTheorems
+            };
+            return (basis, false);
+        }
+        Ok(ApexManifestDiscovery::Found { rel_path }) => rel_path,
+        Ok(ApexManifestDiscovery::Ambiguous { candidates }) => {
+            violations.push(unverified_apex_manifest_violation(
+                "quarry",
+                QUARRY_APEX_MANIFEST_PATTERN,
+                format!(
+                    "{} Apex manifests match `{QUARRY_APEX_MANIFEST_PATTERN}` ({}) and none is `{}` or `{}`, so no single manifest is authoritative",
+                    candidates.len(),
+                    candidates.join(", "),
+                    apex::REPO_ROOT_APEX_MANIFEST_REL,
+                    apex::DEFAULT_APEX_MANIFEST_REL
+                ),
+                format!(
+                    "Name the authoritative manifest `{}` at the repository root, or keep exactly one `{QUARRY_APEX_MANIFEST_PATTERN}`.",
+                    apex::REPO_ROOT_APEX_MANIFEST_REL
+                ),
+            ));
+            return (unresolved_apex_basis(QUARRY_APEX_MANIFEST_PATTERN), false);
+        }
+        Err(e) => {
+            violations.push(unverified_apex_manifest_violation(
+                "quarry",
+                QUARRY_APEX_MANIFEST_PATTERN,
+                format!("Cannot list `quarry/` to resolve `{QUARRY_APEX_MANIFEST_PATTERN}`: {e}"),
+                "Make `quarry/` readable so its Apex manifest can be verified.".to_string(),
+            ));
+            return (unresolved_apex_basis(QUARRY_APEX_MANIFEST_PATTERN), false);
+        }
+    };
+
+    let manifest = match apex::ApexManifest::load_from_path(&root.join(&manifest_rel)) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            violations.push(unverified_apex_manifest_violation(
+                &manifest_rel,
+                &manifest_rel,
+                format!("Apex manifest `{manifest_rel}` cannot be loaded: {e:#}"),
+                "Fix the manifest so it parses and registers at least one `[[apex]]` theorem."
+                    .to_string(),
+            ));
+            return (unresolved_apex_basis(&manifest_rel), false);
+        }
+    };
+
+    let report = evaluate_apex_with_index(
+        repo_root,
+        index,
+        &manifest,
+        ApexCheckOptions {
+            strict_islands: opts.strict,
+            max_islands: None,
+        },
+    );
+    let verified = report.registered_apex_count > 0 && report.check_passed;
+    if !verified {
+        let mut reasons = report.failure_reasons.clone();
+        if reasons.is_empty() {
+            reasons.push(format!(
+                "{} of {} registered apex theorem(s) verified",
+                report.valid_apex_count, report.registered_apex_count
+            ));
+        }
+        let strict_flag = if opts.strict { " --strict-islands" } else { "" };
+        for reason in reasons {
+            violations.push(unverified_apex_manifest_violation(
+                &manifest_rel,
+                &manifest.target_name,
+                format!("Apex manifest `{manifest_rel}` does not verify: {reason}"),
+                format!(
+                    "Run `obb apex check --repo {repo_root} --manifest {}{strict_flag}` for per-theorem offenders and unwired leaf islands, then repair the apex cone or the manifest; `--allow-empty` never bypasses a present Apex manifest.",
+                    root.join(&manifest_rel).display()
+                ),
+            ));
+        }
+    }
+    (
+        PipelineLedgerBasis::ApexManifest {
+            manifest_path: manifest_rel,
+            registered_apex_count: report.registered_apex_count,
+            valid_apex_count: report.valid_apex_count,
+            unwired_island_count: report.unwired_island_count,
+        },
+        verified,
+    )
+}
+
 pub fn check_pipeline(repo_root: &Path) -> Result<PipelineReport> {
     check_pipeline_with_options(repo_root, PipelineCheckOptions::default())
 }
@@ -509,6 +714,8 @@ pub fn check_pipeline_with_index(repo_root: &str, index: &LeanIndex) -> Pipeline
     check_pipeline_with_index_and_options(repo_root, index, PipelineCheckOptions::default())
 }
 
+/// `repo_root` is the directory `index` was built from; its Apex manifest is read from there when
+/// no obligation classes are declared, and verified against `index` without re-parsing.
 pub fn check_pipeline_with_index_and_options(
     repo_root: &str,
     index: &LeanIndex,
@@ -1254,19 +1461,40 @@ pub fn check_pipeline_with_index_and_options(
         });
     }
 
+    let theorem_declaration_count = count_theorem_declarations(index);
+    let (ledger_basis, apex_manifest_verified) = if obligations.is_empty() {
+        classify_without_obligation_classes(
+            repo_root,
+            index,
+            opts,
+            theorem_declaration_count,
+            &mut violations,
+        )
+    } else {
+        (PipelineLedgerBasis::ObligationClasses, false)
+    };
+
     let stage = if !violations.is_empty() {
         PipelineStage::Failed
-    } else if obligations.is_empty() {
-        if opts.allow_empty {
-            PipelineStage::StageBSealed
-        } else {
-            PipelineStage::Undeclared
-        }
-    } else if open_stage_a_obligations > 0 {
-        PipelineStage::StageALocked
     } else {
-        PipelineStage::StageBSealed
+        match &ledger_basis {
+            PipelineLedgerBasis::ObligationClasses if open_stage_a_obligations > 0 => {
+                PipelineStage::StageALocked
+            }
+            PipelineLedgerBasis::ObligationClasses | PipelineLedgerBasis::AllowEmptyOverride => {
+                PipelineStage::StageBSealed
+            }
+            PipelineLedgerBasis::ApexManifest { .. } if apex_manifest_verified => {
+                PipelineStage::StageBSealed
+            }
+            PipelineLedgerBasis::ApexManifest { .. } => PipelineStage::Failed,
+            PipelineLedgerBasis::ZeroDeclarations | PipelineLedgerBasis::UndeclaredTheorems => {
+                PipelineStage::Undeclared
+            }
+        }
     };
+    let allow_empty_override = ledger_basis == PipelineLedgerBasis::AllowEmptyOverride
+        && stage == PipelineStage::StageBSealed;
 
     let passed =
         stage != PipelineStage::Failed && (!opts.strict || stage != PipelineStage::Undeclared);
@@ -1283,6 +1511,9 @@ pub fn check_pipeline_with_index_and_options(
         passed,
         ready_for_parallel_swarm,
         ready_for_claimed,
+        ledger_basis,
+        allow_empty_override,
+        theorem_declaration_count,
         smuggled_sorry_count,
         smuggled_axiom_count,
         total_obligations: obligations.len(),

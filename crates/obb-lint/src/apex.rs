@@ -15,6 +15,59 @@ use std::path::Path;
 
 pub const DEFAULT_APEX_MANIFEST_REL: &str = "quarry/obend-apex.toml";
 
+/// Repository-root manifest name; takes precedence over every `quarry/` manifest.
+pub const REPO_ROOT_APEX_MANIFEST_REL: &str = "obb-apex.toml";
+
+/// Pattern for target-named manifests under `quarry/`, used when exactly one file matches.
+pub const QUARRY_APEX_MANIFEST_PATTERN: &str = "quarry/*-apex.toml";
+
+/// Where a target repository declares its own Apex manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApexManifestDiscovery {
+    /// No `obb-apex.toml`, `quarry/obend-apex.toml` or `quarry/*-apex.toml` exists.
+    Absent,
+    /// The authoritative manifest, relative to the repository root.
+    Found { rel_path: String },
+    /// Several `quarry/*-apex.toml` files exist and none is authoritative (sorted, repo-relative).
+    Ambiguous { candidates: Vec<String> },
+}
+
+/// Locate the repository's Apex manifest: `obb-apex.toml`, then `quarry/obend-apex.toml`, then the
+/// only `quarry/*-apex.toml`. Several `quarry/*-apex.toml` files without one of the first two
+/// names are reported as [`ApexManifestDiscovery::Ambiguous`] rather than resolved by a guess.
+pub fn discover_repo_apex_manifest(repo_root: &Path) -> std::io::Result<ApexManifestDiscovery> {
+    for rel in [REPO_ROOT_APEX_MANIFEST_REL, DEFAULT_APEX_MANIFEST_REL] {
+        if repo_root.join(rel).is_file() {
+            return Ok(ApexManifestDiscovery::Found {
+                rel_path: rel.to_string(),
+            });
+        }
+    }
+    let quarry_dir = repo_root.join("quarry");
+    if !quarry_dir.is_dir() {
+        return Ok(ApexManifestDiscovery::Absent);
+    }
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&quarry_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with("-apex.toml") && entry.path().is_file() {
+            candidates.push(format!("quarry/{name}"));
+        }
+    }
+    candidates.sort();
+    Ok(match candidates.len() {
+        0 => ApexManifestDiscovery::Absent,
+        1 => ApexManifestDiscovery::Found {
+            rel_path: candidates.remove(0),
+        },
+        _ => ApexManifestDiscovery::Ambiguous { candidates },
+    })
+}
+
 pub const CANONICAL_SUBSYSTEMS: &[&str] = &[
     "Core",
     "Leaf",

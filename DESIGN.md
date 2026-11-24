@@ -140,6 +140,8 @@ Rust 2024 workspace of seven crates (`obb-core`, `obb-lint`, `obb-judge`, `obb-q
    Dirty trees bypass reuse; history and external evidence retain their own freshness checks.
    File-unit gates can export the committed file view, modes, Merkle root and runtime fingerprint in a wire-v2 receipt.
    `obb verify-transport` authenticates this evidence against another tree. See `JUDGE.md` for the wire format and key selection.
+   A repository without obligation classes seals only through its own verified Apex manifest. Every
+   pipeline report names its `ledger_basis`, and a seal produced by `--allow-empty` is reported as `allow_empty_override`.
 4. **`obb quarry` (`obb-quarry`, `obb-cli`)**: Zero-pollution `refs/quarry/*` donor git-history
    synchronizer and 6-gate pre-uptake surgery inspector driven by `quarry/obend-quarry.toml`.
 5. **`obb broker`, `obb state`, `obb seg`, `obb ledger` & `obb serve` (`obb-broker`, `obb-state`)**:

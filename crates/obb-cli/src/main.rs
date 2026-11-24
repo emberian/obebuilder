@@ -6,12 +6,17 @@ use obb_broker::{
     BuildPlanOptions, HostChoice, SshExecutor, plan_build as broker_plan_build, probe_hosts,
 };
 use obb_cli::serve::run_server_with_options;
-use obb_judge::pipeline::{PipelineCheckOptions, PipelineStage, check_pipeline_with_options};
+use obb_judge::pipeline::{
+    PipelineCheckOptions, PipelineLedgerBasis, PipelineStage, check_pipeline_with_options,
+};
 use obb_judge::{
     Gate, JudgeClock, JudgeReceipt, SuccessionRecord, TrustBase, check_revert_clean, check_succeed,
     evaluate_gate_on, issue_judge_receipt_with_state_dir,
 };
-use obb_lint::apex::{ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, evaluate_apex};
+use obb_lint::apex::{
+    ApexCheckOptions, ApexManifest, DEFAULT_APEX_MANIFEST_REL, QUARRY_APEX_MANIFEST_PATTERN,
+    REPO_ROOT_APEX_MANIFEST_REL, evaluate_apex,
+};
 use obb_lint::cone::{ProposedShard, plan_cone_shards, scan_repo_cone};
 use obb_lint::harness::{harness_check, harness_install, harness_list};
 use obb_lint::spec_check::run_spec_sensitivity_check;
@@ -273,7 +278,7 @@ enum ApexSubcommand {
 
 #[derive(Subcommand, Debug)]
 enum PipelineSubcommand {
-    /// Verify Stage-A `[HypothesisLedger]` / `[*Obligations]` interface lock or Stage-B concrete instance seal (`0 sorry`, `0 axiom`, acyclic, inhabited)
+    /// Verify Stage-A `[HypothesisLedger]` / `[*Obligations]` interface lock or Stage-B concrete instance seal (`0 sorry`, `0 axiom`, acyclic, inhabited); without obligation classes, verify the repository's Apex manifest
     Check {
         /// Target repository root (strictly read-only)
         #[arg(long, default_value = ".")]
@@ -283,11 +288,11 @@ enum PipelineSubcommand {
         #[arg(long)]
         require_sealed: bool,
 
-        /// Refuse (`exit 2`) when `0` obligation classes are discovered (`UNDECLARED`)
+        /// Refuse (`exit 2`) on `UNDECLARED` (no obligation classes and no Apex manifest); with an Apex manifest, require zero unwired leaf islands
         #[arg(long)]
         strict: bool,
 
-        /// Allow `STAGE_B_SEALED` when `0` obligation classes are discovered in the repository
+        /// Allow `STAGE_B_SEALED` with `0` obligation classes and no Apex manifest; recorded as `allow_empty_override` and never applied over a present Apex manifest
         #[arg(long)]
         allow_empty: bool,
 
@@ -2643,6 +2648,27 @@ fn print_human_pipeline_report(
         "obb pipeline check [{}]: repo={} passed={} ready_for_parallel_swarm={} ready_for_claimed={}",
         rep.stage, rep.repo_root, rep.passed, rep.ready_for_parallel_swarm, rep.ready_for_claimed
     );
+    let basis_detail = match &rep.ledger_basis {
+        PipelineLedgerBasis::ApexManifest {
+            manifest_path,
+            registered_apex_count,
+            valid_apex_count,
+            unwired_island_count,
+        } => format!(
+            " {manifest_path} (apex_valid={valid_apex_count}/{registered_apex_count} unwired_leaf_islands={unwired_island_count})"
+        ),
+        _ => String::new(),
+    };
+    println!(
+        "ledger_basis: {}{basis_detail} | theorem_declarations={}",
+        rep.ledger_basis, rep.theorem_declaration_count
+    );
+    if rep.allow_empty_override {
+        println!(
+            "[ALLOW-EMPTY OVERRIDE] `--allow-empty` produced `{}` with 0 obligation classes and no Apex manifest; this is not verified coverage of the {} theorem declaration(s).",
+            rep.stage, rep.theorem_declaration_count
+        );
+    }
     println!(
         "obligations: total={} sealed={} open_stage_a={} consumer_sites={} | smuggled_sorry={} smuggled_axiom={}",
         rep.total_obligations,
@@ -2679,10 +2705,25 @@ fn print_human_pipeline_report(
                 v.kind, v.path, v.line, v.symbol, v.message, v.remediation
             );
         }
-    } else if strict && rep.stage == PipelineStage::Undeclared {
-        println!(
-            "\n[FAIL] `--strict` is set, and 0 obligation classes (`*Obligations` / `HypothesisLedger` / `@[obb_obligation]`) were declared (`UNDECLARED`)."
-        );
+    } else if (strict || require_sealed) && rep.stage == PipelineStage::Undeclared {
+        let flag = if strict {
+            "--strict"
+        } else {
+            "--require-sealed"
+        };
+        let finding = match rep.ledger_basis {
+            PipelineLedgerBasis::ZeroDeclarations => {
+                "0 theorem declarations were found, and the repository declares no obligation classes and no Apex manifest".to_string()
+            }
+            _ => format!(
+                "{} theorem declaration(s) have neither obligation classes (`*Obligations` / `HypothesisLedger` / `@[obb_obligation]`) nor an Apex manifest (`{}`, `{}` or a single `{}`)",
+                rep.theorem_declaration_count,
+                REPO_ROOT_APEX_MANIFEST_REL,
+                DEFAULT_APEX_MANIFEST_REL,
+                QUARRY_APEX_MANIFEST_PATTERN
+            ),
+        };
+        println!("\n[FAIL] `{flag}` is set, and {finding} (`UNDECLARED`).");
     } else if require_sealed && rep.stage != PipelineStage::StageBSealed {
         println!(
             "\n[FAIL] `--require-sealed` is set, but pipeline stage is `{}` ({} open Stage-A obligation(s)).",
